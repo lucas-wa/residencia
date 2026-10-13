@@ -1,0 +1,28 @@
+# Core (CPU-installable) dependencies for the multimodal IR benchmark.
+# GPU-specific wheels (torch+CUDA, flash-attn, faiss-gpu) live in requirements-gpu.txt.
+# Target: Python 3.11.
+
+numpy
+pandas
+pyyaml
+tqdm
+
+# Model wrappers.
+# TODO confirmar em runtime: colpali-engine e transformers tem acoplamento de versao
+# sensivel (ver spec secao 10). Validar o par abaixo rodando um encode real na 4090 e
+# ajustar os pins caso ColQwen2/ColPali falhem ao carregar.
+transformers>=4.46,<4.51
+colpali-engine>=0.3.10,<0.4
+sentence-transformers>=3.0
+open_clip_torch>=2.24
+
+# Benchmarks / datasets.
+mteb>=1.14
+datasets>=2.19
+pypdfium2>=4.30
+
+# Dense index fallback when faiss-gpu is unavailable (see requirements-gpu.txt).
+faiss-cpu>=1.8
+
+# Tests.
+pytest>=8.0

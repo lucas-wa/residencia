@@ -1,0 +1,44 @@
+# Dependencias para rodar o benchmark no cluster UFG (H100) dentro do container
+# Singularity vllm-openai_latest.sif.
+#
+# NAO inclui torch: a imagem vLLM ja traz torch + CUDA casados com o driver do no.
+#   Reinstalar torch por pip quebraria a instalacao de CUDA do container.
+# NAO inclui faiss: benchmark/common/index.py cai para busca por produto interno em
+#   numpy quando faiss nao existe, e os corpora aqui sao pequenos (mesmo top-k).
+# NAO inclui flash-attn: os wrappers de modelo caem para attn_implementation="eager".
+#
+# TODO confirmar em runtime: o container ja traz um `transformers` proprio (exigido pelo
+# vLLM) e o pin abaixo pode conflitar com ele. Nao e preciso adivinhar: o estagio
+# `preflight` (`python3 -m benchmark.check_env`) le as versoes instaladas e diz qual
+# caminho de carregamento do ColQwen2 sobrou.
+#
+# O pin fica como esta (>=4.46,<4.51): e a faixa que o colpali-engine 0.3.1x pede
+# (ele exige transformers >4.46.1). Se a imagem trouxer um transformers fora dessa faixa
+# e nao der para instalar a copia user-local, ha a ALTERNATIVA do caminho nativo:
+# transformers >=4.49 ja traz ColQwen2 embutido (`ColQwen2ForRetrieval`), mas so carrega
+# o checkpoint convertido `vidore/colqwen2-v1.0-hf` -- e e isso que o preflight reporta
+# como status=warn / colqwen_path=transformers-native.
+
+transformers>=4.46,<4.51
+colpali-engine>=0.3.10,<0.4
+sentence-transformers>=3.0
+open_clip_torch>=2.24
+
+# huggingface_hub recente: backend Xet (download por chunk, bem mais rapido que HTTP
+# simples nos checkpoints grandes). Sem o extra `hf_xet` instalado, a variavel
+# HF_XET_HIGH_PERFORMANCE exportada no slurm_run.sh nao tem efeito.
+huggingface_hub[hf_xet]>=0.34
+# usado por benchmark/check_env.py para comparar versoes (vem junto do transformers,
+# mas o preflight precisa dele mesmo quando o transformers falta)
+packaging>=23.0
+
+mteb>=1.14
+datasets>=2.19
+
+pandas
+pyyaml
+tqdm
+
+pypdfium2>=4.30
+pillow
+numpy

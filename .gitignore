@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv*/
+venv/
+
+# Benchmark outputs and heavy artifacts
+results/
+data/govexe/pages/
+data/govexe/ptbr_planos/pages/
+data/govexe/ptbr_planos/pdf_cache/
+data/vidore_cache/
+*.parquet
+
+# HF caches
+.cache/

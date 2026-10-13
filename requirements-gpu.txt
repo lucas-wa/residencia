@@ -1,0 +1,19 @@
+# GPU-only dependencies. Install AFTER requirements.txt, inside the same venv.
+# Target environment: WSL2 (Linux) + RTX 4090 (24 GB), CUDA 12.x, Python 3.11.
+#
+# 1) PyTorch with CUDA (pick the index-url matching the local CUDA runtime):
+#       pip install torch --index-url https://download.pytorch.org/whl/cu124
+#    On Windows/CPU-only machines just `pip install torch` (benchmarks will be slow).
+#
+# 2) flash-attn needs a compiler + matching torch already installed:
+#       pip install flash-attn --no-build-isolation
+#    If it fails, the wrappers fall back to attn_implementation="eager" automatically.
+#
+# 3) faiss-gpu is only published for Linux (conda channel pytorch / faiss-gpu-cu12 wheels):
+#       pip install faiss-gpu-cu12
+#    If absent, benchmark.common.index.dense_search falls back to faiss-cpu and then
+#    to a pure numpy inner-product search (identical top-k).
+
+torch
+flash-attn
+faiss-gpu-cu12
