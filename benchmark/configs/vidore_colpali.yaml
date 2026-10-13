@@ -1,0 +1,15 @@
+name: vidore_colpali
+model_id: vidore/colpali-v1.3
+model_kind: colpali
+# Mesmo subset usado em vidore_colqwen2.yaml (comparacao pareada). Os 4 subconjuntos do
+# ViDoRe v2, qualquer um deles valido como `dataset:` (prefixo `vidore/`):
+# biomedical_lectures_v2, economics_reports_v2, esg_reports_v2 e
+# esg_reports_human_labeled_v2.
+# Se o preflight cair no caminho nativo do transformers, usar o checkpoint `-hf`
+# equivalente (ver benchmark/check_env.py).
+dataset: vidore/biomedical_lectures_v2
+dtype: bfloat16
+batch_size: 2
+device: cuda
+k_values: [1, 5, 10]
+seed: 42

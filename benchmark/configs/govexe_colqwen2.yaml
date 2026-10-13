@@ -1,0 +1,9 @@
+name: govexe_ptbr_colqwen2
+model_id: vidore/colqwen2-v1.0
+model_kind: colqwen2
+dataset: govexe_ptbr_planos
+dtype: bfloat16
+batch_size: 4
+device: cuda
+k_values: [1, 5, 10]
+seed: 42

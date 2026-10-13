@@ -1,0 +1,18 @@
+name: vidore_colqwen2
+model_id: vidore/colqwen2-v1.0
+model_kind: colqwen2
+# ViDoRe v2 (colecao HF `vidore/vidore-benchmark-v2`) tem exatamente 4 subconjuntos --
+# qualquer um deles vale como `dataset:`:
+#   vidore/biomedical_lectures_v2
+#   vidore/economics_reports_v2
+#   vidore/esg_reports_v2
+#   vidore/esg_reports_human_labeled_v2
+# Checkpoint: `vidore/colqwen2-v1.0` carrega pelo colpali-engine; no caminho nativo do
+# transformers (>=4.49) use `vidore/colqwen2-v1.0-hf` -- `python -m benchmark.check_env`
+# diz qual dos dois caminhos esta disponivel.
+dataset: vidore/biomedical_lectures_v2
+dtype: bfloat16
+batch_size: 4
+device: cuda
+k_values: [1, 5, 10]
+seed: 42
