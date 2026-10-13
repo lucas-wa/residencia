@@ -195,6 +195,48 @@ só tem efeito no `STAGE=build` — `vidore`/`govexe` não têm essa opção.
 - **`flash-attn`** não é instalado: os wrappers caem para `attn_implementation="eager"`
   (mais lento, mesmo resultado).
 
+### 4.6 Execução em VM única (GCP, L4)
+
+Alternativa ao cluster, quando a fila do Slurm não compensa: uma **VM única com GPU** na
+GCP. Aqui **não** há `sbatch` nem Singularity — o `slurm_run.sh` não é usado. O
+equivalente é [`run_gcp.sh`](../run_gcp.sh) na raiz do repo, com os **mesmos estágios e as
+mesmas variáveis** (`STAGE`, `LIMIT`, `FORCE`, `STRICT_PREFLIGHT`, `HF_CACHE_DIR`).
+
+**Máquina sugerida**: `g2-standard-8` (8 vCPU, 32 GB RAM, **1× NVIDIA L4** de 24 GB),
+imagem **Deep Learning VM** (já traz driver NVIDIA + CUDA + PyTorch), disco ≥ **100 GB**
+(os PNGs dos 27 planos e os checkpoints do HF ocupam bastante).
+
+```bash
+# na VM, após o SSH:
+git clone <repo> ~/residencia
+cd ~/residencia
+
+bash run_gcp.sh                         # tudo: preflight + build + vidore + govexe
+STAGE=preflight bash run_gcp.sh         # só a checagem de versões (segundos)
+STAGE=build bash run_gcp.sh             # CPU: baixa os PDFs e rasteriza as páginas
+STAGE=vidore bash run_gcp.sh            # ViDoRe v2 (preflight + GPU)
+STAGE=govexe bash run_gcp.sh            # pt-BR GovExe (preflight + GPU)
+
+LIMIT=50 STAGE=vidore bash run_gcp.sh   # smoke test barato
+FORCE=1 STAGE=build bash run_gcp.sh     # refaz o conjunto pt-BR do zero
+STRICT_PREFLIGHT=1 STAGE=vidore bash run_gcp.sh   # warn do preflight vira erro
+
+# cache do HF num disco de dados (checkpoints são grandes):
+HF_CACHE_DIR=/mnt/disks/data/hf bash run_gcp.sh
+```
+
+**Ambiente Python**: o script cria (uma vez) `.venv-gcp` com
+`python3 -m venv --system-site-packages` — o venv **enxerga o torch+CUDA da imagem base**
+e isola só o resto (`transformers`, `colpali-engine`, …), instalado do mesmo
+[`requirements-slurm.txt`](../requirements-slurm.txt) usado no cluster. Reinstalar torch
+por pip quebraria o casamento com o driver. Se a criação do venv falhar, o script segue
+instalando no ambiente Python ativo. O **cache por hash** é o mesmo do §4.1 (marcador
+`.venv-gcp/.residencia_deps_<hash>`; para forçar, `rm .venv-gcp/.residencia_deps_*`).
+
+Logs vão para o stdout da sessão (não há `logs/slurm_<jobid>_*`); para uma rodada longa,
+use `tmux`/`nohup`, p.ex. `nohup bash run_gcp.sh > logs/gcp_$(date +%F_%H%M).log 2>&1 &`.
+Os resultados continuam em `results/vidore.csv` e `results/govexe_ptbr.csv`.
+
 ## 5. Resultados
 
 Cada execução **acrescenta uma linha** ao CSV, com a config inteira (modelo, dtype,

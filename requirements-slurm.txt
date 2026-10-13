@@ -1,6 +1,10 @@
 # Dependencias para rodar o benchmark no cluster UFG (H100) dentro do container
 # Singularity vllm-openai_latest.sif.
 #
+# Serve para QUALQUER base que ja tenha torch + CUDA instalados: tanto o container do
+# cluster (slurm_run.sh) quanto a imagem "Deep Learning VM" da GCP numa VM unica com L4
+# (run_gcp.sh, onde o venv e criado com --system-site-packages para herdar esse torch).
+#
 # NAO inclui torch: a imagem vLLM ja traz torch + CUDA casados com o driver do no.
 #   Reinstalar torch por pip quebraria a instalacao de CUDA do container.
 # NAO inclui faiss: benchmark/common/index.py cai para busca por produto interno em
