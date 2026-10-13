@@ -16,14 +16,23 @@
 # `preflight` (`python3 -m benchmark.check_env`) le as versoes instaladas e diz qual
 # caminho de carregamento do ColQwen2 sobrou.
 #
-# O pin fica como esta (>=4.46,<4.51): e a faixa que o colpali-engine 0.3.1x pede
-# (ele exige transformers >4.46.1). Se a imagem trouxer um transformers fora dessa faixa
-# e nao der para instalar a copia user-local, ha a ALTERNATIVA do caminho nativo:
-# transformers >=4.49 ja traz ColQwen2 embutido (`ColQwen2ForRetrieval`), mas so carrega
-# o checkpoint convertido `vidore/colqwen2-v1.0-hf` -- e e isso que o preflight reporta
-# como status=warn / colqwen_path=transformers-native.
+# O teto `<4.51` FOI REMOVIDO: em imagens recentes (ex.: Deep Learning VM da GCP com
+# torch 2.9/cu129) ele conflitava com as outras deps -- `mteb`/`sentence-transformers`
+# pedem um transformers mais novo e o pip terminava em ResolutionImpossible. Sem teto,
+# o pip escolhe a versao que satisfaz colpali-engine + mteb + sentence-transformers ao
+# mesmo tempo. NAO se adivinha o que sobrou: o estagio `preflight`
+# (`python3 -m benchmark.check_env`) le as versoes instaladas e diz qual caminho de
+# carregamento do ColQwen2 vale -- colpali-engine quando a faixa bate (ele exige
+# transformers >4.46.1), senao o caminho NATIVO do transformers: >=4.49 ja traz ColQwen2
+# embutido (`ColQwen2ForRetrieval`), mas so carrega o checkpoint convertido
+# `vidore/colqwen2-v1.0-hf` -- e e isso que o preflight reporta como status=warn /
+# colqwen_path=transformers-native.
+#
+# O cap de `colpali-engine` (<0.4) fica como esta -- a API usada pelos wrappers e a da
+# serie 0.3.x. Se ele tambem passar a conflitar numa imagem futura, o sintoma sera outro
+# ResolutionImpossible aqui; so entao vale reavaliar.
 
-transformers>=4.46,<4.51
+transformers>=4.46
 colpali-engine>=0.3.10,<0.4
 sentence-transformers>=3.0
 open_clip_torch>=2.24

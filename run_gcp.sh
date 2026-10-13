@@ -89,12 +89,13 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>
 # A Deep Learning VM ja traz torch + CUDA casados com o driver. Reinstalar torch por pip
 # quebraria isso, entao o venv e criado com --system-site-packages: ele ENXERGA o torch da
 # base e isola so o resto (transformers, colpali-engine, ...). Se o venv nao puder ser
-# criado (python3-venv ausente, disco cheio), caimos para instalar no ambiente ativo.
+# criado (python3-venv/ensurepip ausente, disco cheio), caimos para `pip install --user`
+# no python do sistema -- que ja tem o torch -- sem precisar de sudo.
 # -------------------------------------------------------------------------------------
 if [ ! -d "$VENV_DIR" ]; then
     echo "--- criando venv (--system-site-packages) em $VENV_DIR ---"
     python3 -m venv --system-site-packages "$VENV_DIR" \
-        || echo "--- venv falhou; seguindo no ambiente Python ativo ---"
+        || echo "--- venv falhou; seguindo no python do sistema (deps via pip --user) ---"
 fi
 if [ -f "$VENV_DIR/bin/activate" ]; then
     # shellcheck disable=SC1091
@@ -112,22 +113,33 @@ echo "--- python: $(command -v python3) ($(python3 --version 2>&1)) ---"
 # Cache de instalacao: o conjunto instalado e identificado pelo sha256 do
 # requirements-slurm.txt. Se o marcador correspondente existir, o arquivo nao mudou desde
 # a ultima instalacao e o pip e pulado inteiro. Editar o requirements muda o hash -> novo
-# marcador -> reinstala. Para forcar: rm "$VENV_DIR"/.residencia_deps_*
+# marcador -> reinstala. Para forcar: rm "$DEPS_MARKER_DIR"/.residencia_deps_*
 REQ_HASH="$(sha256sum requirements-slurm.txt | cut -d" " -f1)"
 DEPS_MARKER="$DEPS_MARKER_DIR/.residencia_deps_$REQ_HASH"
 if [ -f "$DEPS_MARKER" ]; then
     echo "--- deps ja instaladas (marcador: $DEPS_MARKER) ---"
 else
     mkdir -p "$DEPS_MARKER_DIR"
-    if command -v uv >/dev/null 2>&1; then
-        # `uv` resolve/instala muito mais rapido. Sem o fallback, uma falha do uv
-        # derrubaria a rodada inteira por causa do `set -e`.
-        echo "--- instalando deps com uv (fallback: pip) ---"
-        uv pip install -r requirements-slurm.txt \
-            || python3 -m pip install --quiet -r requirements-slurm.txt
+    if [ -n "${VIRTUAL_ENV:-}" ]; then
+        # Venv ativo: ele proprio e o alvo da instalacao.
+        if command -v uv >/dev/null 2>&1; then
+            # `uv` resolve/instala muito mais rapido. Sem o fallback, uma falha do uv
+            # derrubaria a rodada inteira por causa do `set -e`.
+            echo "--- instalando deps no venv com uv (fallback: pip) ---"
+            uv pip install -r requirements-slurm.txt \
+                || python3 -m pip install --quiet -r requirements-slurm.txt
+        else
+            echo "--- instalando deps no venv com pip ---"
+            python3 -m pip install --quiet -r requirements-slurm.txt
+        fi
     else
-        echo "--- instalando deps com pip ---"
-        python3 -m pip install --quiet -r requirements-slurm.txt
+        # Sem venv (algumas Deep Learning VMs nao trazem `ensurepip`/python3-venv, entao
+        # `python3 -m venv` falha): instalamos em $HOME/.local com `--user`. NAO usamos
+        # `uv` aqui -- sem venv ativo ele nao tem alvo -- nem instalamos no site do
+        # sistema, que exigiria sudo. O torch ja vem no python do sistema e e enxergado
+        # por cima dessa camada --user, entao as deps que dependem dele nao o reinstalam.
+        echo "--- sem venv: instalando deps com pip --user (alvo: $HOME/.local) ---"
+        python3 -m pip install --quiet --user -r requirements-slurm.txt
     fi
     touch "$DEPS_MARKER"
 fi
