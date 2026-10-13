@@ -144,6 +144,54 @@ else
     touch "$DEPS_MARKER"
 fi
 
+# -------------------------------------------------------------------------------------
+# Reparo do torchaudio (algumas imagens GPU vem com ele ABI-incompativel com o torch).
+#
+# Visto na Deep Learning VM da GCP: torch 2.9.1+cu129 ok, mas o torchaudio da imagem
+# estoura "_torchaudio.abi3.so: undefined symbol: torch_library_impl". Como transformers
+# 5.x importa torchaudio de forma ansiosa (processing_utils -> audio_utils), QUALQUER
+# `import colpali_engine` quebra junto. Reinstalar so o torchaudio (--no-deps, para nao
+# mexer no torch da imagem) na mesma versao/tag CUDA do torch instalado resolve.
+# -------------------------------------------------------------------------------------
+ensure_torchaudio() {
+    if python3 -c "import torchaudio" 2>/dev/null; then
+        echo "--- torchaudio ok (sem reparo) ---"
+        return 0
+    fi
+    echo "--- torchaudio nao importa (ABI incompativel?): reinstalando casado com o torch ---"
+
+    # Versao e tag CUDA derivadas do torch INSTALADO (nada hardcodado). As fatias de
+    # string ficam no bash para o mesmo trecho poder ser colado no slurm_run.sh, cujo
+    # corpo roda dentro de aspas simples (nenhuma aspa simples pode aparecer aqui).
+    TA_VER="$(python3 -c "import torch;print(torch.__version__)" 2>/dev/null || true)"
+    TA_VER="${TA_VER%%+*}"
+    CU_RAW="$(python3 -c "import torch;print(torch.version.cuda or str())" 2>/dev/null || true)"
+    CU="cu${CU_RAW//./}"
+    if [ -z "$TA_VER" ]; then
+        echo "aviso: nao foi possivel reparar torchaudio (siga; o erro aparecera no load se for necessario)"
+        return 0
+    fi
+
+    # Mesma logica do bloco de deps: sem venv ativo o alvo e $HOME/.local (--user), que
+    # tem precedencia sobre o site-packages do sistema; com venv, o alvo e o venv.
+    PIP_USER=""
+    if [ -z "${VIRTUAL_ENV:-}" ]; then
+        PIP_USER="--user"
+    fi
+
+    echo "--- pip install torchaudio==$TA_VER (index: $CU) ---"
+    # Nao-fatal de ponta a ponta: se o indice do PyTorch estiver inacessivel, o `set -e`
+    # nao pode derrubar a rodada -- o erro reaparece no load, se for mesmo necessario.
+    # shellcheck disable=SC2086
+    python3 -m pip install ${PIP_USER} --no-deps --force-reinstall "torchaudio==${TA_VER}" \
+            --index-url "https://download.pytorch.org/whl/${CU}" \
+        && python3 -c "import torchaudio" 2>/dev/null \
+        && echo "--- torchaudio reparado (import ok) ---" \
+        || echo "aviso: nao foi possivel reparar torchaudio (siga; o erro aparecera no load se for necessario)"
+}
+
+ensure_torchaudio
+
 # --limit so e repassado quando LIMIT nao esta vazio.
 LIMIT_ARGS=()
 if [ -n "${LIMIT:-}" ]; then
