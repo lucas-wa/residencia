@@ -1,0 +1,21 @@
+name: v3_colembed8b
+# NVIDIA Nemotron ColEmbed V2 8B -- late interaction (multi-vetor, MaxSim).
+# Licenca NAO comercial (uso academico -- ok para a residencia).
+# TODO confirmar em runtime: o id do 8B e o unico da familia que nao foi conferido no
+# Hub. Irmaos confirmados: nvidia/llama-nemotron-colembed-vl-3b-v2 (3B) e
+# nvidia/nemotron-colembed-vl-4b-v2 (4B). Se der 404, listar a org nvidia por "colembed"
+# e corrigir so esta linha.
+model_id: nvidia/nemotron-colembed-vl-8b-v2
+model_kind: colembed
+# ViDoRe V3 (colecao HF `vidore`): subconjuntos `vidore/vidore_v3_<dominio>`; ha ainda as
+# variantes `*_mteb_format`.
+# TODO confirmar em runtime: `datasets.get_dataset_config_names(...)` para listar os
+# subconjuntos e os nomes de subset/coluna reais antes da primeira rodada.
+dataset: vidore/vidore_v3_hr
+dtype: bfloat16
+# 8B em bfloat16 (~16 GB de pesos) + ativacoes multi-vetor de pagina inteira: batch 2
+# cabe folgado no H100 de 80 GB e evita OOM no pico.
+batch_size: 2
+device: cuda
+k_values: [1, 5, 10]
+seed: 42

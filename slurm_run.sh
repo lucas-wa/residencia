@@ -7,8 +7,10 @@
 #   preflight -> so a checagem de versoes das libs (CPU, segundos)
 #   build   -> constroi o conjunto pt-BR dos planos GovExe (CPU-only: baixa PDFs por
 #              HTTP e rasteriza as paginas com pypdfium2; NAO usa GPU)
-#   vidore  -> preflight + avalia ViDoRe v2 (ColQwen2 + ColPali)         [precisa GPU]
+#   vidore  -> preflight + avalia ViDoRe V3 com o trio SOTA 2026         [precisa GPU]
+#              (ColEmbed V2 8B + Qwen3-VL-Embedding 8B + ColQwen2.5)
 #   govexe  -> preflight + avalia o conjunto pt-BR ja construido         [precisa GPU]
+#              (mesmo trio)
 #   all     -> preflight + build + vidore + govexe (default)
 #
 # -------------------------------------------------------------------------------------
@@ -22,8 +24,14 @@
 #   # 1) construir o conjunto pt-BR -- CPU-only, pede ZERO GPU:
 #   STAGE=build sbatch --gres=gpu:h100:0 slurm_run.sh
 #
-#   # 2) ViDoRe v2 (GPU):
+#   # 2) ViDoRe V3 com o trio SOTA 2026 (GPU):
 #   STAGE=vidore sbatch slurm_run.sh
+#
+#   # so um modelo do trio (ou os configs v2 antigos, mantidos como referencia):
+#   VIDORE_CONFIGS=benchmark/configs/v3_colqwen25.yaml STAGE=vidore sbatch slurm_run.sh
+#   VIDORE_CONFIGS="benchmark/configs/vidore_colqwen2.yaml benchmark/configs/vidore_colpali.yaml" \
+#       STAGE=vidore sbatch slurm_run.sh
+#   GOVEXE_CONFIGS=benchmark/configs/govexe_colqwen2.yaml STAGE=govexe sbatch slurm_run.sh
 #
 #   # 3) pt-BR GovExe (GPU), depois que o build terminou:
 #   STAGE=govexe sbatch slurm_run.sh
@@ -82,6 +90,13 @@ HF_CACHE_DIR="${HF_CACHE_DIR:-/work/.cache/huggingface}"
 # 1 => o preflight trata warn (ex.: cair no ColQwen2 nativo) como erro e aborta o job.
 STRICT_PREFLIGHT="${STRICT_PREFLIGHT:-0}"
 
+# Configs avaliados em cada estagio (lista separada por espaco). O default e o trio SOTA
+# 2026: ColEmbed V2 8B (multi-vetor), Qwen3-VL-Embedding 8B (denso) e ColQwen2.5
+# (baseline atualizado). Os configs v2 seguem no repo como referencia -- rode-os
+# explicitamente se precisar refazer o historico.
+VIDORE_CONFIGS="${VIDORE_CONFIGS:-benchmark/configs/v3_colembed8b.yaml benchmark/configs/v3_qwen3vl8b.yaml benchmark/configs/v3_colqwen25.yaml}"
+GOVEXE_CONFIGS="${GOVEXE_CONFIGS:-benchmark/configs/govexe_colembed8b.yaml benchmark/configs/govexe_qwen3vl8b.yaml benchmark/configs/govexe_colqwen25.yaml}"
+
 case "$STAGE" in
     preflight|build|vidore|govexe|all) ;;
     *) echo "STAGE invalido: '$STAGE' (use preflight|build|vidore|govexe|all)" >&2; exit 2 ;;
@@ -93,6 +108,8 @@ echo "=== Job ${SLURM_JOB_ID:-local} em $(hostname) | $(date) ==="
 echo "    STAGE=$STAGE  LIMIT=${LIMIT:-<nenhum>}  FORCE=${FORCE:-<nao>}  RESIDENCIA_DIR=$RESIDENCIA_DIR"
 echo "    STRICT_PREFLIGHT=$STRICT_PREFLIGHT"
 echo "    CONTAINER_IMAGE=$CONTAINER_IMAGE  HF_CACHE_DIR=$HF_CACHE_DIR"
+echo "    VIDORE_CONFIGS=$VIDORE_CONFIGS"
+echo "    GOVEXE_CONFIGS=$GOVEXE_CONFIGS"
 
 # -------------------------------------------------------------------------------------
 # Propagacao das variaveis para DENTRO do container.
@@ -110,6 +127,8 @@ export SINGULARITYENV_LIMIT="$LIMIT"
 export SINGULARITYENV_FORCE="$FORCE"
 export SINGULARITYENV_HF_CACHE_DIR="$HF_CACHE_DIR"
 export SINGULARITYENV_STRICT_PREFLIGHT="$STRICT_PREFLIGHT"
+export SINGULARITYENV_VIDORE_CONFIGS="$VIDORE_CONFIGS"
+export SINGULARITYENV_GOVEXE_CONFIGS="$GOVEXE_CONFIGS"
 
 export APPTAINERENV_RESIDENCIA_DIR="$RESIDENCIA_DIR"
 export APPTAINERENV_STAGE="$STAGE"
@@ -117,6 +136,8 @@ export APPTAINERENV_LIMIT="$LIMIT"
 export APPTAINERENV_FORCE="$FORCE"
 export APPTAINERENV_HF_CACHE_DIR="$HF_CACHE_DIR"
 export APPTAINERENV_STRICT_PREFLIGHT="$STRICT_PREFLIGHT"
+export APPTAINERENV_VIDORE_CONFIGS="$VIDORE_CONFIGS"
+export APPTAINERENV_GOVEXE_CONFIGS="$GOVEXE_CONFIGS"
 
 srun singularity exec \
     --no-home \
@@ -267,10 +288,15 @@ srun singularity exec \
                 ${FORCE_ARGS[@]+"${FORCE_ARGS[@]}"}
         }
 
+        # Trio SOTA 2026 avaliado no ViDoRe V3. Os configs v2 (vidore_colqwen2/
+        # vidore_colpali) continuam no repo como REFERENCIA historica e NAO rodam por
+        # padrao -- para refaze-los, use VIDORE_CONFIGS (ver bloco de USO no topo).
+        VIDORE_CONFIGS="${VIDORE_CONFIGS:-benchmark/configs/v3_colembed8b.yaml benchmark/configs/v3_qwen3vl8b.yaml benchmark/configs/v3_colqwen25.yaml}"
+        GOVEXE_CONFIGS="${GOVEXE_CONFIGS:-benchmark/configs/govexe_colembed8b.yaml benchmark/configs/govexe_qwen3vl8b.yaml benchmark/configs/govexe_colqwen25.yaml}"
+
         run_vidore() {
-            echo "=== [vidore] ViDoRe v2 (GPU) ==="
-            for cfg in benchmark/configs/vidore_colqwen2.yaml \
-                       benchmark/configs/vidore_colpali.yaml; do
+            echo "=== [vidore] ViDoRe V3 (GPU) ==="
+            for cfg in $VIDORE_CONFIGS; do
                 echo "--- $cfg ---"
                 python3 -m benchmark.run_vidore \
                     --config "$cfg" \
@@ -280,11 +306,14 @@ srun singularity exec \
 
         run_govexe() {
             echo "=== [govexe] conjunto pt-BR (GPU) ==="
-            python3 -m benchmark.run_govexe_ptbr \
-                --config benchmark/configs/govexe_colqwen2.yaml \
-                --data-dir data/govexe/ptbr_planos \
-                --out results/govexe_ptbr.csv \
-                ${LIMIT_ARGS[@]+"${LIMIT_ARGS[@]}"}
+            for cfg in $GOVEXE_CONFIGS; do
+                echo "--- $cfg ---"
+                python3 -m benchmark.run_govexe_ptbr \
+                    --config "$cfg" \
+                    --data-dir data/govexe/ptbr_planos \
+                    --out results/govexe_ptbr.csv \
+                    ${LIMIT_ARGS[@]+"${LIMIT_ARGS[@]}"}
+            done
         }
 
         case "$STAGE" in

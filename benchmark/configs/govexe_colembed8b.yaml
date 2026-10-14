@@ -1,0 +1,11 @@
+name: govexe_ptbr_colembed8b
+# NVIDIA Nemotron ColEmbed V2 8B no conjunto pt-BR dos planos (GovExe).
+# TODO confirmar em runtime: id do checkpoint 8B (ver benchmark/configs/v3_colembed8b.yaml).
+model_id: nvidia/nemotron-colembed-vl-8b-v2
+model_kind: colembed
+dataset: govexe_ptbr_planos
+dtype: bfloat16
+batch_size: 2
+device: cuda
+k_values: [1, 5, 10]
+seed: 42

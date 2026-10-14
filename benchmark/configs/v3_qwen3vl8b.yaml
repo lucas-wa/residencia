@@ -1,0 +1,15 @@
+name: v3_qwen3vl8b
+# Qwen3-VL-Embedding 8B -- embedder DENSO (um vetor por item), Apache-2.0.
+# Query = texto, documento = imagem da pagina. Indexado por produto interno
+# (runner com multi_vector=False).
+# TODO confirmar em runtime: a API de encode vem do custom code do checkpoint
+# (trust_remote_code). Ver github.com/QwenLM/Qwen3-VL-Embedding.
+model_id: Qwen/Qwen3-VL-Embedding-8B
+model_kind: qwen3vl
+# TODO confirmar em runtime: nomes dos subconjuntos/colunas do ViDoRe V3.
+dataset: vidore/vidore_v3_hr
+dtype: bfloat16
+batch_size: 2
+device: cuda
+k_values: [1, 5, 10]
+seed: 42

@@ -1,0 +1,12 @@
+name: govexe_ptbr_colqwen25
+# ColQwen2.5 (baseline atualizado) no conjunto pt-BR dos planos (GovExe).
+# TODO confirmar em runtime: tag do checkpoint e nome da classe no colpali-engine
+# (ver benchmark/configs/v3_colqwen25.yaml).
+model_id: vidore/colqwen2.5-v0.2
+model_kind: colqwen2.5
+dataset: govexe_ptbr_planos
+dtype: bfloat16
+batch_size: 4
+device: cuda
+k_values: [1, 5, 10]
+seed: 42

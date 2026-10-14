@@ -1,0 +1,11 @@
+name: govexe_ptbr_qwen3vl8b
+# Qwen3-VL-Embedding 8B (denso) no conjunto pt-BR dos planos (GovExe).
+# TODO confirmar em runtime: API de encode do checkpoint (trust_remote_code).
+model_id: Qwen/Qwen3-VL-Embedding-8B
+model_kind: qwen3vl
+dataset: govexe_ptbr_planos
+dtype: bfloat16
+batch_size: 2
+device: cuda
+k_values: [1, 5, 10]
+seed: 42

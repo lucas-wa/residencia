@@ -37,6 +37,26 @@ colpali-engine>=0.3.10,<0.4
 sentence-transformers>=3.0
 open_clip_torch>=2.24
 
+# --- trio SOTA 2026 (ViDoRe V3 + pt-BR) ---------------------------------------------
+# NVIDIA Nemotron ColEmbed V2 (benchmark/models/colembed.py) e Qwen3-VL-Embedding
+# (benchmark/models/qwen3vl_embed.py) sao CUSTOM CODE: carregam com
+# `trust_remote_code=True`, ou seja, o modeling vem do proprio repo do checkpoint no Hub
+# e nao da versao do transformers instalada. O que o pip precisa garantir sao as deps que
+# esse codigo remoto importa:
+#   - accelerate: exigido pelo `device_map=` do from_pretrained;
+#   - qwen-vl-utils: helper de visao dos modelos Qwen-VL (process_vision_info, resize
+#     dinamico das paginas). O custom code do Qwen3-VL-Embedding o importa;
+#   - einops: rearranjos de tensor usados pelo backbone Eagle2/Qwen3-VL do ColEmbed.
+# `sentence-transformers` (acima) cobre o caminho alternativo caso o Qwen3-VL-Embedding
+# seja carregado pelo wrapper ST em vez de AutoModel.
+# flash-attn segue FORA de proposito: os dois wrappers tem fallback para
+# attn_implementation="eager" (compilar flash-attn no cluster custa mais do que rende).
+# ColQwen2.5 nao pede nada novo -- entra pelo colpali-engine ja listado (quando a release
+# instalada nao expuser `ColQwen2_5`, o wrapper usa `ColQwen2` com o checkpoint 2.5).
+accelerate>=0.30
+qwen-vl-utils>=0.0.8
+einops>=0.7
+
 # huggingface_hub recente: backend Xet (download por chunk, bem mais rapido que HTTP
 # simples nos checkpoints grandes). Sem o extra `hf_xet` instalado, a variavel
 # HF_XET_HIGH_PERFORMANCE exportada no slurm_run.sh nao tem efeito.

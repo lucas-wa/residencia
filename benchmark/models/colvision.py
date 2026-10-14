@@ -1,4 +1,4 @@
-"""ColPali / ColQwen2 late-interaction retriever (multi-vector, one array per item).
+"""ColPali / ColQwen2 / ColQwen2.5 late-interaction retriever (multi-vector).
 
 `encode_queries` / `encode_corpus` return `list[np.ndarray]` of shape [n_tokens, dim];
 ranking is done by `benchmark.common.index.maxsim_search` through
@@ -17,29 +17,50 @@ import numpy as np
 from benchmark.common.types import Doc, Query
 
 
+def resolve_classes(kind: str):
+    """(model_cls, processor_cls) do colpali-engine para `kind`.
+
+    Funcao de modulo de proposito: o teste injeta um `colpali_engine.models` falso em
+    `sys.modules` e cobre o dispatch sem baixar pesos nem instalar o pacote.
+    """
+    # TODO confirmar em runtime: os nomes das classes mudam entre releases do
+    # colpali-engine (0.3.x expoe ColPali/ColPaliProcessor/ColQwen2/ColQwen2Processor;
+    # releases mais novas renomeiam para ColIdefics*/ColQwen2_5*). Conferir
+    # `dir(colpali_engine.models)` antes da primeira rodada e ajustar o mapa abaixo.
+    if kind == "colpali":
+        from colpali_engine.models import ColPali, ColPaliProcessor
+
+        return ColPali, ColPaliProcessor
+    if kind == "colqwen2.5":
+        # TODO confirmar em runtime: o nome exato da classe do ColQwen2.5 no
+        # colpali-engine instalado (`ColQwen2_5`/`ColQwen2_5Processor` nas releases que
+        # o trazem). Sem ela, o checkpoint 2.5 ainda carrega pela classe ColQwen2 --
+        # mesma arquitetura Qwen2-VL, so o backbone muda.
+        try:
+            from colpali_engine.models import ColQwen2_5, ColQwen2_5Processor
+
+            return ColQwen2_5, ColQwen2_5Processor
+        except ImportError:
+            pass
+    elif kind != "colqwen2":
+        raise ValueError(f"kind sem wrapper no colpali-engine: {kind}")
+
+    from colpali_engine.models import ColQwen2, ColQwen2Processor
+
+    return ColQwen2, ColQwen2Processor
+
+
 class ColVisionRetriever:
-    def __init__(self, model_id: str, kind: Literal["colpali", "colqwen2"],
+    def __init__(self, model_id: str, kind: Literal["colpali", "colqwen2", "colqwen2.5"],
                  device: str = "cuda", dtype: str = "bfloat16", batch_size: int = 4):
         import torch
-        # TODO confirmar em runtime: os nomes das classes mudam entre releases do
-        # colpali-engine (0.3.x expoe ColPali/ColPaliProcessor/ColQwen2/ColQwen2Processor;
-        # releases mais novas renomeiam para ColIdefics*/ColQwen2_5*). Conferir
-        # `dir(colpali_engine.models)` antes da primeira rodada e ajustar o mapa abaixo.
-        from colpali_engine.models import (
-            ColPali,
-            ColPaliProcessor,
-            ColQwen2,
-            ColQwen2Processor,
-        )
 
         self.name = f"{kind}:{model_id}"
         self.kind = kind
         self.device = device
         self.batch_size = batch_size
         td = getattr(torch, dtype)
-        model_cls, proc_cls = (
-            (ColPali, ColPaliProcessor) if kind == "colpali" else (ColQwen2, ColQwen2Processor)
-        )
+        model_cls, proc_cls = resolve_classes(kind)
         try:
             model = model_cls.from_pretrained(
                 model_id, torch_dtype=td, device_map=device,

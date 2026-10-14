@@ -248,9 +248,17 @@ batch, device, seed) + as métricas `recall@k`, `ndcg@k` e `mrr`:
 ## 6. Configs
 
 Um YAML por experimento em `benchmark/configs/`. Campos: `name`, `model_id`,
-`model_kind` (`clip|siglip|colpali|colqwen2|text`), `dataset`, `dtype`, `batch_size`,
-`device`, `k_values`, `seed`. `model_kind` também decide o regime de busca:
-`colpali`/`colqwen2` → multi-vetor (MaxSim); o resto → dense (faiss/numpy).
+`model_kind` (`clip|siglip|colpali|colqwen2|colqwen2.5|colembed|qwen3vl|text`),
+`dataset`, `dtype`, `batch_size`, `device`, `k_values`, `seed`. `model_kind` também
+decide o regime de busca: `colpali`/`colqwen2`/`colqwen2.5`/`colembed` → multi-vetor
+(MaxSim); o resto (inclusive `qwen3vl`, denso por construção) → dense (faiss/numpy).
+
+Trio SOTA 2026 (`benchmark/configs/v3_*.yaml` no ViDoRe V3 e `govexe_*8b|25.yaml` no
+pt-BR): `colembed` = NVIDIA Nemotron ColEmbed V2 8B (late interaction,
+`trust_remote_code`, licença não-comercial/acadêmica), `qwen3vl` =
+Qwen3-VL-Embedding 8B (denso, Apache-2.0), `colqwen2.5` = baseline atualizado via
+`colpali-engine`. São os configs que `slurm_run.sh` roda por padrão; os `vidore_*.yaml`
+do v2 seguem no repo como referência (`VIDORE_CONFIGS=... STAGE=vidore`).
 
 ## 7. Testes
 

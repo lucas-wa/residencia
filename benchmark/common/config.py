@@ -6,7 +6,13 @@ from typing import Literal
 
 import yaml
 
-ModelKind = Literal["clip", "siglip", "colpali", "colqwen2", "text"]
+ModelKind = Literal[
+    "clip", "siglip", "colpali", "colqwen2", "text",
+    # trio SOTA 2026:
+    "colqwen2.5",  # vidore/colqwen2.5-* via colpali-engine (late interaction)
+    "colembed",    # NVIDIA Nemotron ColEmbed V2 (late interaction, trust_remote_code)
+    "qwen3vl",     # Qwen3-VL-Embedding (denso, um vetor por item)
+]
 
 
 @dataclass(frozen=True)
