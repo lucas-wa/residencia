@@ -24,6 +24,13 @@
 #   # 1) construir o conjunto pt-BR -- CPU-only, pede ZERO GPU:
 #   STAGE=build sbatch --gres=gpu:h100:0 slurm_run.sh
 #
+#   # o dataset dos planos e PRIVADO no Hub (da 401 sem auth). Copie o parquet para o
+#   # cluster e aponte PARQUET para ele (caminho DENTRO do bind /work):
+#   #   (no host) scp train.parquet \
+#   #       <user>@<cluster>:/raid/user_lucasalves/ufg/residencia/data/govexe/planos_train.parquet
+#   PARQUET=/work/ufg/residencia/data/govexe/planos_train.parquet \
+#       STAGE=build sbatch --gres=gpu:h100:0 slurm_run.sh
+#
 #   # 2) ViDoRe V3 com o trio SOTA 2026 (GPU):
 #   STAGE=vidore sbatch slurm_run.sh
 #
@@ -89,6 +96,10 @@ CONTAINER_IMAGE="${CONTAINER_IMAGE:-/raid/user_lucasalves/images/vllm-openai_lat
 HF_CACHE_DIR="${HF_CACHE_DIR:-/work/.cache/huggingface}"
 # 1 => o preflight trata warn (ex.: cair no ColQwen2 nativo) como erro e aborta o job.
 STRICT_PREFLIGHT="${STRICT_PREFLIGHT:-0}"
+# Parquet LOCAL dos planos (caminho DENTRO do bind /work). Vazio => baixa o dataset
+# GovExe/gov-br-linguagem-simples do Hub, que e PRIVADO (401 sem auth). Aponte para o
+# parquet copiado ao cluster, ex.: /work/ufg/residencia/data/govexe/planos_train.parquet
+PARQUET="${PARQUET:-}"
 
 # Configs avaliados em cada estagio (lista separada por espaco). O default e o trio SOTA
 # 2026: ColEmbed V2 8B (multi-vetor), Qwen3-VL-Embedding 8B (denso) e ColQwen2.5
@@ -107,6 +118,7 @@ mkdir -p logs
 echo "=== Job ${SLURM_JOB_ID:-local} em $(hostname) | $(date) ==="
 echo "    STAGE=$STAGE  LIMIT=${LIMIT:-<nenhum>}  FORCE=${FORCE:-<nao>}  RESIDENCIA_DIR=$RESIDENCIA_DIR"
 echo "    STRICT_PREFLIGHT=$STRICT_PREFLIGHT"
+echo "    PARQUET=${PARQUET:-<Hub (privado)>}"
 echo "    CONTAINER_IMAGE=$CONTAINER_IMAGE  HF_CACHE_DIR=$HF_CACHE_DIR"
 echo "    VIDORE_CONFIGS=$VIDORE_CONFIGS"
 echo "    GOVEXE_CONFIGS=$GOVEXE_CONFIGS"
@@ -127,6 +139,7 @@ export SINGULARITYENV_LIMIT="$LIMIT"
 export SINGULARITYENV_FORCE="$FORCE"
 export SINGULARITYENV_HF_CACHE_DIR="$HF_CACHE_DIR"
 export SINGULARITYENV_STRICT_PREFLIGHT="$STRICT_PREFLIGHT"
+export SINGULARITYENV_PARQUET="$PARQUET"
 export SINGULARITYENV_VIDORE_CONFIGS="$VIDORE_CONFIGS"
 export SINGULARITYENV_GOVEXE_CONFIGS="$GOVEXE_CONFIGS"
 
@@ -136,6 +149,7 @@ export APPTAINERENV_LIMIT="$LIMIT"
 export APPTAINERENV_FORCE="$FORCE"
 export APPTAINERENV_HF_CACHE_DIR="$HF_CACHE_DIR"
 export APPTAINERENV_STRICT_PREFLIGHT="$STRICT_PREFLIGHT"
+export APPTAINERENV_PARQUET="$PARQUET"
 export APPTAINERENV_VIDORE_CONFIGS="$VIDORE_CONFIGS"
 export APPTAINERENV_GOVEXE_CONFIGS="$GOVEXE_CONFIGS"
 
@@ -280,9 +294,11 @@ srun singularity exec \
             if [ "${FORCE:-}" = "1" ]; then
                 FORCE_ARGS=(--force)
             fi
-            # --parquet "" => baixa GovExe/gov-br-linguagem-simples (config planos) do Hub.
+            # PARQUET vazio => baixa GovExe/gov-br-linguagem-simples (config planos) do
+            # Hub (PRIVADO: da 401 sem auth). Com PARQUET apontando para o parquet local
+            # no bind /work, le do arquivo e nao toca no Hub.
             python3 -m data.govexe.build_planos_benchmark \
-                --parquet "" \
+                --parquet "${PARQUET:-}" \
                 --out-dir data/govexe/ptbr_planos \
                 ${LIMIT_ARGS[@]+"${LIMIT_ARGS[@]}"} \
                 ${FORCE_ARGS[@]+"${FORCE_ARGS[@]}"}
