@@ -91,6 +91,21 @@ flowchart TB
 | Observabilidade | **Cloud Logging/Monitoring**, alertas | saúde dos coletores, latência, falhas, DLQ |
 | Governança | **Dataplex** | catálogo, linhagem e qualidade sobre o lake |
 
+### 4.1 Etapa de embedding (Gold) — detalhe da Semana 7
+
+A representação do Gold usa o **modelo unificado Qwen3-VL-Embedding** (2B na primeira
+fatia; 8B ou WeMM-9B como teto), rodando em **VM GPU efêmera** (L4, `g2-standard-4`,
+**liga/desliga**) — custo proporcional ao lote, sem servidor ocioso. Os vetores saem
+**L2-normalizados** (MRL/Matryoshka para truncar a dimensão e baratear o índice) e vão
+para **Cloud SQL (PostgreSQL) + pgvector**, com **upsert idempotente por hash / id de
+página** (reprocessar não duplica). A consulta é por cosine (`<=>` do pgvector). **Áudio
+não entra no unificado** → **ASR→texto (pointer vector)**.
+
+A alternativa de **ensemble de especialistas + pointer vector** e o **protocolo de A/B**
+(unificado × ensemble) estão em `fusao/multimodal.md`. A implementação da fatia vertical
+(coletor → GCS → embedding → pgvector → consulta) está em `gcp/slice/` (ver
+`README-slice.md`): credenciais via **Secret Manager**, VM efêmera e **teardown** ao fim.
+
 ## 5. Idempotência, incremental e reprocesso
 
 - **Chave de deduplicação**: `hash(conteúdo)` + chave natural da fonte (ex.: `(proposicao_id, casa)`, `url_oficial`, `tse_sequencial`). Grava-se só o que é novo.
