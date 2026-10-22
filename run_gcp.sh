@@ -145,6 +145,54 @@ else
 fi
 
 # -------------------------------------------------------------------------------------
+# Guard "preferir o torch da imagem".
+#
+# A imagem base (Deep Learning VM) ja traz torch + CUDA casados com o driver, e nem o
+# venv (--system-site-packages) nem a camada --user devem conter um torch proprio. Mas o
+# pip resolve a arvore INTEIRA do requirements e qualquer dep que declare torch
+# (colpali-engine, peft, ...) instala um por cima. Esse torch vem sem as libs CUDA do no
+# -- o sintoma real foi
+#     ImportError: libnvJitLink.so.12: cannot open shared object file
+# -- e, por vir ANTES no sys.path, SOMBRA o torch funcional da imagem: o `import torch`
+# de benchmark/models/colvision.py quebra e derruba a rodada.
+#
+# Correcao: depois de instalar as deps, remover do alvo (venv ou $HOME/.local) o torch e
+# os pacotes colados nele. Roda em TODA rodada de proposito: editar o requirements
+# invalida o marcador de deps, dispara a reinstalacao e o torch indesejado volta. Quando
+# nao ha nada a limpar, o custo e um teste de existencia de diretorio.
+# -------------------------------------------------------------------------------------
+prefer_host_torch() {
+    # Mesma deteccao de alvo do bloco de deps / ensure_torchaudio: com venv ativo o
+    # torch indesejado estaria dentro do venv; sem venv, em $HOME/.local (--user).
+    if [ -n "${VIRTUAL_ENV:-}" ]; then
+        TORCH_ROOT="$VIRTUAL_ENV"
+    else
+        TORCH_ROOT="$HOME/.local"
+    fi
+
+    LOCAL_TORCH=""
+    for _f in "$TORCH_ROOT"/lib/python*/site-packages/torch/__init__.py; do
+        if [ -f "$_f" ]; then LOCAL_TORCH="$_f"; fi
+    done
+    if [ -z "$LOCAL_TORCH" ]; then
+        echo "--- sem torch em $TORCH_ROOT: o torch da imagem prevalece ---"
+        return 0
+    fi
+
+    echo "--- torch encontrado em $LOCAL_TORCH: removendo para o torch da imagem prevalecer ---"
+    for _sp in "$TORCH_ROOT"/lib/python*/site-packages; do
+        [ -d "$_sp" ] || continue
+        rm -rf "$_sp"/torch "$_sp"/torch-* "$_sp"/torchvision* \
+               "$_sp"/torchaudio* "$_sp"/nvidia* "$_sp"/functorch* || true
+    done
+
+    python3 -c "import torch; print(torch.__version__, torch.__file__)" \
+        || echo "aviso: import torch AINDA falha apos limpar $TORCH_ROOT -- o torch da imagem tambem esta quebrado; verifique a VM antes de gastar GPU"
+}
+
+prefer_host_torch
+
+# -------------------------------------------------------------------------------------
 # Reparo do torchaudio (algumas imagens GPU vem com ele ABI-incompativel com o torch).
 #
 # Visto na Deep Learning VM da GCP: torch 2.9.1+cu129 ok, mas o torchaudio da imagem

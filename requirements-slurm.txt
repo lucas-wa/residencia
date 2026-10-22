@@ -6,7 +6,19 @@
 # (run_gcp.sh, onde o venv e criado com --system-site-packages para herdar esse torch).
 #
 # NAO inclui torch: a imagem vLLM ja traz torch + CUDA casados com o driver do no.
-#   Reinstalar torch por pip quebraria a instalacao de CUDA do container.
+#   Reinstalar torch por pip quebraria a instalacao de CUDA do container. Isso NAO e so
+#   uma preferencia: quando o `uv pip install --system` falha (site-packages read-only) e
+#   os runners caem no `pip install --user`, o pip resolve a arvore inteira e QUALQUER dep
+#   que declare torch (colpali-engine, peft, bitsandbytes) arrasta um torch proprio para
+#   $HOME/.local. Esse torch vem sem as libs CUDA do no (`ImportError:
+#   libnvJitLink.so.12`), e como o --user vem ANTES no sys.path ele sombra o torch bom da
+#   imagem. Por isso os runners tem o guard `prefer_host_torch` (slurm_run.sh,
+#   run_gcp.sh, finetune/slurm_finetune.sh, finetune/run_gcp_finetune.sh), que limpa o
+#   torch do --user/venv depois de instalar as deps. Mantenha torch FORA deste arquivo.
+# NAO inclui bitsandbytes: ele so e usado no QLoRA (`finetune/train_lora.py` com
+#   METHOD=qlora) e e um dos que arrastam torch pela resolucao acima. Quem precisa dele e
+#   so `finetune/run_gcp_finetune.sh`, que o instala sob demanda com `--no-deps` quando
+#   METHOD=qlora. O benchmark e o LoRA bf16 da H100 nao o tocam.
 # NAO inclui faiss: benchmark/common/index.py cai para busca por produto interno em
 #   numpy quando faiss nao existe, e os corpora aqui sao pequenos (mesmo top-k).
 # NAO inclui flash-attn: os wrappers de modelo caem para attn_implementation="eager".
@@ -63,14 +75,15 @@ einops>=0.7
 # O finetuning (`finetune/train_lora.py`) usa o MESMO peft: LoraConfig/get_peft_model
 # para o LoRA e `prepare_model_for_kbit_training` para o QLoRA.
 peft>=0.11
-# bitsandbytes: so o QLoRA precisa (kernels NF4 do `BitsAndBytesConfig(load_in_4bit)`,
-# caminho da L4 24 GB em `finetune/run_gcp_finetune.sh`). O LoRA bf16 da H100
-# (`finetune/slurm_finetune.sh`) nao o toca, e o `--dry-run` do treinador roda sem ele
-# -- so avisa que faltaria. Nao e dep do benchmark.
+# bitsandbytes NAO entra aqui (ver o bloco no topo): so o QLoRA precisa dele (kernels NF4
+# do `BitsAndBytesConfig(load_in_4bit)`, caminho da L4 24 GB) e, listado aqui, ele entra
+# na resolucao de TODO job e arrasta torch para o --user. Quem o instala e
+# `finetune/run_gcp_finetune.sh`, sob demanda e com `--no-deps`, quando METHOD=qlora.
+# O LoRA bf16 da H100 (`finetune/slurm_finetune.sh`) nao o toca, e o `--dry-run` do
+# treinador roda sem ele -- so avisa que faltaria. Nao e dep do benchmark.
 # TODO confirmar em runtime: wheel com CUDA casado com o torch da imagem; se o import
 # reclamar de libcudart, reinstalar apontando o indice do PyTorch, como no reparo do
 # torchaudio dos runners.
-bitsandbytes>=0.43
 
 # huggingface_hub recente: backend Xet (download por chunk, bem mais rapido que HTTP
 # simples nos checkpoints grandes). Sem o extra `hf_xet` instalado, a variavel

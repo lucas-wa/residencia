@@ -154,7 +154,9 @@ fi
 echo "--- python: $(command -v python3) ($(python3 --version 2>&1)) ---"
 
 # Deps: mesmo cache por sha256 do requirements-slurm.txt do run_gcp.sh (o finetuning
-# acrescentou peft/bitsandbytes la -- bitsandbytes e o que habilita o 4-bit do QLoRA).
+# acrescentou `peft` la). bitsandbytes NAO esta no requirements de proposito -- ele so
+# serve ao 4-bit do QLoRA e, listado la, entraria na resolucao de TODO job arrastando
+# torch junto; aqui ele e instalado sob demanda, com --no-deps, por ensure_bitsandbytes.
 # Para forcar a reinstalacao: rm "$DEPS_MARKER_DIR"/.residencia_deps_*
 REQ_HASH="$(sha256sum requirements-slurm.txt | cut -d" " -f1)"
 DEPS_MARKER="$DEPS_MARKER_DIR/.residencia_deps_$REQ_HASH"
@@ -177,6 +179,45 @@ else
     fi
     touch "$DEPS_MARKER"
 fi
+
+# -------------------------------------------------------------------------------------
+# Guard "preferir o torch da imagem" (ver comentario longo no run_gcp.sh): o pip resolve
+# a arvore inteira do requirements e qualquer dep que declare torch instala um torch
+# proprio no venv/--user. Esse torch vem sem as libs CUDA do no (`ImportError:
+# libnvJitLink.so.12`) e, por vir antes no sys.path, sombra o torch bom da imagem.
+# Removemos o torch do alvo (venv ou $HOME/.local) para o da imagem prevalecer. Roda em
+# TODA rodada: mudar o requirements invalida o marcador de deps e o torch indesejado
+# volta.
+# -------------------------------------------------------------------------------------
+prefer_host_torch() {
+    # Mesma deteccao de alvo do bloco de deps / ensure_torchaudio.
+    if [ -n "${VIRTUAL_ENV:-}" ]; then
+        TORCH_ROOT="$VIRTUAL_ENV"
+    else
+        TORCH_ROOT="$HOME/.local"
+    fi
+
+    LOCAL_TORCH=""
+    for _f in "$TORCH_ROOT"/lib/python*/site-packages/torch/__init__.py; do
+        if [ -f "$_f" ]; then LOCAL_TORCH="$_f"; fi
+    done
+    if [ -z "$LOCAL_TORCH" ]; then
+        echo "--- sem torch em $TORCH_ROOT: o torch da imagem prevalece ---"
+        return 0
+    fi
+
+    echo "--- torch encontrado em $LOCAL_TORCH: removendo para o torch da imagem prevalecer ---"
+    for _sp in "$TORCH_ROOT"/lib/python*/site-packages; do
+        [ -d "$_sp" ] || continue
+        rm -rf "$_sp"/torch "$_sp"/torch-* "$_sp"/torchvision* \
+               "$_sp"/torchaudio* "$_sp"/nvidia* "$_sp"/functorch* || true
+    done
+
+    python3 -c "import torch; print(torch.__version__, torch.__file__)" \
+        || echo "aviso: import torch AINDA falha apos limpar $TORCH_ROOT -- o torch da imagem tambem esta quebrado; verifique a VM antes de gastar GPU"
+}
+
+prefer_host_torch
 
 # -------------------------------------------------------------------------------------
 # Reparo do torchaudio ABI-incompativel (ver comentario longo no run_gcp.sh): foi visto
@@ -210,6 +251,44 @@ ensure_torchaudio() {
 }
 
 ensure_torchaudio
+
+# -------------------------------------------------------------------------------------
+# bitsandbytes: SO o QLoRA precisa (kernels NF4 do `BitsAndBytesConfig(load_in_4bit)`).
+# Ele saiu do requirements-slurm.txt de proposito -- la, ele entrava na resolucao de todo
+# job e arrastava um torch proprio para o venv/--user, justamente o que o
+# `prefer_host_torch` acima tem de desfazer. Aqui ele e instalado sob demanda e com
+# `--no-deps`, que impede o pip de puxar torch junto: o torch da imagem ja esta no
+# ambiente e o wheel do bitsandbytes so precisa encontra-lo em runtime.
+#
+# Nao-fatal: se o indice estiver inacessivel ou o wheel nao casar com a CUDA da imagem,
+# `set -e` nao pode derrubar a rodada -- o erro reaparece no load, e o `--dry-run` do
+# treinador roda sem bitsandbytes (so avisa que faltaria).
+# -------------------------------------------------------------------------------------
+ensure_bitsandbytes() {
+    if [ "$METHOD" != "qlora" ]; then
+        echo "--- METHOD=$METHOD: bitsandbytes nao e necessario (so o QLoRA usa) ---"
+        return 0
+    fi
+    if python3 -c "import bitsandbytes" 2>/dev/null; then
+        echo "--- bitsandbytes ok (ja instalado) ---"
+        return 0
+    fi
+
+    # Mesma deteccao de alvo do bloco de deps / ensure_torchaudio.
+    PIP_USER=""
+    if [ -z "${VIRTUAL_ENV:-}" ]; then
+        PIP_USER="--user"
+    fi
+
+    echo "--- METHOD=qlora: instalando bitsandbytes (--no-deps, para nao arrastar torch) ---"
+    # shellcheck disable=SC2086
+    python3 -m pip install --quiet ${PIP_USER} --no-deps "bitsandbytes>=0.43" \
+        && python3 -c "import bitsandbytes" 2>/dev/null \
+        && echo "--- bitsandbytes instalado (import ok) ---" \
+        || echo "aviso: bitsandbytes indisponivel -- o QLoRA vai falhar no load (o --dry-run segue)"
+}
+
+ensure_bitsandbytes
 
 # -------------------------------------------------------------------------------------
 # Argumentos: cada opcional so entra quando a variavel esta setada.

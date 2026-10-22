@@ -219,6 +219,49 @@ srun singularity exec \
         fi
 
         # ---------------------------------------------------------------------------
+        # Guard "preferir o torch do container".
+        #
+        # Quando o `uv pip install --system` falha (site-packages do container
+        # read-only) e caimos no `pip install --user`, o pip resolve a arvore INTEIRA e
+        # qualquer dep que declare torch (colpali-engine, peft, ...) instala um torch
+        # PROPRIO em $HOME/.local. Esse torch vem sem as libs CUDA casadas com o no --
+        # o sintoma real no cluster foi
+        #     ImportError: libnvJitLink.so.12: cannot open shared object file
+        # -- e, como o site-packages --user vem ANTES do site-packages do container no
+        # sys.path, ele SOMBRA o torch funcional da imagem vLLM: o `import torch` de
+        # benchmark/models/colvision.py quebra e derruba o run_vidore inteiro.
+        #
+        # Correcao: depois de instalar as deps, remover do --user o torch e os pacotes
+        # que vem colados nele (torchvision/torchaudio/nvidia-*/functorch), para o torch
+        # da imagem voltar a prevalecer. Roda em TODO job de proposito: editar o
+        # requirements invalida o marcador de deps, dispara a reinstalacao e o torch
+        # --user volta. O custo quando nao ha nada a limpar e um teste de existencia de
+        # diretorio.
+        # ---------------------------------------------------------------------------
+        prefer_host_torch() {
+            USER_TORCH=""
+            for _f in "$HOME"/.local/lib/python*/site-packages/torch/__init__.py; do
+                if [ -f "$_f" ]; then USER_TORCH="$_f"; fi
+            done
+            if [ -z "$USER_TORCH" ]; then
+                echo "--- sem torch em --user: o torch do container prevalece ---"
+                return 0
+            fi
+
+            echo "--- torch encontrado em --user ($USER_TORCH): removendo para o torch do container prevalecer ---"
+            for _sp in "$HOME"/.local/lib/python*/site-packages; do
+                [ -d "$_sp" ] || continue
+                rm -rf "$_sp"/torch "$_sp"/torch-* "$_sp"/torchvision* \
+                       "$_sp"/torchaudio* "$_sp"/nvidia* "$_sp"/functorch* || true
+            done
+
+            python3 -c "import torch; print(torch.__version__, torch.__file__)" \
+                || echo "aviso: import torch AINDA falha apos limpar o --user -- o torch da imagem tambem esta quebrado; verifique o container antes de gastar GPU"
+        }
+
+        prefer_host_torch
+
+        # ---------------------------------------------------------------------------
         # Reparo do torchaudio (algumas imagens GPU vem com ele ABI-incompativel com o
         # torch). Visto na Deep Learning VM da GCP: torch 2.9.1+cu129 ok, mas o
         # torchaudio da imagem estoura "_torchaudio.abi3.so: undefined symbol:

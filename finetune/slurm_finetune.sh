@@ -160,7 +160,9 @@ srun singularity exec \
             || echo "--- sem GPU visivel (ok no DRY_RUN=1 sem LOAD_MODEL) ---"
 
         # Deps: mesmo cache por sha256 do requirements-slurm.txt do slurm_run.sh (o
-        # finetuning acrescentou peft/bitsandbytes la). Para forcar a reinstalacao:
+        # finetuning acrescentou `peft` la; bitsandbytes NAO entra -- ele so serve ao
+        # QLoRA da L4 e e instalado sob demanda em finetune/run_gcp_finetune.sh. O LoRA
+        # bf16 daqui nao o usa). Para forcar a reinstalacao:
         #     rm "$HOME"/.local/.residencia_deps_*
         REQ_HASH="$(sha256sum requirements-slurm.txt | cut -d" " -f1)"
         DEPS_MARKER="$HOME/.local/.residencia_deps_$REQ_HASH"
@@ -178,6 +180,36 @@ srun singularity exec \
             fi
             touch "$DEPS_MARKER"
         fi
+
+        # Guard "preferir o torch do container" (ver comentario longo no slurm_run.sh):
+        # quando o `uv pip install --system` falha e caimos no `pip install --user`, o
+        # pip arrasta um torch PROPRIO para $HOME/.local (puxado por colpali-engine/
+        # peft). Esse torch vem sem as libs CUDA do no (`ImportError:
+        # libnvJitLink.so.12`) e, por vir antes no sys.path, sombra o torch bom da
+        # imagem. Removemos o torch do --user para o da imagem prevalecer. Roda em TODO
+        # job: mudar o requirements invalida o marcador de deps e o torch --user volta.
+        prefer_host_torch() {
+            USER_TORCH=""
+            for _f in "$HOME"/.local/lib/python*/site-packages/torch/__init__.py; do
+                if [ -f "$_f" ]; then USER_TORCH="$_f"; fi
+            done
+            if [ -z "$USER_TORCH" ]; then
+                echo "--- sem torch em --user: o torch do container prevalece ---"
+                return 0
+            fi
+
+            echo "--- torch encontrado em --user ($USER_TORCH): removendo para o torch do container prevalecer ---"
+            for _sp in "$HOME"/.local/lib/python*/site-packages; do
+                [ -d "$_sp" ] || continue
+                rm -rf "$_sp"/torch "$_sp"/torch-* "$_sp"/torchvision* \
+                       "$_sp"/torchaudio* "$_sp"/nvidia* "$_sp"/functorch* || true
+            done
+
+            python3 -c "import torch; print(torch.__version__, torch.__file__)" \
+                || echo "aviso: import torch AINDA falha apos limpar o --user -- o torch da imagem tambem esta quebrado; verifique o container antes de gastar GPU"
+        }
+
+        prefer_host_torch
 
         # Reparo do torchaudio ABI-incompativel (ver comentario longo no slurm_run.sh):
         # transformers 5.x importa torchaudio de forma ansiosa e derruba qualquer
