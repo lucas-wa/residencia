@@ -1,0 +1,15 @@
+name: v3_colqwen2
+# ColQwen2 v1.0 -- a outra metade do par de continuidade (mesmo checkpoint de
+# `vidore_colqwen2.yaml`, que rodou no ViDoRe v2), agora no ViDoRe V3. Late interaction
+# (MaxSim), carregado pelo colpali-engine -- mesmo wrapper do `v3_colqwen25.yaml`.
+# No caminho nativo do transformers (>=4.49) o checkpoint vira `vidore/colqwen2-v1.0-hf`
+# -- `python -m benchmark.check_env` diz qual dos dois caminhos esta disponivel.
+model_id: vidore/colqwen2-v1.0
+model_kind: colqwen2
+# TODO confirmar em runtime: nomes dos subconjuntos/colunas do ViDoRe V3.
+dataset: vidore/vidore_v3_hr
+dtype: bfloat16
+batch_size: 4
+device: cuda
+k_values: [1, 5, 10]
+seed: 42

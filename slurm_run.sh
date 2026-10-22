@@ -105,7 +105,7 @@ PARQUET="${PARQUET:-}"
 # 2026: ColEmbed V2 8B (multi-vetor), Qwen3-VL-Embedding 8B (denso) e ColQwen2.5
 # (baseline atualizado). Os configs v2 seguem no repo como referencia -- rode-os
 # explicitamente se precisar refazer o historico.
-VIDORE_CONFIGS="${VIDORE_CONFIGS:-benchmark/configs/v3_colembed8b.yaml benchmark/configs/v3_qwen3vl8b.yaml benchmark/configs/v3_colqwen25.yaml}"
+VIDORE_CONFIGS="${VIDORE_CONFIGS:-benchmark/configs/v3_colpali.yaml benchmark/configs/v3_colqwen2.yaml benchmark/configs/v3_colembed8b.yaml benchmark/configs/v3_jinav4.yaml benchmark/configs/v3_colqwen25.yaml}"
 GOVEXE_CONFIGS="${GOVEXE_CONFIGS:-benchmark/configs/govexe_colembed8b.yaml benchmark/configs/govexe_qwen3vl8b.yaml benchmark/configs/govexe_colqwen25.yaml}"
 
 case "$STAGE" in
@@ -307,7 +307,7 @@ srun singularity exec \
         # Trio SOTA 2026 avaliado no ViDoRe V3. Os configs v2 (vidore_colqwen2/
         # vidore_colpali) continuam no repo como REFERENCIA historica e NAO rodam por
         # padrao -- para refaze-los, use VIDORE_CONFIGS (ver bloco de USO no topo).
-        VIDORE_CONFIGS="${VIDORE_CONFIGS:-benchmark/configs/v3_colembed8b.yaml benchmark/configs/v3_qwen3vl8b.yaml benchmark/configs/v3_colqwen25.yaml}"
+        VIDORE_CONFIGS="${VIDORE_CONFIGS:-benchmark/configs/v3_colpali.yaml benchmark/configs/v3_colqwen2.yaml benchmark/configs/v3_colembed8b.yaml benchmark/configs/v3_jinav4.yaml benchmark/configs/v3_colqwen25.yaml}"
         GOVEXE_CONFIGS="${GOVEXE_CONFIGS:-benchmark/configs/govexe_colembed8b.yaml benchmark/configs/govexe_qwen3vl8b.yaml benchmark/configs/govexe_colqwen25.yaml}"
 
         run_vidore() {

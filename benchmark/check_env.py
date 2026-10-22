@@ -47,6 +47,8 @@ LIBS = {
     "sentence-transformers": "sentence_transformers",
     "mteb": "mteb",
     "open_clip_torch": "open_clip_torch",
+    # o custom code do jina-embeddings-v4 carrega adaptadores LoRA por task -> precisa de peft
+    "peft": "peft",
     "pypdfium2": "pypdfium2",
     "numpy": "numpy",
 }

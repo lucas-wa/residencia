@@ -3,7 +3,8 @@ from __future__ import annotations
 from benchmark.common.config import ExperimentConfig
 
 # Late interaction (ranqueado por MaxSim em `benchmark.common.index.maxsim_search`).
-# `qwen3vl` NAO entra aqui: o Qwen3-VL-Embedding e denso (um vetor por item).
+# `qwen3vl` e `jinav4` NAO entram aqui: os dois sao densos (um vetor por item). O
+# jina-v4 tambem sabe fazer multi-vetor, mas o wrapper atual so expoe o caminho denso.
 _MULTI = {"colpali", "colqwen2", "colqwen2.5", "colembed"}
 # Subconjunto de _MULTI atendido pelo wrapper do colpali-engine.
 _COLVISION = {"colpali", "colqwen2", "colqwen2.5"}
@@ -42,4 +43,9 @@ def build_retriever(cfg: ExperimentConfig):
 
         return Qwen3VLEmbedRetriever(cfg.model_id, device=cfg.device, dtype=cfg.dtype,
                                      batch_size=cfg.batch_size)
+    if cfg.model_kind == "jinav4":
+        from benchmark.models.jina_embed import JinaV4Retriever
+
+        return JinaV4Retriever(cfg.model_id, device=cfg.device, dtype=cfg.dtype,
+                               batch_size=cfg.batch_size)
     raise ValueError(f"model_kind desconhecido: {cfg.model_kind}")

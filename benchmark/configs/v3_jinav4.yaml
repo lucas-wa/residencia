@@ -1,0 +1,20 @@
+name: v3_jinav4
+# jina-embeddings-v4 -- embedder DENSO (um vetor por item) no modo `retrieval`.
+# Query = texto, documento = imagem da pagina; indexado por produto interno
+# (runner com multi_vector=False).
+# LICENCA: o repo saiu por engano como CC-BY-NC-4.0 e o card corrige para a *Qwen
+# Research License* (deriva do Qwen2.5-VL-3B). Nao comercial nos dois casos ->
+# PESQUISA, nao producao. Reconferir o card antes de qualquer uso oficial.
+# API de encode confirmada no card: `encode_text(..., task="retrieval",
+# prompt_name="query")` / `encode_image(..., task="retrieval")`, custom code
+# (trust_remote_code). O modo multi-vetor (`return_multivector=True`) fica para depois.
+model_id: jinaai/jina-embeddings-v4
+model_kind: jinav4
+# TODO confirmar em runtime: nomes dos subconjuntos/colunas do ViDoRe V3.
+dataset: vidore/vidore_v3_hr
+dtype: bfloat16
+# ~3.8B (base Qwen2.5-VL-3B): folgado no H100, mesmo com paginas inteiras.
+batch_size: 4
+device: cuda
+k_values: [1, 5, 10]
+seed: 42

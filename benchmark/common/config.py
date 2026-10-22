@@ -12,6 +12,7 @@ ModelKind = Literal[
     "colqwen2.5",  # vidore/colqwen2.5-* via colpali-engine (late interaction)
     "colembed",    # NVIDIA Nemotron ColEmbed V2 (late interaction, trust_remote_code)
     "qwen3vl",     # Qwen3-VL-Embedding (denso, um vetor por item)
+    "jinav4",      # jina-embeddings-v4 (denso nesta versao; trust_remote_code)
 ]
 
 

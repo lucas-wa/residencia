@@ -1,0 +1,15 @@
+name: v3_colpali
+# ColPali v1.3 -- metade do par de continuidade (o mesmo checkpoint rodado no ViDoRe v2
+# em `vidore_colpali.yaml`), agora no ViDoRe V3. Late interaction (MaxSim), carregado
+# pelo colpali-engine -- mesmo wrapper do `v3_colqwen25.yaml`.
+# LICENCA: base PaliGemma -> licenca Gemma, restritiva. Entra como baseline
+# NAO-GOVERNAMENTAL (comparacao historica), nunca como candidato de producao.
+model_id: vidore/colpali-v1.3
+model_kind: colpali
+# TODO confirmar em runtime: nomes dos subconjuntos/colunas do ViDoRe V3.
+dataset: vidore/vidore_v3_hr
+dtype: bfloat16
+batch_size: 2
+device: cuda
+k_values: [1, 5, 10]
+seed: 42
