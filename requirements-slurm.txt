@@ -60,7 +60,17 @@ einops>=0.7
 # Qwen2.5-VL-3B) e o modeling remoto carrega um adaptador LoRA POR TASK
 # (retrieval/text-matching/code) -> sem `peft` o from_pretrained estoura no import.
 # `benchmark.check_env` reporta a versao instalada.
+# O finetuning (`finetune/train_lora.py`) usa o MESMO peft: LoraConfig/get_peft_model
+# para o LoRA e `prepare_model_for_kbit_training` para o QLoRA.
 peft>=0.11
+# bitsandbytes: so o QLoRA precisa (kernels NF4 do `BitsAndBytesConfig(load_in_4bit)`,
+# caminho da L4 24 GB em `finetune/run_gcp_finetune.sh`). O LoRA bf16 da H100
+# (`finetune/slurm_finetune.sh`) nao o toca, e o `--dry-run` do treinador roda sem ele
+# -- so avisa que faltaria. Nao e dep do benchmark.
+# TODO confirmar em runtime: wheel com CUDA casado com o torch da imagem; se o import
+# reclamar de libcudart, reinstalar apontando o indice do PyTorch, como no reparo do
+# torchaudio dos runners.
+bitsandbytes>=0.43
 
 # huggingface_hub recente: backend Xet (download por chunk, bem mais rapido que HTTP
 # simples nos checkpoints grandes). Sem o extra `hf_xet` instalado, a variavel

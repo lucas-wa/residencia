@@ -11,6 +11,8 @@ venv/
 
 # Benchmark outputs and heavy artifacts
 results/
+# adaptadores LoRA/QLoRA salvos por finetune/train_lora.py (pesos, centenas de MB)
+finetune/runs/
 data/govexe/pages/
 data/govexe/ptbr_planos/pages/
 data/govexe/ptbr_planos/pdf_cache/
