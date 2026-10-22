@@ -4,14 +4,27 @@ Query = texto; documento = imagem da pagina (`Doc.image_path`). Os dois lados sa
 L2-normalizados, entao `score` e um produto interno -- `runner.evaluate(...,
 multi_vector=False)` indexa com FAISS/numpy.
 
-Checkpoint: `Qwen/Qwen3-VL-Embedding-8B` (ha 2B/4B na mesma familia).
-Repo de referencia: github.com/QwenLM/Qwen3-VL-Embedding.
+Checkpoint default: `Qwen/Qwen3-VL-Embedding-2B` (cabe folgado numa L4 24 GB); ha
+4B/8B na mesma familia -- troque por `model_id`. Repo de referencia:
+github.com/QwenLM/Qwen3-VL-Embedding.
 
 `dim` ativa Matryoshka (MRL): o vetor e truncado para `dim` e renormalizado. `None`
 mantem a dimensao nativa do checkpoint.
 
 `_embed_queries` / `_embed_images` sao metodos de instancia de proposito: o teste de
 contrato os substitui para exercitar o wrapper sem baixar pesos.
+
+Alem do protocolo `Retriever` (usado pelo benchmark), o modulo expoe o mesmo encode
+como API de inferencia fora do benchmark -- e o embedder da fatia GCP:
+
+    from benchmark.models.qwen3vl_embed import embed_images, embed_texts
+
+    vecs = embed_images(["pagina0.png", "pagina1.png"])   # [N, dim] float32, L2=1
+    q = embed_texts(["metas de saude"])                   # [1, dim] float32, L2=1
+    scores = q @ vecs.T                                   # produto interno = cosseno
+
+`get_embedder` guarda o modelo carregado num cache por (model_id, device, dtype,
+batch_size, dim), entao chamadas repetidas em um mesmo processo nao recarregam pesos.
 """
 
 from __future__ import annotations
@@ -30,6 +43,9 @@ _QUERY_FNS = ("encode_query", "embed_query", "get_query_embeddings", "encode_que
 _IMAGE_FNS = ("encode_document", "embed_document", "get_doc_embeddings", "encode_images",
               "encode_corpus")
 
+# 2B e o default da inferencia fora do benchmark (fatia GCP, VM L4 24 GB).
+DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-Embedding-2B"
+
 
 def _l2_normalize(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype="float32")
@@ -38,8 +54,8 @@ def _l2_normalize(x: np.ndarray) -> np.ndarray:
 
 
 class Qwen3VLEmbedRetriever:
-    def __init__(self, model_id: str, device: str = "cuda", dtype: str = "bfloat16",
-                 batch_size: int = 8, dim: int | None = None):
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: str = "cuda",
+                 dtype: str = "bfloat16", batch_size: int = 8, dim: int | None = None):
         import torch
         from transformers import AutoModel, AutoProcessor
 
@@ -150,13 +166,62 @@ class Qwen3VLEmbedRetriever:
                     im.close()
         return np.vstack(out) if out else np.zeros((0, 1), dtype="float32")
 
+    # -- API de inferencia (fora do benchmark) -----------------------------------
+
+    def embed_images(self, paths: list[str]) -> np.ndarray:
+        """Caminhos de imagem -> `[N, dim]` float32 L2-normalizado (um vetor por pagina)."""
+        return self._postprocess(self._embed_images(list(paths)))
+
+    def embed_texts(self, texts: list[str]) -> np.ndarray:
+        """Textos -> `[N, dim]` float32 L2-normalizado (mesmo espaco das imagens)."""
+        return self._postprocess(self._embed_queries(list(texts)))
+
     # -- Retriever protocol ------------------------------------------------------
 
     def encode_queries(self, queries: list[Query]) -> np.ndarray:
-        return self._postprocess(self._embed_queries([q.text or "" for q in queries]))
+        return self.embed_texts([q.text or "" for q in queries])
 
     def encode_corpus(self, docs: list[Doc]) -> np.ndarray:
-        return self._postprocess(self._embed_images([d.image_path or "" for d in docs]))
+        return self.embed_images([d.image_path or "" for d in docs])
 
     def score(self, q_emb: np.ndarray, d_emb: np.ndarray) -> np.ndarray:
         return q_emb @ d_emb.T
+
+
+# -- API de modulo: embedding reutilizavel fora do benchmark ----------------------------
+
+_EMBEDDERS: dict[tuple, Qwen3VLEmbedRetriever] = {}
+
+
+def get_embedder(model_id: str = DEFAULT_MODEL_ID, device: str = "cuda",
+                 dtype: str = "bfloat16", batch_size: int = 8,
+                 dim: int | None = None) -> Qwen3VLEmbedRetriever:
+    """Embedder carregado (cache por configuracao) -- evita recarregar pesos no processo."""
+    key = (model_id, device, dtype, batch_size, dim)
+    emb = _EMBEDDERS.get(key)
+    if emb is None:
+        emb = _EMBEDDERS[key] = Qwen3VLEmbedRetriever(
+            model_id, device=device, dtype=dtype, batch_size=batch_size, dim=dim)
+    return emb
+
+
+def embed_images(paths: list[str], *, model_id: str = DEFAULT_MODEL_ID, device: str = "cuda",
+                 dtype: str = "bfloat16", batch_size: int = 8, dim: int | None = None,
+                 embedder: Qwen3VLEmbedRetriever | None = None) -> np.ndarray:
+    """Embute imagens de pagina -> `np.ndarray [N, dim]` float32 L2-normalizado.
+
+    `embedder` injeta um wrapper ja carregado (ou um duble, nos testes); sem ele o
+    modelo vem de `get_embedder(...)`.
+    """
+    emb = embedder or get_embedder(model_id=model_id, device=device, dtype=dtype,
+                                   batch_size=batch_size, dim=dim)
+    return emb.embed_images(list(paths))
+
+
+def embed_texts(texts: list[str], *, model_id: str = DEFAULT_MODEL_ID, device: str = "cuda",
+                dtype: str = "bfloat16", batch_size: int = 8, dim: int | None = None,
+                embedder: Qwen3VLEmbedRetriever | None = None) -> np.ndarray:
+    """Embute textos (consultas) -> `np.ndarray [N, dim]` float32 L2-normalizado."""
+    emb = embedder or get_embedder(model_id=model_id, device=device, dtype=dtype,
+                                   batch_size=batch_size, dim=dim)
+    return emb.embed_texts(list(texts))
