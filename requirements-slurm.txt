@@ -93,6 +93,14 @@ huggingface_hub[hf_xet]>=0.34
 # mas o preflight precisa dele mesmo quando o transformers falta)
 packaging>=23.0
 
+# transformers 5.x importa `soxr` INCONDICIONALMENTE no ramo is_librosa_available() de
+# audio_utils (processing_utils -> audio_utils). O container tem librosa mas NAO tem soxr
+# -> `ModuleNotFoundError: No module named 'soxr'` derruba QUALQUER import de modelo
+# (colpali_engine/Gemma3 etc.). soxr depende so de numpy (nao arrasta torch), entao entra
+# aqui com seguranca. Mesma familia do reparo do torchaudio: o transformers 5.x carrega
+# deps de audio de forma ansiosa.
+soxr>=0.3.2
+
 mteb>=1.14
 datasets>=2.19
 
