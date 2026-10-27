@@ -57,7 +57,9 @@ open_clip_torch>=2.24
 # esse codigo remoto importa:
 #   - accelerate: exigido pelo `device_map=` do from_pretrained;
 #   - qwen-vl-utils: helper de visao dos modelos Qwen-VL (process_vision_info, resize
-#     dinamico das paginas). O custom code do Qwen3-VL-Embedding o importa;
+#     dinamico das paginas). O wrapper do Qwen3-VL-Embedding o usa no encode de imagem
+#     (ver benchmark/models/qwen3vl_embed.py); o card pede >=0.0.14, que e a serie com
+#     `image_patch_size` (o Qwen3-VL usa patch 16, nao 14);
 #   - einops: rearranjos de tensor usados pelo backbone Eagle2/Qwen3-VL do ColEmbed.
 # `sentence-transformers` (acima) cobre o caminho alternativo caso o Qwen3-VL-Embedding
 # seja carregado pelo wrapper ST em vez de AutoModel.
@@ -66,7 +68,7 @@ open_clip_torch>=2.24
 # ColQwen2.5 nao pede nada novo -- entra pelo colpali-engine ja listado (quando a release
 # instalada nao expuser `ColQwen2_5`, o wrapper usa `ColQwen2` com o checkpoint 2.5).
 accelerate>=0.30
-qwen-vl-utils>=0.0.8
+qwen-vl-utils>=0.0.14
 einops>=0.7
 # jina-embeddings-v4 (benchmark/models/jina_embed.py) tambem e custom code (base
 # Qwen2.5-VL-3B) e o modeling remoto carrega um adaptador LoRA POR TASK

@@ -12,7 +12,9 @@ import pytest
 
 from benchmark.models import qwen3vl_embed as mod
 from benchmark.models.qwen3vl_embed import (
+    DEFAULT_INSTRUCTION,
     DEFAULT_MODEL_ID,
+    MAX_LENGTH,
     Qwen3VLEmbedRetriever,
     embed_images,
     embed_texts,
@@ -73,7 +75,8 @@ class _ModelComEncode:
         return [np.array([0.0, 5.0, 12.0, 0.0], dtype="float32")[: self.dim] for _ in images]
 
 
-def _bare(model, proc=None, batch_size=2, dim=None) -> Qwen3VLEmbedRetriever:
+def _bare(model, proc=None, batch_size=2, dim=None,
+          instruction=DEFAULT_INSTRUCTION) -> Qwen3VLEmbedRetriever:
     """Instancia sem __init__ (nao carrega pesos)."""
     r = Qwen3VLEmbedRetriever.__new__(Qwen3VLEmbedRetriever)
     r.name = "qwen3vl:test"
@@ -81,6 +84,8 @@ def _bare(model, proc=None, batch_size=2, dim=None) -> Qwen3VLEmbedRetriever:
     r.device = "cpu"
     r.batch_size = batch_size
     r.dim = dim
+    r.instruction = instruction
+    r.max_length = MAX_LENGTH
     r._model = model
     r._proc = proc
     return r
@@ -141,8 +146,55 @@ def test_dim_trunca_e_renormaliza(fake_libs):
     assert np.allclose(np.linalg.norm(vecs, axis=1), 1.0)
 
 
+# -- caminho real: chat template -> input_ids (+ pixel_values) -> pooling do ultimo token --
+#
+# O checkpoint nao expoe metodo de encode (config.json sem auto_map), entao este e o
+# caminho que a rodada de verdade percorre. O duble do modelo exige `input_ids`: sem
+# eles o Qwen3VLModel estoura "You must specify exactly one of input_ids or
+# inputs_embeds" -- o bug que o wrapper tinha ao mandar `processor(images=...)` cru.
+
+
+class _Tensor:
+    """Tensor minimo: so `.to(device)` e `.sum(dim=...)`, que e o que o wrapper usa."""
+
+    def __init__(self, data):
+        self.data = np.asarray(data)
+        self.movido_para = None
+
+    def to(self, device):
+        self.movido_para = device
+        return self
+
+    def sum(self, dim=0):
+        return self.data.sum(axis=dim)
+
+
+class _Processor:
+    """Processor do Qwen3-VL dublado: chat template + batch com input_ids."""
+
+    def __init__(self, n_tokens=3):
+        self.conversas: list[list[dict]] = []
+        self.chamadas: list[dict] = []
+        self.n_tokens = n_tokens
+
+    def apply_chat_template(self, conversation, add_generation_prompt=False, tokenize=True):
+        assert add_generation_prompt is True and tokenize is False
+        self.conversas.append(conversation)
+        n_img = sum(1 for msg in conversation for c in msg["content"] if c["type"] == "image")
+        return "<|im_start|>" + "<|image_pad|>" * n_img + "<|im_start|>assistant\n"
+
+    def __call__(self, **kwargs):
+        self.chamadas.append(kwargs)
+        n = len(kwargs["text"])
+        out = {"input_ids": _Tensor([[1] * self.n_tokens] * n),
+               "attention_mask": _Tensor([[1] * self.n_tokens] * n)}
+        if kwargs.get("images"):
+            out["pixel_values"] = _Tensor(np.zeros((len(kwargs["images"]), 2)))
+        return out
+
+
 class _ModelGenerico:
-    """Duble sem API de encode: forca o caminho processor + forward + pooling."""
+    """Duble do Qwen3VLModel: exige `input_ids` e devolve `last_hidden_state`."""
 
     device = "cpu"
 
@@ -150,40 +202,102 @@ class _ModelGenerico:
         self.inputs_vistos: list[dict] = []
 
     def __call__(self, **inputs):
+        if "input_ids" not in inputs:
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         self.inputs_vistos.append(inputs)
-        n = len(inputs["pixel_values"].rows)
-        return types.SimpleNamespace(
-            embeddings=np.array([[1.0, 1.0, 1.0, 1.0]] * n, dtype="float32"))
+        n, n_tokens = inputs["input_ids"].data.shape
+        hidden = np.zeros((n, n_tokens, 4), dtype="float32")
+        hidden[:, -1, :] = 1.0          # so o ULTIMO token carrega o vetor [1,1,1,1]
+        return types.SimpleNamespace(last_hidden_state=hidden)
 
 
-class _Tensor:
-    def __init__(self, rows):
-        self.rows = rows
+@pytest.fixture
+def fake_vision(monkeypatch):
+    """`qwen_vl_utils.process_vision_info` dublado; devolve as conversas que recebeu."""
+    conversas: list = []
 
-    def to(self, _device):
-        return self
+    def process_vision_info(convs, image_patch_size=None):
+        conversas.append((convs, image_patch_size))
+        imgs = [c["image"] for conv in convs for msg in conv for c in msg["content"]
+                if c["type"] == "image"]
+        return (imgs or None, None)
+
+    qvu = types.ModuleType("qwen_vl_utils")
+    qvu.process_vision_info = process_vision_info
+    monkeypatch.setitem(sys.modules, "qwen_vl_utils", qvu)
+    return conversas
 
 
-class _Processor:
-    def __init__(self):
-        self.chamadas: list[dict] = []
-
-    def __call__(self, **kwargs):
-        self.chamadas.append(kwargs)
-        items = kwargs.get("images") or kwargs.get("text")
-        return {"pixel_values": _Tensor(list(items))}
-
-
-def test_caminho_generico_usa_processor_e_normaliza(tmp_path, fake_libs):
+def test_imagem_monta_input_ids_e_pixel_values(tmp_path, fake_libs, fake_vision):
     model, proc = _ModelGenerico(), _Processor()
     r = _bare(model, proc=proc, batch_size=4)
 
     vecs = embed_images(_paths(tmp_path, 2), embedder=r)
 
+    # o batch entregue ao modelo tem input_ids (do chat template) E pixel_values
+    batch = model.inputs_vistos[0]
+    assert "input_ids" in batch and "pixel_values" in batch and "attention_mask" in batch
+    assert batch["input_ids"].movido_para == "cpu"
+    # conversa: system com a instrucao + user com a imagem
+    conv = proc.conversas[0]
+    assert [m["role"] for m in conv] == ["system", "user"]
+    assert conv[0]["content"][0]["text"] == DEFAULT_INSTRUCTION
+    assert conv[1]["content"][0]["type"] == "image"
+    # imagens passam pelo process_vision_info (patch 16) -> processor sem resize proprio
+    assert fake_vision[0][1] == mod.IMAGE_PATCH_SIZE
+    assert proc.chamadas[0]["do_resize"] is False
+    assert proc.chamadas[0]["max_length"] == MAX_LENGTH
+    # saida [N, dim] L2-normalizada
     assert vecs.shape == (2, 4)
     assert np.allclose(np.linalg.norm(vecs, axis=1), 1.0)
     assert np.allclose(vecs, 0.5)                       # [1,1,1,1]/2
-    assert proc.chamadas and "images" in proc.chamadas[0]
+
+
+def test_texto_monta_input_ids_sem_pixel_values(fake_libs, fake_vision):
+    model, proc = _ModelGenerico(), _Processor()
+    r = _bare(model, proc=proc, batch_size=4)
+
+    vecs = embed_texts(["metas de saude", "orcamento"], embedder=r)
+
+    batch = model.inputs_vistos[0]
+    assert "input_ids" in batch and "pixel_values" not in batch
+    assert "images" not in proc.chamadas[0]
+    assert not fake_vision                              # sem imagem, sem qwen_vl_utils
+    conv = proc.conversas[0]
+    assert conv[1]["content"] == [{"type": "text", "text": "metas de saude"}]
+    assert vecs.shape == (2, 4)
+    assert np.allclose(np.linalg.norm(vecs, axis=1), 1.0)
+
+
+def test_sem_qwen_vl_utils_manda_as_pil_cruas(tmp_path, fake_libs, monkeypatch):
+    """Sem o helper oficial o processor recebe as imagens e faz o resize sozinho."""
+    monkeypatch.setitem(sys.modules, "qwen_vl_utils", None)   # import -> ImportError
+    model, proc = _ModelGenerico(), _Processor()
+    r = _bare(model, proc=proc, batch_size=4)
+
+    vecs = embed_images(_paths(tmp_path, 2), embedder=r)
+
+    assert len(proc.chamadas[0]["images"]) == 2
+    assert "do_resize" not in proc.chamadas[0]
+    assert "pixel_values" in model.inputs_vistos[0]
+    assert vecs.shape == (2, 4)
+
+
+def test_pooling_pega_o_ultimo_token_nao_pad():
+    hidden = np.arange(2 * 3 * 2, dtype="float32").reshape(2, 3, 2)
+    mask = _Tensor([[1, 1, 0], [1, 1, 1]])              # padding a direita
+    pooled = Qwen3VLEmbedRetriever._pool(hidden, mask)
+    assert np.allclose(pooled, [hidden[0, 1], hidden[1, 2]])
+
+
+def test_instrucao_customizada_vai_no_system_prompt(fake_libs, fake_vision):
+    proc = _Processor()
+    r = _bare(_ModelGenerico(), proc=proc, batch_size=4,
+              instruction="Retrieve relevant documents for the query")
+    embed_texts(["x"], embedder=r)
+    # ponto final acrescentado como no modeling de referencia
+    assert proc.conversas[0][0]["content"][0]["text"] == (
+        "Retrieve relevant documents for the query.")
 
 
 def test_default_e_o_2b():
