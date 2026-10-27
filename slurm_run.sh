@@ -154,6 +154,7 @@ export APPTAINERENV_VIDORE_CONFIGS="$VIDORE_CONFIGS"
 export APPTAINERENV_GOVEXE_CONFIGS="$GOVEXE_CONFIGS"
 
 srun singularity exec \
+    --nv \
     --no-home \
     --bind "/raid/user_lucasalves/:/work" \
     "$CONTAINER_IMAGE" \

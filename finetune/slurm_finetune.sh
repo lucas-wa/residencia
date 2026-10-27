@@ -132,6 +132,7 @@ for _v in RESIDENCIA_DIR HF_CACHE_DIR DRY_RUN LOAD_MODEL PAIRS BASE METHOD OUTPU
 done
 
 srun singularity exec \
+    --nv \
     --no-home \
     --bind "/raid/user_lucasalves/:/work" \
     "$CONTAINER_IMAGE" \
