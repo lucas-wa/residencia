@@ -96,9 +96,10 @@ CONTAINER_IMAGE="${CONTAINER_IMAGE:-/raid/user_lucasalves/images/vllm-openai_lat
 HF_CACHE_DIR="${HF_CACHE_DIR:-/work/.cache/huggingface}"
 # 1 => o preflight trata warn (ex.: cair no ColQwen2 nativo) como erro e aborta o job.
 STRICT_PREFLIGHT="${STRICT_PREFLIGHT:-0}"
-# Parquet LOCAL dos planos (caminho DENTRO do bind /work). Vazio => baixa o dataset
-# GovExe/gov-br-linguagem-simples do Hub, que e PRIVADO (401 sem auth). Aponte para o
-# parquet copiado ao cluster, ex.: /work/ufg/residencia/data/govexe/planos_train.parquet
+# Parquet LOCAL dos planos (caminho DENTRO do bind /work). Vazio => baixa do Hub o
+# espelho PUBLICO lucas-wa/gov-br-linguagem-simples, que nao exige token. Aponte para o
+# parquet copiado ao cluster para rodar offline / fixar a versao, ex.:
+# /work/ufg/residencia/data/govexe/planos_train.parquet
 PARQUET="${PARQUET:-}"
 
 # Configs avaliados em cada estagio (lista separada por espaco). O default e o trio SOTA
@@ -338,9 +339,10 @@ srun singularity exec \
             if [ "${FORCE:-}" = "1" ]; then
                 FORCE_ARGS=(--force)
             fi
-            # PARQUET vazio => baixa GovExe/gov-br-linguagem-simples (config planos) do
-            # Hub (PRIVADO: da 401 sem auth). Com PARQUET apontando para o parquet local
-            # no bind /work, le do arquivo e nao toca no Hub.
+            # PARQUET vazio => baixa do Hub o espelho PUBLICO
+            # lucas-wa/gov-br-linguagem-simples (config planos), que nao exige token. Com
+            # PARQUET apontando para o parquet local no bind /work, le do arquivo e nao
+            # toca no Hub (modo offline / versao fixa).
             python3 -m data.govexe.build_planos_benchmark \
                 --parquet "${PARQUET:-}" \
                 --out-dir data/govexe/ptbr_planos \

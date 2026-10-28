@@ -37,7 +37,7 @@ Plano com PDF corrompido/ilegível é **pulado com aviso**, sem abortar o lote.
 python -m data.govexe.build_planos_benchmark \
   --parquet /mnt/d/projects/govexe/dataset/planos/train.parquet \
   --out-dir data/govexe/ptbr_planos
-# sem --parquet local: usa load_dataset("GovExe/gov-br-linguagem-simples", "planos")
+# sem --parquet local: usa load_dataset("lucas-wa/gov-br-linguagem-simples", "planos")
 ```
 
 Saída: `data/govexe/ptbr_planos/{pages/*.png, corpus.jsonl, queries.jsonl, qrels.tsv}`

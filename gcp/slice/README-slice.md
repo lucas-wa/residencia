@@ -123,7 +123,8 @@ CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
 **Tabela**: o `embed_job.py` a cria sozinho no primeiro upsert (ele conhece a dimensão
-real do checkpoint). Para criar à mão, troque `<dim>` pela dimensão do modelo:
+com que está indexando). Para criar à mão, use a mesma dimensão do `--dim` do job (1024
+por padrão):
 
 ```sql
 CREATE TABLE IF NOT EXISTS govexe_pages (
@@ -132,12 +133,22 @@ CREATE TABLE IF NOT EXISTS govexe_pages (
     uri            TEXT NOT NULL,
     content_sha256 TEXT NOT NULL,
     model_id       TEXT NOT NULL,
-    embedding      VECTOR(<dim>) NOT NULL,
+    embedding      VECTOR(1024) NOT NULL,   -- = --dim do embed_job (teto do HNSW: 2000)
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS govexe_pages_embedding_cos
     ON govexe_pages USING hnsw (embedding vector_cosine_ops);
 ```
+
+> **Teto de 2000 dimensões.** O índice do pgvector (`hnsw` e também `ivfflat`) não aceita
+> coluna acima de **2000 dimensões** — passar disso faz o `CREATE INDEX` estourar
+> `column cannot have more than 2000 dimensions for hnsw index`. O
+> `Qwen/Qwen3-VL-Embedding-2B` entrega **2048** nativas, então a fatia indexa em **1024**
+> por padrão (`--dim`, Matryoshka/MRL: trunca o vetor e renormaliza, preservando o
+> cosseno). Indexar as 2048 nativas exigiria abrir mão do índice (busca exata, sem HNSW);
+> com `--dim` acima de 2000 o `embed_job.py` falha de propósito, antes do DDL, com um
+> recado apontando este teto. A consulta do §8 usa a mesma dimensão por padrão — se você
+> indexar com outro `--dim`, passe o mesmo valor ao `query.py`.
 
 `page_id` é a chave primária e é o **stem do arquivo** (`<tse_seq>_p<NN>`), o mesmo id de
 página do `corpus.jsonl` — é ele que torna a ingestão idempotente.
@@ -231,11 +242,25 @@ python -m gcp.slice.embed_job \
     --blob-prefix "bronze/fonte=tse_planos/dt=$DT/" \
     --work-dir /tmp/govexe-bronze \
     --source tse_planos \
-    --device cuda --batch-size 8 \
+    --device cuda --batch-size 8 --dim 1024 \
     --pg-host 127.0.0.1 --pg-port 5432 --pg-db "$DB" --pg-user "$DB_USER"
 ```
 
 Saída esperada: `N páginas gravadas; total no índice: N`.
+
+> **Migração: já ingeriu com `--dim 2048`?** O default do `--dim` passou de **2048** para
+> **1024** (§4). A dimensão faz parte do *tipo da coluna*, então uma tabela `govexe_pages`
+> criada antes disso continua `VECTOR(2048)` e **recusa** os vetores de 1024 no upsert
+> (`expected 2048 dimensions, not 1024`) — o `CREATE TABLE IF NOT EXISTS` do job não
+> altera tabela existente. Antes de reingerir, derrube a tabela (o `embed_job.py` a recria
+> com a dimensão nova, junto do índice HNSW, no primeiro upsert):
+>
+> ```sql
+> DROP TABLE IF EXISTS govexe_pages;    -- leva o índice HNSW junto
+> ```
+>
+> Para preservar a ingestão antiga, indexe em outra tabela: passe o mesmo `--table <nome>`
+> ao `embed_job.py` e ao `query.py` (§8).
 
 ## 8. Consulta fim a fim e prova de idempotência
 

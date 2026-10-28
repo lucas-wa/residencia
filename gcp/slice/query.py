@@ -28,6 +28,7 @@ if __package__ in (None, ""):
 from benchmark.models.qwen3vl_embed import DEFAULT_MODEL_ID, embed_texts  # noqa: E402
 from gcp.slice.collector import DEFAULT_SOURCE  # noqa: E402
 from gcp.slice.embed_job import (  # noqa: E402
+    DEFAULT_DIM,
     TOP_K,
     Hit,
     InMemoryVectorStore,
@@ -74,7 +75,9 @@ def main(argv: list[str] | None = None, *, store: VectorStore | None = None) -> 
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--dim", type=int, default=None,
-                    help="trunca o vetor da consulta para N dimensoes (MRL)")
+                    help="trunca o vetor da consulta para N dimensoes (MRL); default: a "
+                         f"dimensao do indice ({DEFAULT_DIM} no Cloud SQL, a do .npy em "
+                         "--vectors)")
     add_pg_arguments(ap)
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -82,8 +85,11 @@ def main(argv: list[str] | None = None, *, store: VectorStore | None = None) -> 
     if store is None:
         store = store_from_vectors(a.vectors) if a.vectors else open_vector_store(a)
 
+    # a consulta tem de sair na MESMA dimensao do indice: no Cloud SQL quem manda e o
+    # `--dim` do embed_job (DEFAULT_DIM, teto do HNSW); em --vectors, a do .npy ja gravado.
+    dim = a.dim if a.dim is not None else (None if a.vectors else DEFAULT_DIM)
     hits = search(a.text, store, k=a.k, model_id=a.model_id, device=a.device,
-                  dtype=a.dtype, dim=a.dim)
+                  dtype=a.dtype, dim=dim)
     if not hits:
         log.warning("nenhuma pagina indexada para a consulta %r", a.text)
         return 1

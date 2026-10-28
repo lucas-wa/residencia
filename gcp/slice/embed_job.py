@@ -26,6 +26,10 @@ configuravel por `--password-env`), populada a partir do **Secret Manager**:
 
 Nada de senha em flag, em codigo ou no git.
 
+**Dimensao**: a fatia indexa em 1024 dimensoes (`--dim`, Matryoshka/MRL: trunca e
+renormaliza, preservando o cosseno). O checkpoint entrega 2048 nativas, e o indice HNSW
+do pgvector nao aceita colunas acima de 2000 -- ver `HNSW_MAX_DIM`/`DEFAULT_DIM`.
+
 Uso:
     python -m gcp.slice.embed_job --bucket gs://govexe-bronze --blob-prefix bronze/ \
         --pg-host 127.0.0.1 --pg-db govexe --pg-user govexe
@@ -66,6 +70,15 @@ DEFAULT_TABLE = "govexe_pages"
 DEFAULT_PASSWORD_ENV = "PGPASSWORD"
 DEFAULT_WORK_DIR = "/tmp/govexe-bronze"
 TOP_K = 5
+
+# Teto do indice do pgvector: uma coluna indexada por `hnsw` (ou `ivfflat`) nao pode passar
+# de 2000 dimensoes -- acima disso o CREATE INDEX estoura
+# `column cannot have more than 2000 dimensions for hnsw index`.
+HNSW_MAX_DIM = 2000
+# Dimensao indexada por esta fatia. O Qwen3-VL-Embedding entrega 2048 nativas, que NAO
+# cabem no HNSW; 1024 e o corte Matryoshka/MRL validado na execucao real (`--dim` trunca e
+# renormaliza, entao o cosseno continua valendo).
+DEFAULT_DIM = 1024
 
 # DDL identica a do README-slice.md (secao "tabela"): o job cria a tabela se ela nao
 # existir, mas a criacao tambem pode ser feita a mao no Cloud SQL Studio/psql.
@@ -270,9 +283,18 @@ class PgVectorStore:
         return "[" + ",".join(f"{float(x):.8g}" for x in np.asarray(vec).ravel()) + "]"
 
     def ensure_schema(self, dim: int) -> None:
+        dim = int(dim)
+        if dim > HNSW_MAX_DIM:
+            # checado aqui para falhar com um recado acionavel em vez da
+            # `psycopg.errors.ProgramLimitExceeded` crua do CREATE INDEX.
+            raise ValueError(
+                f"dimensao {dim} acima do teto do indice HNSW do pgvector "
+                f"({HNSW_MAX_DIM} dimensoes): reduza o vetor com --dim <= {HNSW_MAX_DIM} "
+                f"(Matryoshka/MRL -- o default da fatia e {DEFAULT_DIM}, que trunca e "
+                "renormaliza, preservando o cosseno)")
         with self._conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            cur.execute(DDL_TABLE.format(table=self.table, dim=int(dim)))
+            cur.execute(DDL_TABLE.format(table=self.table, dim=dim))
             cur.execute(DDL_INDEX.format(table=self.table))
         self._conn.commit()
 
@@ -369,8 +391,10 @@ def main(argv: list[str] | None = None, *, store: VectorStore | None = None) -> 
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16")
-    ap.add_argument("--dim", type=int, default=None,
-                    help="trunca o vetor para N dimensoes (Matryoshka/MRL) e renormaliza")
+    ap.add_argument("--dim", type=int, default=DEFAULT_DIM,
+                    help="trunca o vetor para N dimensoes (Matryoshka/MRL) e renormaliza "
+                         f"(default: {DEFAULT_DIM}; o indice HNSW do pgvector so aceita ate "
+                         f"{HNSW_MAX_DIM} dimensoes)")
     ap.add_argument("--limit", type=int, default=None, help="processa so as N primeiras paginas")
     add_pg_arguments(ap)
     a = ap.parse_args(argv)

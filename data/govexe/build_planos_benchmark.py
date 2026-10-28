@@ -27,6 +27,9 @@ from typing import Callable
 log = logging.getLogger(__name__)
 
 SEED = 42
+# Espelho PUBLICO dos planos no Hub. O repo original (`GovExe/gov-br-linguagem-simples`)
+# e privado -- `load_dataset` nele responde 401/404 sem token.
+HUB_DATASET = "lucas-wa/gov-br-linguagem-simples"
 DEFAULT_PARQUET = r"D:\projects\govexe\dataset\planos\train.parquet"
 DEFAULT_OUT_DIR = "data/govexe/ptbr_planos"
 RENDER_DPI = 150
@@ -120,7 +123,7 @@ def load_planos_rows(parquet_path: str | None = None) -> list[dict]:
         return pd.read_parquet(parquet_path).to_dict("records")
     from datasets import load_dataset
 
-    ds = load_dataset("GovExe/gov-br-linguagem-simples", "planos", split="train")
+    ds = load_dataset(HUB_DATASET, "planos", split="train")
     return [dict(r) for r in ds]
 
 
