@@ -28,11 +28,39 @@
 # `preflight` (`python3 -m benchmark.check_env`) le as versoes instaladas e diz qual
 # caminho de carregamento do ColQwen2 sobrou.
 #
-# O teto `<4.51` FOI REMOVIDO: em imagens recentes (ex.: Deep Learning VM da GCP com
-# torch 2.9/cu129) ele conflitava com as outras deps -- `mteb`/`sentence-transformers`
-# pedem um transformers mais novo e o pip terminava em ResolutionImpossible. Sem teto,
-# o pip escolhe a versao que satisfaz colpali-engine + mteb + sentence-transformers ao
-# mesmo tempo. NAO se adivinha o que sobrou: o estagio `preflight`
+# FAIXA DO TRANSFORMERS -- os dois tetos ja tentados aqui e por que a faixa e esta:
+#
+# 1) O teto `<4.51` FOI REMOVIDO: em imagens recentes (ex.: Deep Learning VM da GCP com
+#    torch 2.9/cu129) ele conflitava com as outras deps -- `mteb`/`sentence-transformers`
+#    pedem um transformers mais novo e o pip terminava em ResolutionImpossible.
+#
+# 2) Sem teto NENHUM, porem, o pip sobe para transformers 5.x (hoje 5.21) e o
+#    `v3_jinav4` MORRE no from_pretrained. O jina-embeddings-v4 e custom code e
+#    VENDORIZA uma copia de `qwen2_5_vl.py` no proprio repo do Hub; essa copia faz
+#        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]   # rope_type="default"
+#    e o transformers 5.0.0 REMOVEU a chave "default" de
+#    `transformers.modeling_rope_utils.ROPE_INIT_FUNCTIONS` (restaram linear/dynamic/
+#    yarn/longrope/llama3/...). Resultado no cluster: `KeyError: 'default'` ao carregar
+#    `jinaai/jina-embeddings-v4`. O codigo e do repo do checkpoint, nao nosso -- nao da
+#    para corrigir do nosso lado; o que resta e nao deixar o transformers passar de 5.
+#    Dai o teto `<5`. Quando o jina republicar o modeling contra a API do 5.x, este teto
+#    pode cair.
+#
+# O piso `>=4.57` vem dos outros dois do trio: Qwen3-VL-Embedding (card:
+# `transformers>=4.57.0`; o `Qwen3VLForConditionalGeneration` NATIVO so existe a partir
+# do 4.57.0 -- nao ha custom code aqui) e Nemotron ColEmbed V2 (card:
+# `transformers>=4.57.2`; o custom code importa de
+# `transformers.models.qwen3_vl.modeling_qwen3_vl`). O jina pede `>=4.52.0`, ja coberto.
+#
+# A faixa `>=4.57,<5` e viavel com TODO o resto -- quem a aperta de verdade e o
+# `colpali-engine`, que pina transformers por release dentro da propria serie 0.3.x:
+# 0.3.10 pede <4.52, 0.3.11/0.3.12 pedem <4.54, 0.3.13 pede `>=4.53.1,<4.58` e de 0.3.14
+# em diante ja exige `>=5.0`. Com o teto `<5` o pip retrocede sozinho ate o 0.3.13 e
+# fecha em transformers 4.57.x -- verificado com `uv pip compile` (py3.11/3.12/3.13):
+# transformers==4.57.6, colpali-engine==0.3.13, peft==0.17.1, sentence-transformers==5.7.0,
+# mteb==2.26.28. Sem ResolutionImpossible. `mteb` (>=4.40,<6) e `sentence-transformers`
+# (o 6.x pede >=5.0, mas a serie 5.x pede `>=4.41,<5`) acomodam os dois lados.
+# NAO se adivinha o que sobrou na imagem: o estagio `preflight`
 # (`python3 -m benchmark.check_env`) le as versoes instaladas e diz qual caminho de
 # carregamento do ColQwen2 vale -- colpali-engine quando a faixa bate (ele exige
 # transformers >4.46.1), senao o caminho NATIVO do transformers: >=4.49 ja traz ColQwen2
@@ -44,7 +72,7 @@
 # serie 0.3.x. Se ele tambem passar a conflitar numa imagem futura, o sintoma sera outro
 # ResolutionImpossible aqui; so entao vale reavaliar.
 
-transformers>=4.46
+transformers>=4.57,<5
 colpali-engine>=0.3.10,<0.4
 sentence-transformers>=3.0
 open_clip_torch>=2.24

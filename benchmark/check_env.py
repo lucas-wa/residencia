@@ -36,6 +36,10 @@ COLPALI_ENGINE_SPEC = SpecifierSet(">0.3.4")
 TRANSFORMERS_FOR_COLPALI_SPEC = SpecifierSet(">4.46.1")
 TRANSFORMERS_NATIVE_SPEC = SpecifierSet(">=4.49")
 
+# jina-embeddings-v4: o custom code vendoriza `qwen2_5_vl.py` e usa
+# ROPE_INIT_FUNCTIONS["default"], chave removida no transformers 5.0.0 -> KeyError.
+TRANSFORMERS_FOR_JINAV4_SPEC = SpecifierSet(">=4.52,<5")
+
 HF_CHECKPOINT_NATIVE = "vidore/colqwen2-v1.0-hf"
 
 # distribuicoes consultadas por collect(): nome no PyPI -> chave do relatorio
@@ -127,6 +131,13 @@ def analyze(versions: dict[str, str | None]) -> dict:
             note("fail", f"sem caminho viavel: colpali-engine "
                          f"{cp_raw or '<ausente>'} incompativel e transformers {tf_raw} "
                          f"nao satisfaz {TRANSFORMERS_NATIVE_SPEC} (ColQwen2 nativo)")
+
+    # 2b) jina-embeddings-v4 (v3_jinav4) -- preso a API de RoPE do transformers 4.x
+    if tf is not None and tf not in TRANSFORMERS_FOR_JINAV4_SPEC:
+        note("warn", f"transformers {tf_raw} fora de {TRANSFORMERS_FOR_JINAV4_SPEC}: o "
+                     f"jina-embeddings-v4 (custom code, qwen2_5_vl.py vendorizado) usa "
+                     f"ROPE_INIT_FUNCTIONS['default'], removido no 5.0.0 -- o config "
+                     f"v3_jinav4 vai estourar KeyError: 'default' no from_pretrained")
 
     # 3) torch: no cluster vem do container, entao a ausencia aqui e so um aviso
     if _parsed(_raw(versions, "torch")) is None:
