@@ -92,7 +92,31 @@ class ColVisionRetriever:
                 attn_implementation="eager",
             )
         self._model = model.eval()
-        self._proc = proc_cls.from_pretrained(model_id)
+        try:
+            self._proc = proc_cls.from_pretrained(model_id)
+        except TypeError as exc:
+            # transformers 4.57.x: `get_processor_dict` monta o dict de chat templates com
+            # `cached_file(..., _raise_exceptions_for_missing_entries=False)` e abre cada
+            # entrada sem checar None -- com o `additional_chat_templates/` que o
+            # `vidore/colqwen2.5-v0.2` traz, uma entrada vem None e estoura em `open(None)`.
+            # Nao da para subir de versao: o teto `transformers<5` e fixado pelo jina-v4.
+            # Este wrapper nunca usa chat template (so process_queries/process_images), entao
+            # recarregar de um snapshot local SEM esses arquivos e correto e sem perda: o glob
+            # de templates vem vazio e o load passa. Pesos ficam de fora do snapshot -- o
+            # processor nao os le e o `model_cls.from_pretrained` acima ja os baixou no mesmo
+            # cache do HF. Qualquer outro TypeError sobe intacto.
+            if "expected str, bytes or os.PathLike" not in str(exc):
+                raise
+            from huggingface_hub import snapshot_download
+
+            local_dir = snapshot_download(
+                model_id,
+                ignore_patterns=[
+                    "additional_chat_templates/*", "chat_template.jinja", "chat_template.json",
+                    "*.safetensors", "*.bin", "*.pt", "*.pth",
+                ],
+            )
+            self._proc = proc_cls.from_pretrained(local_dir)
 
     # -- embedding --------------------------------------------------------------
 

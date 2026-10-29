@@ -5,7 +5,7 @@ import types
 
 import pytest
 
-from benchmark.models.colvision import resolve_classes
+from benchmark.models.colvision import ColVisionRetriever, resolve_classes
 
 
 def _install_fake_colpali(monkeypatch, names: dict[str, object]):
@@ -82,3 +82,100 @@ def test_kind_desconhecido(monkeypatch):
     _install_fake_colpali(monkeypatch, _WITH_25)
     with pytest.raises(ValueError):
         resolve_classes("qwen3vl")
+
+
+# -- fallback do processor (bug do transformers 4.57.x) --------------------------------
+
+_MODEL_ID = "vidore/colqwen2.5-v0.2"
+_TEMPLATE_BUG = "expected str, bytes or os.PathLike object, not NoneType"
+
+
+class _FakeModel:
+    device = "cpu"
+
+    def eval(self):
+        return self
+
+
+class _FakeModelCls:
+    """Fica no lugar da classe do colpali-engine: `from_pretrained` nunca baixa pesos."""
+
+    def from_pretrained(self, model_id, **kwargs):
+        return _FakeModel()
+
+
+class _FakeProcCls:
+    """`from_pretrained` levanta `raises` na 1a chamada e devolve um sentinela depois."""
+
+    def __init__(self, raises=None):
+        self.raises = raises
+        self.calls: list[str] = []
+
+    def from_pretrained(self, path):
+        self.calls.append(path)
+        if len(self.calls) == 1 and self.raises is not None:
+            raise self.raises
+        return ("proc", path)
+
+
+def _prepare(monkeypatch, proc_cls, snapshot=None):
+    """Injeta colpali_engine/torch falsos e, se dado, um `snapshot_download` gravador."""
+    import huggingface_hub
+
+    _install_fake_colpali(
+        monkeypatch, dict(_WITH_25, ColQwen2_5=_FakeModelCls(), ColQwen2_5_Processor=proc_cls)
+    )
+    torch = types.ModuleType("torch")
+    torch.bfloat16 = "bfloat16"
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    calls: list[dict] = []
+    if snapshot is not None:
+        def _fake_snapshot_download(repo_id=None, **kwargs):
+            calls.append(dict(kwargs, repo_id=repo_id))
+            return snapshot
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot_download)
+    return calls
+
+
+def test_processor_cai_para_snapshot_local_sem_chat_templates(monkeypatch):
+    """Regressao: transformers 4.57.x estoura em `open(None)` com `additional_chat_templates/`.
+
+    `get_processor_dict` monta o dict de templates com `cached_file(...,
+    _raise_exceptions_for_missing_entries=False)`; uma entrada vem `None` e a
+    comprehension abre sem checar -> TypeError. Recarregar de um snapshot local sem esses
+    arquivos faz o glob de templates vir vazio e o load passa.
+    """
+    proc = _FakeProcCls(raises=TypeError(_TEMPLATE_BUG))
+    calls = _prepare(monkeypatch, proc, snapshot="/tmp/snap-colqwen25")
+
+    r = ColVisionRetriever(_MODEL_ID, kind="colqwen2.5", device="cpu")
+
+    assert proc.calls == [_MODEL_ID, "/tmp/snap-colqwen25"]
+    assert r._proc == ("proc", "/tmp/snap-colqwen25")
+    assert len(calls) == 1
+    assert calls[0]["repo_id"] == _MODEL_ID
+    assert "additional_chat_templates/*" in calls[0]["ignore_patterns"]
+
+
+def test_typeerror_de_outra_causa_propaga_sem_snapshot(monkeypatch):
+    """So o TypeError DESTE bug aciona o fallback -- qualquer outro sobe intacto."""
+    proc = _FakeProcCls(raises=TypeError("got an unexpected keyword argument 'foo'"))
+    calls = _prepare(monkeypatch, proc, snapshot="/tmp/snap-colqwen25")
+
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        ColVisionRetriever(_MODEL_ID, kind="colqwen2.5", device="cpu")
+
+    assert calls == []
+    assert proc.calls == [_MODEL_ID]
+
+
+def test_processor_que_carrega_direto_nao_baixa_snapshot(monkeypatch):
+    """Caminho colpali/colqwen2 (e qualquer load que funciona): uma chamada, sem fallback."""
+    proc = _FakeProcCls()
+    calls = _prepare(monkeypatch, proc, snapshot="/tmp/snap-colqwen25")
+
+    r = ColVisionRetriever(_MODEL_ID, kind="colqwen2.5", device="cpu")
+
+    assert proc.calls == [_MODEL_ID]
+    assert r._proc == ("proc", _MODEL_ID)
+    assert calls == []
