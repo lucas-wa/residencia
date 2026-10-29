@@ -93,8 +93,12 @@ open_clip_torch>=2.24
 # seja carregado pelo wrapper ST em vez de AutoModel.
 # flash-attn segue FORA de proposito: os dois wrappers tem fallback para
 # attn_implementation="eager" (compilar flash-attn no cluster custa mais do que rende).
-# ColQwen2.5 nao pede nada novo -- entra pelo colpali-engine ja listado (quando a release
-# instalada nao expuser `ColQwen2_5`, o wrapper usa `ColQwen2` com o checkpoint 2.5).
+# ColQwen2.5 nao pede nada novo -- entra pelo colpali-engine ja listado. CONFERIDO nas
+# wheels do PyPI: `ColQwen2_5`/`ColQwen2_5_Processor` existem desde a 0.3.9 (ausentes na
+# 0.3.8), portanto estao presentes em TODA a faixa `>=0.3.10,<0.4` -- inclusive na 0.3.13,
+# que e onde o teto `transformers<5` faz o pip parar. Nao existe fallback para `ColQwen2`:
+# o checkpoint 2.5 e qwen2_5_vl e a classe ColQwen2 e qwen2_vl, entao carregar um pelo
+# outro estoura "size mismatch" no state_dict (ver colvision.py: resolve_classes).
 accelerate>=0.30
 qwen-vl-utils>=0.0.14
 einops>=0.7

@@ -23,26 +23,37 @@ def resolve_classes(kind: str):
     Funcao de modulo de proposito: o teste injeta um `colpali_engine.models` falso em
     `sys.modules` e cobre o dispatch sem baixar pesos nem instalar o pacote.
     """
-    # TODO confirmar em runtime: os nomes das classes mudam entre releases do
-    # colpali-engine (0.3.x expoe ColPali/ColPaliProcessor/ColQwen2/ColQwen2Processor;
-    # releases mais novas renomeiam para ColIdefics*/ColQwen2_5*). Conferir
-    # `dir(colpali_engine.models)` antes da primeira rodada e ajustar o mapa abaixo.
+    # Nomes CONFERIDOS no wheel do colpali-engine (nao sao simetricos -- o processor do
+    # 2.5 leva um underscore a mais): `colpali_engine/models/__init__.py` exporta
+    #     from .qwen2   import BiQwen2,   BiQwen2Processor,    ColQwen2,   ColQwen2Processor
+    #     from .qwen2_5 import BiQwen2_5, BiQwen2_5_Processor, ColQwen2_5, ColQwen2_5_Processor
+    # `ColQwen2_5`/`ColQwen2_5_Processor` existem desde a 0.3.9 (verificado nas wheels
+    # 0.3.8=ausente, 0.3.9/0.3.10/0.3.13=presente), ou seja, em TODA a faixa que o
+    # requirements-slurm.txt permite (`colpali-engine>=0.3.10,<0.4`). O card do
+    # `vidore/colqwen2.5-v0.2` usa exatamente este import.
     if kind == "colpali":
         from colpali_engine.models import ColPali, ColPaliProcessor
 
         return ColPali, ColPaliProcessor
     if kind == "colqwen2.5":
-        # TODO confirmar em runtime: o nome exato da classe do ColQwen2.5 no
-        # colpali-engine instalado (`ColQwen2_5`/`ColQwen2_5Processor` nas releases que
-        # o trazem). Sem ela, o checkpoint 2.5 ainda carrega pela classe ColQwen2 --
-        # mesma arquitetura Qwen2-VL, so o backbone muda.
+        # Sem fallback para ColQwen2: as arquiteturas sao DIFERENTES (ColQwen2 estende
+        # Qwen2VLModel, ColQwen2_5 estende Qwen2_5_VLModel). Carregar o checkpoint 2.5
+        # pela classe 2 nao degrada -- quebra, e quebra tarde e de forma opaca
+        # ("size mismatch for bias: ... torch.Size([2048]) vs torch.Size([1280])",
+        # depois de um aviso facil de ignorar "model of type qwen2_5_vl to instantiate a
+        # model of type qwen2_vl"). Falhar aqui, com a causa nomeada, custa menos.
         try:
-            from colpali_engine.models import ColQwen2_5, ColQwen2_5Processor
+            from colpali_engine.models import ColQwen2_5, ColQwen2_5_Processor
+        except ImportError as exc:  # noqa: TRY003
+            raise ImportError(
+                "colpali-engine sem ColQwen2_5/ColQwen2_5_Processor (precisa de >=0.3.9; "
+                "o requirements-slurm.txt ja pede >=0.3.10). O checkpoint ColQwen2.5 NAO "
+                "carrega pela classe ColQwen2 -- arquiteturas distintas (qwen2_5_vl vs "
+                "qwen2_vl). Atualize o colpali-engine."
+            ) from exc
 
-            return ColQwen2_5, ColQwen2_5Processor
-        except ImportError:
-            pass
-    elif kind != "colqwen2":
+        return ColQwen2_5, ColQwen2_5_Processor
+    if kind != "colqwen2":
         raise ValueError(f"kind sem wrapper no colpali-engine: {kind}")
 
     from colpali_engine.models import ColQwen2, ColQwen2Processor
@@ -61,12 +72,21 @@ class ColVisionRetriever:
         self.batch_size = batch_size
         td = getattr(torch, dtype)
         model_cls, proc_cls = resolve_classes(kind)
+        # flash-attn fica FORA do requirements de proposito (ver requirements-slurm.txt):
+        # sem o pacote, pedir "flash_attention_2" so rende um ImportError que o except
+        # engole. Checar antes evita a PRIMEIRA from_pretrained inteira e, sobretudo,
+        # evita que esse traceback descartado apareca na frente do erro que importa.
+        from importlib.util import find_spec
+
+        attn = "flash_attention_2" if find_spec("flash_attn") else "eager"
         try:
             model = model_cls.from_pretrained(
                 model_id, torch_dtype=td, device_map=device,
-                attn_implementation="flash_attention_2",
+                attn_implementation=attn,
             )
-        except Exception:  # flash-attn ausente -> fallback obrigatorio
+        except Exception:  # flash-attn presente mas inutilizavel -> fallback obrigatorio
+            if attn == "eager":
+                raise
             model = model_cls.from_pretrained(
                 model_id, torch_dtype=td, device_map=device,
                 attn_implementation="eager",

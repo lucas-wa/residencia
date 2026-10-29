@@ -31,7 +31,12 @@ _LEGACY = {
     "ColPali": _ColPali, "ColPaliProcessor": _ColPaliProcessor,
     "ColQwen2": _ColQwen2, "ColQwen2Processor": _ColQwen2Processor,
 }
-_WITH_25 = dict(_LEGACY, ColQwen2_5=_ColQwen25, ColQwen2_5Processor=_ColQwen25Processor)
+# Nome do processor CONFERIDO no wheel do colpali-engine (0.3.9+) e no card do
+# `vidore/colqwen2.5-v0.2`: `ColQwen2_5_Processor`, com underscore antes de "Processor"
+# -- assimetrico em relacao a `ColQwen2Processor` da linha 2. Escrever
+# `ColQwen2_5Processor` aqui foi o que deixou o teste verde enquanto o cluster caia no
+# fallback para ColQwen2 e estourava "size mismatch" no state_dict.
+_WITH_25 = dict(_LEGACY, ColQwen2_5=_ColQwen25, ColQwen2_5_Processor=_ColQwen25Processor)
 
 
 def test_colpali(monkeypatch):
@@ -49,9 +54,28 @@ def test_colqwen25_usa_classe_dedicada_quando_existe(monkeypatch):
     assert resolve_classes("colqwen2.5") == (_ColQwen25, _ColQwen25Processor)
 
 
-def test_colqwen25_cai_para_colqwen2_em_release_antiga(monkeypatch):
+def test_colqwen25_erra_claro_em_release_antiga(monkeypatch):
+    """Release sem ColQwen2_5 -> erro nomeado, NAO fallback silencioso para ColQwen2.
+
+    O checkpoint 2.5 e qwen2_5_vl e a classe ColQwen2 e qwen2_vl: carregar um pelo outro
+    nao degrada, quebra no state_dict ("size mismatch", 2048 vs 1280) longe da causa.
+    """
     _install_fake_colpali(monkeypatch, _LEGACY)
-    assert resolve_classes("colqwen2.5") == (_ColQwen2, _ColQwen2Processor)
+    with pytest.raises(ImportError, match="ColQwen2_5"):
+        resolve_classes("colqwen2.5")
+
+
+def test_colqwen25_nome_do_processor_tem_underscore(monkeypatch):
+    """Regressao: `ColQwen2_5Processor` (sem o underscore) nao existe no colpali-engine.
+
+    Com o nome errado o import falhava e o wrapper caia em ColQwen2 -- exatamente o bug
+    que derrubava o config `v3_colqwen25` no cluster.
+    """
+    _install_fake_colpali(
+        monkeypatch, dict(_LEGACY, ColQwen2_5=_ColQwen25, ColQwen2_5Processor=_ColQwen25Processor)
+    )
+    with pytest.raises(ImportError, match="ColQwen2_5"):
+        resolve_classes("colqwen2.5")
 
 
 def test_kind_desconhecido(monkeypatch):

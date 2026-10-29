@@ -1,10 +1,12 @@
 name: v3_colqwen25
 # ColQwen2.5 -- baseline atualizado da linha ColPali (late interaction, MaxSim),
 # carregado pelo colpali-engine.
+# Classe: `ColQwen2_5` + `ColQwen2_5_Processor` do colpali-engine (existem desde a
+# 0.3.9; a faixa do requirements-slurm.txt e >=0.3.10). NAO ha fallback para `ColQwen2`
+# -- arquiteturas distintas (qwen2_5_vl vs qwen2_vl), ver
+# `benchmark/models/colvision.py: resolve_classes`.
 # TODO confirmar em runtime: a tag exata do checkpoint (`vidore/colqwen2.5-v0.2`; ha
-# tambem v0.1). E o nome da classe no colpali-engine instalado: `ColQwen2_5` quando a
-# release a traz, senao o wrapper cai para `ColQwen2` com este mesmo checkpoint
-# (`benchmark/models/colvision.py: resolve_classes`).
+# tambem v0.1).
 model_id: vidore/colqwen2.5-v0.2
 model_kind: colqwen2.5
 # TODO confirmar em runtime: nomes dos subconjuntos/colunas do ViDoRe V3.
