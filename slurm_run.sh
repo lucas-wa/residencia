@@ -58,6 +58,10 @@
 #   # tratar warn do preflight como erro (aborta antes de gastar GPU):
 #   STRICT_PREFLIGHT=1 STAGE=vidore sbatch slurm_run.sh
 #
+#   # o no nao isola GPU por job: por padrao o runner escolhe sozinho a GPU mais livre;
+#   # GPU_AUTOSELECT=0 desliga e respeita o CUDA_VISIBLE_DEVICES herdado:
+#   GPU_AUTOSELECT=0 STAGE=vidore sbatch slurm_run.sh
+#
 #   # apontar para outro checkout:
 #   RESIDENCIA_DIR=/work/ufg/residencia-dev STAGE=vidore sbatch slurm_run.sh
 #
@@ -96,6 +100,10 @@ CONTAINER_IMAGE="${CONTAINER_IMAGE:-/raid/user_lucasalves/images/vllm-openai_lat
 HF_CACHE_DIR="${HF_CACHE_DIR:-/work/.cache/huggingface}"
 # 1 => o preflight trata warn (ex.: cair no ColQwen2 nativo) como erro e aborta o job.
 STRICT_PREFLIGHT="${STRICT_PREFLIGHT:-0}"
+# 1 (default) => antes dos estagios de GPU, escolhe sozinho a GPU com MAIS memoria livre
+# e exporta CUDA_VISIBLE_DEVICES para ela. 0 => desliga e respeita o
+# CUDA_VISIBLE_DEVICES herdado do Slurm/usuario. Ver select_gpu() no corpo do container.
+GPU_AUTOSELECT="${GPU_AUTOSELECT:-1}"
 # Parquet LOCAL dos planos (caminho DENTRO do bind /work). Vazio => baixa do Hub o
 # espelho PUBLICO lucas-wa/gov-br-linguagem-simples, que nao exige token. Aponte para o
 # parquet copiado ao cluster para rodar offline / fixar a versao, ex.:
@@ -118,7 +126,7 @@ mkdir -p logs
 
 echo "=== Job ${SLURM_JOB_ID:-local} em $(hostname) | $(date) ==="
 echo "    STAGE=$STAGE  LIMIT=${LIMIT:-<nenhum>}  FORCE=${FORCE:-<nao>}  RESIDENCIA_DIR=$RESIDENCIA_DIR"
-echo "    STRICT_PREFLIGHT=$STRICT_PREFLIGHT"
+echo "    STRICT_PREFLIGHT=$STRICT_PREFLIGHT  GPU_AUTOSELECT=$GPU_AUTOSELECT"
 echo "    PARQUET=${PARQUET:-<Hub (privado)>}"
 echo "    CONTAINER_IMAGE=$CONTAINER_IMAGE  HF_CACHE_DIR=$HF_CACHE_DIR"
 echo "    VIDORE_CONFIGS=$VIDORE_CONFIGS"
@@ -140,6 +148,7 @@ export SINGULARITYENV_LIMIT="$LIMIT"
 export SINGULARITYENV_FORCE="$FORCE"
 export SINGULARITYENV_HF_CACHE_DIR="$HF_CACHE_DIR"
 export SINGULARITYENV_STRICT_PREFLIGHT="$STRICT_PREFLIGHT"
+export SINGULARITYENV_GPU_AUTOSELECT="$GPU_AUTOSELECT"
 export SINGULARITYENV_PARQUET="$PARQUET"
 export SINGULARITYENV_VIDORE_CONFIGS="$VIDORE_CONFIGS"
 export SINGULARITYENV_GOVEXE_CONFIGS="$GOVEXE_CONFIGS"
@@ -150,6 +159,7 @@ export APPTAINERENV_LIMIT="$LIMIT"
 export APPTAINERENV_FORCE="$FORCE"
 export APPTAINERENV_HF_CACHE_DIR="$HF_CACHE_DIR"
 export APPTAINERENV_STRICT_PREFLIGHT="$STRICT_PREFLIGHT"
+export APPTAINERENV_GPU_AUTOSELECT="$GPU_AUTOSELECT"
 export APPTAINERENV_PARQUET="$PARQUET"
 export APPTAINERENV_VIDORE_CONFIGS="$VIDORE_CONFIGS"
 export APPTAINERENV_GOVEXE_CONFIGS="$GOVEXE_CONFIGS"
@@ -314,6 +324,57 @@ srun singularity exec \
 
         ensure_torchaudio
 
+        # ---------------------------------------------------------------------------
+        # Escolha da GPU mais livre.
+        #
+        # O no dgx-H100-02 (particao h100n2) NAO isola GPU por job: o job enxerga as 8
+        # GPUs e a memoria ocupada pelos processos de outros usuarios. Como os configs
+        # usam device: cuda, o PyTorch cai no cuda:0 FISICO -- que pode estar cheio de
+        # outro job -- e o modelo estoura torch.OutOfMemoryError ja no load, mesmo com
+        # outras GPUs do no completamente livres.
+        #
+        # Correcao: logo antes do trabalho de GPU (depois das deps/torch, para encurtar
+        # a janela em que outro job pode tomar a GPU escolhida), consultar o nvidia-smi,
+        # pegar o indice com MAIS memoria livre e exportar CUDA_VISIBLE_DEVICES para
+        # ele; assim o cuda:0 do PyTorch passa a apontar para a GPU livre.
+        # GPU_AUTOSELECT=0 desliga tudo e respeita o CUDA_VISIBLE_DEVICES herdado do
+        # Slurm/usuario. Sem GPU visivel (STAGE=build com --gres=gpu:h100:0, ou
+        # nvidia-smi ausente) a funcao apenas avisa e segue -- nada aqui pode derrubar
+        # o job por causa do `set -e`.
+        # ---------------------------------------------------------------------------
+        select_gpu() {
+            if [ "${GPU_AUTOSELECT:-1}" != "1" ]; then
+                echo "--- GPU_AUTOSELECT=${GPU_AUTOSELECT:-1}: auto-selecao desligada (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<herdado>}) ---"
+                return 0
+            fi
+
+            GPU_LIST="$(nvidia-smi -L 2>/dev/null || true)"
+            case "$GPU_LIST" in
+                GPU*) ;;
+                *) echo "--- sem GPU visivel: sem auto-selecao ---"; return 0 ;;
+            esac
+
+            # Linha do nvidia-smi com a maior memoria livre: "indice, livre_MiB".
+            # O head fecha o pipe cedo (SIGPIPE no nvidia-smi) e o pipefail esta ativo,
+            # dai o `|| true`: a falta de resposta vira string vazia, tratada abaixo.
+            GPU_TOP="$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null \
+                | sort -t, -k2 -nr | head -n1 || true)"
+            GPU_IDX="$(printf "%s" "$GPU_TOP" | cut -d, -f1 | tr -d " ")"
+            GPU_FREE="$(printf "%s" "$GPU_TOP" | cut -d, -f2 | tr -d " ")"
+
+            # Indice vazio ou nao-numerico => NAO exporta nada (melhor o default do
+            # PyTorch que um CUDA_VISIBLE_DEVICES invalido, que esconde todas as GPUs).
+            case "$GPU_IDX" in
+                ""|*[!0-9]*)
+                    echo "aviso: nao foi possivel determinar a GPU mais livre: mantendo CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<herdado>}"
+                    return 0
+                    ;;
+            esac
+
+            export CUDA_VISIBLE_DEVICES="$GPU_IDX"
+            echo "--- GPU auto-selecionada: indice $GPU_IDX (mais livre, ${GPU_FREE:-?} MiB) | CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES ---"
+        }
+
         # --limit so e repassado quando LIMIT nao esta vazio.
         LIMIT_ARGS=()
         if [ -n "${LIMIT:-}" ]; then
@@ -377,6 +438,8 @@ srun singularity exec \
                     ${LIMIT_ARGS[@]+"${LIMIT_ARGS[@]}"}
             done
         }
+
+        select_gpu
 
         case "$STAGE" in
             preflight) run_preflight ;;
