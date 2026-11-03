@@ -1,8 +1,8 @@
-"""Fatia GCP (`gcp/slice/`): coletor Bronze, job de embedding e consulta top-k.
+"""Fatia GCP (`gcp/slice/`): coletor Bronze, job de embedding multimodal e consulta top-k.
 
 Tudo offline: o GCS e substituido pelo `LocalObjectStore` (fake de filesystem), o Cloud SQL
-pelo `InMemoryVectorStore`, e o encode do Qwen3-VL e monkeypatchado -- nenhum teste toca a
-nuvem, a rede ou pesos de modelo.
+pelo `InMemoryVectorStore`, o Whisper pelo `FakeTranscriber` e o encode do Qwen3-VL e
+monkeypatchado -- nenhum teste toca a nuvem, a rede, GPU ou pesos de modelo.
 """
 
 import json
@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from gcp.slice import collector, embed_job, query
+from gcp.slice import asr, collector, embed_job, query
 
 
 def _pages(tmp_path, n, prefix="BR001"):
@@ -26,6 +26,20 @@ def _pages(tmp_path, n, prefix="BR001"):
 def _fake_embed(paths, **kw):
     """Vetores canonicos e0, e1, ... (L2=1): o ranking fica previsivel."""
     return np.eye(len(paths), 4, dtype="float32")
+
+
+def _fake_embed_texts(texts, **kw):
+    """Texto -> vetor canonico: e3 para transcricao de audio, e2 para texto nativo.
+
+    Fica no MESMO espaco de 4 dimensoes do `_fake_embed` das imagens -- e isso que
+    permite exercitar a busca cross-modal sem modelo nenhum.
+    """
+    linhas = []
+    for t in texts:
+        v = np.zeros(4, dtype="float32")
+        v[3 if asr.FAKE_PREFIX in t else 2] = 1.0
+        linhas.append(v)
+    return np.vstack(linhas)
 
 
 # -- collector -------------------------------------------------------------------------
@@ -89,7 +103,9 @@ def test_build_rows_do_manifest_usa_o_stem_como_chave(tmp_path):
     rows = embed_job.build_rows(items, vecs, model_id="Qwen/X", source="tse_planos",
                                 uris={paths[0]: "gs://b/bronze/BR001_p00.png"})
 
-    assert [r.page_id for r in rows] == ["BR001_p00", "BR001_p01"]
+    assert [r.item_id for r in rows] == ["BR001_p00", "BR001_p01"]
+    assert {r.modality for r in rows} == {embed_job.MODALITY_DOC_IMAGE}
+    assert rows[0].content_text is None          # pagina-imagem nao tem texto embutido
     assert rows[0].uri == "gs://b/bronze/BR001_p00.png"     # veio do Bronze
     assert rows[1].uri == paths[1]                          # sem URI mapeada: caminho local
     assert rows[0].content_sha256 != rows[1].content_sha256
@@ -114,13 +130,14 @@ def test_content_sha256_muda_com_o_conteudo(tmp_path):
 # -- embed_job: upsert idempotente ---------------------------------------------------------
 
 
-def _row(page_id, vec, sha="h0", uri="gs://b/x.png"):
-    return embed_job.PageRow(page_id=page_id, source="tse_planos", uri=uri,
+def _row(item_id, vec, sha="h0", uri="gs://b/x.png",
+         modality=embed_job.MODALITY_DOC_IMAGE, **kw):
+    return embed_job.ItemRow(item_id=item_id, modality=modality, source="tse_planos", uri=uri,
                              content_sha256=sha, model_id="Qwen/X",
-                             embedding=np.asarray(vec, dtype="float32"))
+                             embedding=np.asarray(vec, dtype="float32"), **kw)
 
 
-def test_upsert_em_memoria_e_idempotente_por_page_id():
+def test_upsert_em_memoria_e_idempotente_por_item_id():
     store = embed_job.InMemoryVectorStore()
     rows = [_row("BR001_p00", [1, 0, 0, 0]), _row("BR001_p01", [0, 1, 0, 0])]
 
@@ -132,6 +149,23 @@ def test_upsert_em_memoria_e_idempotente_por_page_id():
     assert store.count() == 2
     assert store.rows["BR001_p00"].content_sha256 == "h1"
     np.testing.assert_allclose(store.rows["BR001_p00"].embedding, [0, 0, 1, 0])
+
+
+def test_in_memory_store_com_arquivo_sobrevive_ao_processo(tmp_path):
+    """`--local-store <arquivo>`: o indice fake persiste entre duas execucoes do CLI."""
+    arquivo = tmp_path / "indice.json"
+    primeira = embed_job.InMemoryVectorStore(path=arquivo)
+    primeira.upsert([_row("foto:abc", [0, 0, 1, 0], modality=embed_job.MODALITY_IMAGE,
+                          credit="Foto: Fulano/Agencia Brasil",
+                          pointer_uri="https://agencia/foto.jpg")])
+
+    segunda = embed_job.InMemoryVectorStore(path=arquivo)
+    assert segunda.count() == 1
+    linha = segunda.rows["foto:abc"]
+    assert linha.modality == embed_job.MODALITY_IMAGE
+    assert linha.credit == "Foto: Fulano/Agencia Brasil"
+    assert linha.pointer_uri == "https://agencia/foto.jpg"
+    np.testing.assert_allclose(linha.embedding, [0, 0, 1, 0])
 
 
 def test_embed_job_main_duas_ingestoes_nao_duplicam(tmp_path, monkeypatch, capsys):
@@ -156,7 +190,7 @@ def test_embed_job_main_duas_ingestoes_nao_duplicam(tmp_path, monkeypatch, capsy
     assert sorted(store.rows) == ["BR001_p00", "BR001_p01", "BR001_p02"]
     assert store.rows["BR001_p00"].uri.startswith("gs://") is False  # fake: caminho local
     assert "bronze/fonte=tse_planos/dt=2026-10-22" in store.rows["BR001_p00"].uri
-    assert "3 paginas gravadas" in capsys.readouterr().out
+    assert "3 itens gravados" in capsys.readouterr().out
 
 
 def test_embed_job_main_reusa_npy_e_manifest(tmp_path, monkeypatch):
@@ -222,34 +256,53 @@ class _FakeConn:
         self.commits += 1
 
 
-def test_pgvector_upsert_usa_on_conflict_na_chave_de_pagina():
+def test_pgvector_upsert_usa_on_conflict_na_chave_de_item():
     conn = _FakeConn()
-    store = embed_job.PgVectorStore(conn, table="govexe_pages")
+    store = embed_job.PgVectorStore(conn, table="govexe_items")
 
     store.ensure_schema(4)
-    store.upsert([_row("BR001_p00", [1, 0, 0, 0])])
+    store.upsert([_row("audio:abc", [1, 0, 0, 0], modality=embed_job.MODALITY_AUDIO,
+                       credit="Radio Camara", pointer_uri="gs://b/audio.mp3",
+                       content_text="transcricao")])
 
     ddl = conn.sql[1][0]
     assert "CREATE EXTENSION IF NOT EXISTS vector" in conn.sql[0][0]
-    assert "govexe_pages" in ddl and "VECTOR(4)" in ddl and "page_id TEXT PRIMARY KEY" in ddl
+    assert "govexe_items" in ddl and "VECTOR(4)" in ddl and "item_id TEXT PRIMARY KEY" in ddl
+    assert "modality TEXT NOT NULL" in ddl and "credit TEXT" in ddl
     assert "USING hnsw (embedding vector_cosine_ops)" in conn.sql[2][0]
+    assert "(modality)" in conn.sql[3][0]                      # btree do filtro por modalidade
 
-    sql, params = conn.sql[3]
-    assert "INSERT INTO govexe_pages" in sql
-    assert "ON CONFLICT (page_id) DO UPDATE SET" in sql
-    assert params[0][0] == "BR001_p00" and params[0][5] == "[1,0,0,0]"
+    sql, params = conn.sql[4]
+    assert "INSERT INTO govexe_items" in sql
+    assert "ON CONFLICT (item_id) DO UPDATE SET" in sql
+    assert params[0][:2] == ("audio:abc", embed_job.MODALITY_AUDIO)
+    assert params[0][-1] == "[1,0,0,0]"
     assert conn.commits == 2
 
 
 def test_pgvector_search_ordena_pelo_operador_de_cosseno():
-    conn = _FakeConn(resultado=[("BR001_p01", "gs://b/p01.png", 0.9)])
+    conn = _FakeConn(resultado=[("BR001_p01", "doc_image", "gs://b/p01.png",
+                                 None, None, None, 0.9)])
     store = embed_job.PgVectorStore(conn)
 
     hits = store.search(np.array([0, 1, 0, 0], dtype="float32"), k=3)
 
     sql, params = conn.sql[0]
-    assert "ORDER BY embedding <=> %s::vector" in sql and params[2] == 3
-    assert hits == [embed_job.Hit("BR001_p01", "gs://b/p01.png", 0.9)]
+    assert "ORDER BY embedding <=> %s::vector" in sql and params[-1] == 3
+    assert "WHERE" not in sql
+    assert hits == [embed_job.Hit("BR001_p01", "doc_image", "gs://b/p01.png", 0.9)]
+
+
+def test_pgvector_search_filtra_por_modalidade():
+    conn = _FakeConn(resultado=[])
+    store = embed_job.PgVectorStore(conn)
+
+    store.search(np.array([0, 1, 0, 0], dtype="float32"), k=3,
+                 modality=embed_job.MODALITY_AUDIO)
+
+    sql, params = conn.sql[0]
+    assert "WHERE modality = %s" in sql
+    assert embed_job.MODALITY_AUDIO in params and params[-1] == 3
 
 
 def test_pgvector_connect_sem_senha_no_ambiente_falha(monkeypatch):
@@ -287,6 +340,7 @@ def test_query_main_imprime_o_ranking(monkeypatch, capsys):
     linhas = capsys.readouterr().out.splitlines()
     assert "metas de saude" in linhas[0]
     assert "BR001_p01" in linhas[1] and "gs://b/p01.png" in linhas[1]
+    assert embed_job.MODALITY_DOC_IMAGE in linhas[1]
     assert "BR001_p00" in linhas[2]
 
 
@@ -310,3 +364,307 @@ def test_query_main_indice_vazio_sai_1(monkeypatch):
     monkeypatch.setattr(query, "embed_texts",
                         lambda textos, **kw: np.zeros((1, 4), dtype="float32"))
     assert query.main(["--text", "x"], store=embed_job.InMemoryVectorStore()) == 1
+
+
+# -- ASR (Whisper atras de interface) --------------------------------------------------------
+
+
+def test_fake_transcriber_e_deterministico_e_nao_baixa_modelo(tmp_path):
+    audio = tmp_path / "sessao_camara.mp3"
+    audio.write_bytes(b"ID3fake")
+    t = asr.FakeTranscriber()
+
+    texto = t.transcribe(audio)
+
+    assert texto == t.transcribe(audio)                  # deterministico
+    assert asr.FAKE_PREFIX in texto and "sessao_camara" in texto
+    assert t.calls == [str(audio), str(audio)]
+
+
+def test_fake_transcriber_aceita_transcricao_canonica_por_arquivo(tmp_path):
+    audio = tmp_path / "radio.wav"
+    audio.write_bytes(b"RIFF")
+    t = asr.FakeTranscriber({"radio": "metas de saneamento no orcamento"})
+    assert t.transcribe(audio) == "metas de saneamento no orcamento"
+
+
+def test_whisper_transcriber_nao_carrega_pesos_no_construtor():
+    """Import do Whisper e lazy: construir o transcritor nao toca a rede nem a GPU."""
+    import sys
+
+    t = asr.WhisperTranscriber(model="large-v3", device="cpu")
+
+    assert t.model == "large-v3" and t.backend == asr.DEFAULT_ASR_BACKEND
+    assert t._model is None
+    assert "faster_whisper" not in sys.modules and "whisper" not in sys.modules
+
+
+def test_open_transcriber_fake_nao_instancia_whisper():
+    assert isinstance(asr.open_transcriber("fake"), asr.FakeTranscriber)
+    assert isinstance(asr.open_transcriber(asr.DEFAULT_ASR_BACKEND), asr.WhisperTranscriber)
+    with pytest.raises(ValueError, match="backend"):
+        asr.open_transcriber("nao-existe")
+
+
+# -- records: id estavel, roteamento por modalidade e ASR ------------------------------------
+
+
+def test_default_item_id_e_estavel_e_marcado_pela_modalidade():
+    a = embed_job.default_item_id(embed_job.MODALITY_IMAGE, "https://agencia/foto.jpg")
+    b = embed_job.default_item_id(embed_job.MODALITY_IMAGE, "https://agencia/foto.jpg")
+    c = embed_job.default_item_id(embed_job.MODALITY_IMAGE, "https://agencia/outra.jpg")
+
+    assert a == b and a != c
+    assert a.startswith(f"{embed_job.MODALITY_IMAGE}:")
+
+
+def test_prepare_record_texto_nativo_hasheia_o_proprio_texto():
+    rec = {"modality": "text", "text": "meta: ampliar a atencao basica",
+           "uri": "https://camara/materia/1", "credit": "Agencia Camara"}
+
+    p = embed_job.prepare_record(rec, source="agencia_camara")
+
+    assert p["content_text"] == "meta: ampliar a atencao basica"
+    assert p["content_sha256"] == embed_job.text_sha256(rec["text"])
+    assert p["pointer_uri"] is None and p["uri"] == "https://camara/materia/1"
+    assert p["item_id"] == embed_job.default_item_id("text", "https://camara/materia/1")
+    assert p["source"] == "agencia_camara"
+
+
+def test_prepare_record_audio_chama_o_transcritor(tmp_path):
+    audio = tmp_path / "sessao.mp3"
+    audio.write_bytes(b"ID3fake")
+    t = asr.FakeTranscriber()
+
+    p = embed_job.prepare_record(
+        {"modality": "audio_asr", "audio_path": str(audio),
+         "pointer_uri": "https://youtube/watch?v=x", "credit": "TV Camara"},
+        source="tv_camara", transcriber=t)
+
+    assert t.calls == [str(audio)]
+    assert p["content_text"] == t.transcribe(audio)
+    assert p["pointer_uri"] == "https://youtube/watch?v=x" and p["credit"] == "TV Camara"
+
+
+def test_prepare_record_audio_sem_transcritor_falha(tmp_path):
+    audio = tmp_path / "sessao.mp3"
+    audio.write_bytes(b"ID3fake")
+    with pytest.raises(ValueError, match="transcritor"):
+        embed_job.prepare_record({"modality": "audio_asr", "audio_path": str(audio)})
+
+
+def test_prepare_record_modalidade_desconhecida_falha():
+    with pytest.raises(ValueError, match="modalidade"):
+        embed_job.prepare_record({"modality": "video", "uri": "x"})
+
+
+def test_embed_records_roteia_cada_modalidade_para_o_encoder_certo(tmp_path, monkeypatch):
+    """Lote misto: imagem vai por embed_images, texto/ASR por embed_texts -- mesmo espaco."""
+    pages = _pages(tmp_path, 1)
+    foto = tmp_path / "foto.jpg"
+    foto.write_bytes(b"jpgfake")
+    audio = tmp_path / "sessao.mp3"
+    audio.write_bytes(b"ID3fake")
+    vistos: dict[str, list] = {"img": [], "txt": []}
+
+    def espia_imagens(paths, **kw):
+        vistos["img"].append((list(paths), kw.get("model_id"), kw.get("dim")))
+        return _fake_embed(paths)
+
+    def espia_textos(textos, **kw):
+        vistos["txt"].append((list(textos), kw.get("model_id"), kw.get("dim")))
+        return _fake_embed_texts(textos)
+
+    monkeypatch.setattr(embed_job, "embed_images", espia_imagens)
+    monkeypatch.setattr(embed_job, "embed_texts", espia_textos)
+
+    t = asr.FakeTranscriber()
+    rows = embed_job.embed_records(
+        [{"modality": "doc_image", "image_path": str(pages / "BR001_p00.png")},
+         {"modality": "text", "text": "meta de saude", "uri": "https://x/1"},
+         {"modality": "image", "image_path": str(foto), "credit": "Foto: EBC"},
+         {"modality": "audio_asr", "audio_path": str(audio), "credit": "TV Camara"}],
+        model_id="Qwen/X", dim=4, transcriber=t, source="govexe")
+
+    # ordem do lote preservada, apesar de imagens e textos irem em chamadas separadas
+    assert [r.modality for r in rows] == ["doc_image", "text", "image", "audio_asr"]
+    assert vistos["img"][0][0] == [str(pages / "BR001_p00.png"), str(foto)]
+    assert vistos["txt"][0][0] == ["meta de saude", t.transcribe(audio)]
+    # mesmo checkpoint e mesma dimensao nos dois lados == mesmo espaco vetorial
+    assert vistos["img"][0][1:] == vistos["txt"][0][1:] == ("Qwen/X", 4)
+    assert {r.model_id for r in rows} == {"Qwen/X"}
+    np.testing.assert_allclose([np.linalg.norm(r.embedding) for r in rows], 1.0, atol=1e-6)
+    # a transcricao do Whisper (fake) e o texto que foi embutido, e fica persistida
+    audio_row = rows[3]
+    assert audio_row.content_text == t.transcribe(audio)
+    np.testing.assert_allclose(audio_row.embedding, [0, 0, 0, 1])
+    assert rows[0].content_text is None
+
+
+# -- fatia multimodal fim a fim: um indice, quatro modalidades -------------------------------
+
+
+def _records_jsonl(tmp_path):
+    """JSONL de um lote misto: 2 paginas + 1 foto com credito + 1 texto + 1 audio."""
+    pages = _pages(tmp_path, 2)
+    foto = tmp_path / "foto_ebc.jpg"
+    foto.write_bytes(b"jpgfake")
+    audio = tmp_path / "sessao_camara.mp3"
+    audio.write_bytes(b"ID3fake")
+    registros = [
+        {"modality": "doc_image", "image_path": str(pages / "BR001_p00.png")},
+        {"modality": "doc_image", "image_path": str(pages / "BR001_p01.png")},
+        {"item_id": "foto:ebc-1", "modality": "image", "image_path": str(foto),
+         "pointer_uri": "https://agenciabrasil/foto_ebc.jpg",
+         "credit": "Foto: Fulano/Agencia Brasil", "source": "ebc"},
+        {"item_id": "texto:camara-1", "modality": "text",
+         "text": "meta de ampliar a atencao basica em saude",
+         "uri": "https://camara/materia/1", "credit": "Agencia Camara", "source": "camara"},
+        {"item_id": "audio:camara-1", "modality": "audio_asr", "audio_path": str(audio),
+         "pointer_uri": "https://youtube/watch?v=x", "credit": "TV Camara",
+         "source": "tv_camara"},
+    ]
+    jsonl = tmp_path / "records.jsonl"
+    jsonl.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in registros),
+                     encoding="utf-8")
+    return jsonl
+
+
+def test_embed_job_main_lote_misto_indexa_tudo_e_nao_duplica(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(embed_job, "embed_images", _fake_embed)
+    monkeypatch.setattr(embed_job, "embed_texts", _fake_embed_texts)
+    jsonl = _records_jsonl(tmp_path)
+    store = embed_job.InMemoryVectorStore()
+    argv = ["--records", str(jsonl), "--asr-backend", "fake", "--device", "cpu", "--dim", "4"]
+
+    assert embed_job.main(argv, store=store) == 0
+    assert store.count() == 5
+    assert {r.modality for r in store.rows.values()} == {
+        "doc_image", "image", "text", "audio_asr"}
+
+    foto = store.rows["foto:ebc-1"]
+    assert foto.credit == "Foto: Fulano/Agencia Brasil"
+    assert foto.pointer_uri == "https://agenciabrasil/foto_ebc.jpg"
+    assert foto.source == "ebc" and foto.content_text is None
+
+    audio = store.rows["audio:camara-1"]
+    assert asr.FAKE_PREFIX in audio.content_text          # passou pelo Transcriber
+    assert audio.credit == "TV Camara"
+
+    # mesmo model_id e mesma dimensao em TODAS as modalidades (um unico espaco)
+    assert len({r.model_id for r in store.rows.values()}) == 1
+    assert {len(r.embedding) for r in store.rows.values()} == {4}
+    assert "5 itens gravados" in capsys.readouterr().out
+
+    assert embed_job.main(argv, store=store) == 0         # reingestao do mesmo lote
+    assert store.count() == 5
+    assert sorted(store.rows) == ["BR001_p00", "BR001_p01", "audio:camara-1",
+                                  "foto:ebc-1", "texto:camara-1"]
+
+
+def test_query_cross_modal_recupera_as_quatro_modalidades(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(embed_job, "embed_images", _fake_embed)
+    monkeypatch.setattr(embed_job, "embed_texts", _fake_embed_texts)
+    store = embed_job.InMemoryVectorStore()
+    embed_job.main(["--records", str(_records_jsonl(tmp_path)), "--asr-backend", "fake",
+                    "--device", "cpu", "--dim", "4"], store=store)
+
+    # consulta equidistante das 4 direcoes canonicas: o top-5 traz o indice inteiro
+    monkeypatch.setattr(query, "embed_texts",
+                        lambda textos, **kw: np.full((1, 4), 0.5, dtype="float32"))
+    hits = query.search("saude publica", store, k=5)
+    assert {h.modality for h in hits} == {"doc_image", "image", "text", "audio_asr"}
+
+    # consulta alinhada com a transcricao: o audio vence a pagina-imagem (cross-modal real)
+    monkeypatch.setattr(query, "embed_texts",
+                        lambda textos, **kw: np.array([[0, 0, 0, 1]], dtype="float32"))
+    capsys.readouterr()                                   # descarta a saida da ingestao
+    assert query.main(["--text", "sessao da camara", "--k", "3", "--device", "cpu"],
+                      store=store) == 0
+    saida = capsys.readouterr().out
+    primeira = saida.splitlines()[1]
+    assert "audio:camara-1" in primeira and "audio_asr" in primeira
+    assert "TV Camara" in saida and "https://youtube/watch?v=x" in saida
+
+
+def test_query_main_filtra_por_modalidade(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(embed_job, "embed_images", _fake_embed)
+    monkeypatch.setattr(embed_job, "embed_texts", _fake_embed_texts)
+    store = embed_job.InMemoryVectorStore()
+    embed_job.main(["--records", str(_records_jsonl(tmp_path)), "--asr-backend", "fake",
+                    "--device", "cpu", "--dim", "4"], store=store)
+    monkeypatch.setattr(query, "embed_texts",
+                        lambda textos, **kw: np.full((1, 4), 0.5, dtype="float32"))
+
+    assert query.main(["--text", "saude", "--k", "5", "--modality", "image",
+                       "--device", "cpu"], store=store) == 0
+
+    saida = capsys.readouterr().out
+    assert "foto:ebc-1" in saida
+    assert "BR001_p00" not in saida and "audio:camara-1" not in saida
+    assert "Foto: Fulano/Agencia Brasil" in saida
+
+
+def test_embed_job_main_records_resolve_blob_do_bronze(tmp_path, monkeypatch):
+    """Record com `blob` (sem caminho local): o job baixa do Bronze antes de embutir."""
+    monkeypatch.setattr(embed_job, "embed_images", _fake_embed)
+    monkeypatch.setattr(embed_job, "embed_texts", _fake_embed_texts)
+    pages = _pages(tmp_path, 1)
+    bucket = tmp_path / "bucket"
+    bronze = collector.LocalObjectStore(bucket)
+    [rec] = collector.collect(collector.collect_paths(str(pages)), bronze, day="2026-10-22")
+    jsonl = tmp_path / "r.jsonl"
+    jsonl.write_text(json.dumps({"modality": "doc_image", "blob": rec["blob"]}),
+                     encoding="utf-8")
+
+    store = embed_job.InMemoryVectorStore()
+    assert embed_job.main(["--records", str(jsonl), "--records-store", str(bucket),
+                           "--work-dir", str(tmp_path / "work"), "--device", "cpu",
+                           "--dim", "4"], store=store) == 0
+    assert "BR001_p00" in store.rows
+    assert store.rows["BR001_p00"].uri.endswith("dt=2026-10-22/BR001_p00.png")
+
+
+# -- collector: audio no Bronze e JSONL de records -------------------------------------------
+
+
+def test_collect_marca_a_modalidade_e_aceita_audio(tmp_path):
+    audio_dir = tmp_path / "audios"
+    audio_dir.mkdir()
+    (audio_dir / "sessao.mp3").write_bytes(b"ID3fake")
+    store = collector.LocalObjectStore(tmp_path / "bucket")
+
+    registros = collector.collect([str(audio_dir / "sessao.mp3")], store,
+                                  source="tv_camara", day="2026-10-22")
+
+    assert registros[0]["modality"] == embed_job.MODALITY_AUDIO
+    assert registros[0]["item_id"] == "sessao"
+    assert store.list("bronze/") == ["bronze/fonte=tv_camara/dt=2026-10-22/sessao.mp3"]
+
+
+def test_collector_main_records_sobe_binarios_e_reescreve_o_jsonl(tmp_path):
+    foto = tmp_path / "foto.jpg"
+    foto.write_bytes(b"jpgfake")
+    audio = tmp_path / "sessao.mp3"
+    audio.write_bytes(b"ID3fake")
+    entrada = tmp_path / "in.jsonl"
+    entrada.write_text("\n".join(json.dumps(r) for r in [
+        {"modality": "image", "image_path": str(foto), "credit": "Foto: EBC"},
+        {"modality": "audio_asr", "audio_path": str(audio), "credit": "TV Camara"},
+        {"modality": "text", "text": "meta de saude", "uri": "https://x/1"},
+    ]), encoding="utf-8")
+    saida = tmp_path / "out.jsonl"
+    root = tmp_path / "bucket"
+
+    rc = collector.main(["--local-root", str(root), "--records", str(entrada),
+                         "--out-records", str(saida), "--source", "ebc",
+                         "--date", "2026-10-22"])
+
+    assert rc == 0
+    linhas = [json.loads(ln) for ln in saida.read_text(encoding="utf-8").splitlines()]
+    assert linhas[0]["blob"] == "bronze/fonte=ebc/dt=2026-10-22/foto.jpg"
+    assert linhas[0]["credit"] == "Foto: EBC"                 # credito preservado
+    assert linhas[0]["pointer_uri"].endswith("foto.jpg")      # aponta o binario no Bronze
+    assert linhas[1]["blob"].endswith("sessao.mp3")
+    assert "blob" not in linhas[2] and linhas[2]["text"] == "meta de saude"
+    assert (root / "bronze/fonte=ebc/dt=2026-10-22/sessao.mp3").is_file()

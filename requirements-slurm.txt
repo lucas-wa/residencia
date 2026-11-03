@@ -135,6 +135,20 @@ packaging>=23.0
 # deps de audio de forma ansiosa.
 soxr>=0.3.2
 
+# ASR da fatia GCP multimodal (`gcp/slice/asr.py`): audio -> texto -> MESMO embedder.
+# A modalidade `audio_asr` nao tem embedder proprio -- o audio e colapsado em texto pelo
+# Whisper large-v3 e embutido pelo `embed_texts` do Qwen3-VL-Embedding (pointer vector,
+# `fusao/multimodal.md` §3/§4). Aqui vai o backend DEFAULT, `faster-whisper`
+# (reimplementacao em CTranslate2): ~4x mais rapido e com ~3 GB de VRAM no large-v3 em
+# float16, o que importa porque na VM L4 (24 GB) ele divide a placa com o
+# Qwen3-VL-Embedding-2B. CRITICO para a regra do topo deste arquivo: o faster-whisper NAO
+# depende de torch (puxa ctranslate2 + tokenizers + onnxruntime + av), entao nao arrasta
+# um torch proprio para o --user como as deps do bloco do topo; o `openai-whisper`
+# (`--asr-backend openai-whisper`) dependeria, e por isso NAO entra aqui -- quem o quiser
+# instala sob demanda com --no-deps, como o bitsandbytes do QLoRA.
+# E dep de GPU/VM: os testes offline usam o `FakeTranscriber` e nao precisam dela.
+faster-whisper>=1.0
+
 mteb>=1.14
 datasets>=2.19
 

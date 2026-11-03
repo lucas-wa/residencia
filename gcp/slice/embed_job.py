@@ -1,23 +1,44 @@
 """Job de embedding da fatia GCP: GCS (Bronze) -> Qwen3-VL-Embedding -> Cloud SQL/pgvector.
 
-Roda na **VM L4 efemera** (`g2-standard-4`, ver `gcp/slice/README-slice.md`): baixa as
-paginas do bucket Bronze, embute cada uma com `Qwen/Qwen3-VL-Embedding-2B`
-(`benchmark.models.qwen3vl_embed.embed_images`) e faz **upsert** no Cloud SQL + pgvector.
+Roda na **VM L4 efemera** (`g2-standard-4`, ver `gcp/slice/README-slice.md`): baixa os
+itens do bucket Bronze, embute cada um com `Qwen/Qwen3-VL-Embedding-2B` e faz **upsert**
+no Cloud SQL + pgvector.
 
-Tres modos de entrada:
+**Abordagem A -- modelo unificado** (`fusao/multimodal.md` §2): QUATRO modalidades no
+MESMO indice (`govexe_items`), pelo MESMO checkpoint e no MESMO espaco vetorial:
+
+    doc_image   pagina de documento rasterizada  -> embed_images()
+    image       foto de agencia publica          -> embed_images()
+    text        texto nativo (materia, legenda)  -> embed_texts()
+    audio_asr   audio -> transcricao Whisper     -> embed_texts()
+
+O audio NAO tem embedder proprio aqui: ele e colapsado em texto pelo ASR (`gcp/slice/asr.py`,
+Whisper large-v3 atras da interface `Transcriber`) e embutido pelo mesmo `embed_texts` --
+o *pointer vector* de `fusao/multimodal.md` §3/§4. Embedding nativo de audio (CLAP) e
+outro objetivo. O binario original fica em `pointer_uri` e o credito obrigatorio em
+`credit`.
+
+Modos de entrada:
 
     --bucket gs://... --blob-prefix bronze/fonte=.../dt=...   paginas vindas do GCS
-    --images-dir <dir>                                        diretorio local (modo dev)
+    --local-bronze <dir>                                      bucket fake (modo dev)
+    --images-dir <dir>                                        diretorio local de paginas
+    --records <arquivo.jsonl>                                 lote MISTO (foto/texto/audio,
+                                                              formato no README-slice.md);
+                                                              `--records-store` resolve o
+                                                              campo `blob` contra o Bronze
     --vectors <prefixo>                                       reusa `<prefixo>.npy` +
                                                               `<prefixo>.manifest.json`
                                                               de `scripts/embed_qwen3vl.py`
                                                               (nao carrega modelo nenhum)
 
-**Idempotencia** (requisito do plano): a chave e o `page_id` -- o stem do arquivo, o mesmo
-id de pagina do `corpus.jsonl` (`<tse_seq>_p<NN>`). O SQL e
-`INSERT ... ON CONFLICT (page_id) DO UPDATE`, entao rodar o job duas vezes sobre o mesmo
-Bronze deixa exatamente as mesmas linhas; `content_sha256` registra o conteudo que gerou
-aquele vetor (pagina reemitida com bytes diferentes atualiza a linha, nao cria outra).
+**Idempotencia** (requisito do plano): a chave e o `item_id` -- o stem do arquivo para
+paginas (o mesmo id do `corpus.jsonl`, `<tse_seq>_p<NN>`) e `<modalidade>:<hash da uri>`
+(ou o id natural do record) para foto/texto/audio. O SQL e
+`INSERT ... ON CONFLICT (item_id) DO UPDATE`, entao rodar o job duas vezes sobre o mesmo
+lote deixa exatamente as mesmas linhas -- so `updated_at` avanca. `content_sha256`
+registra o conteudo que gerou aquele vetor: os bytes do arquivo nas modalidades de imagem
+e o proprio texto embutido (a transcricao, no caso do audio) nas de texto.
 
 **Segredo**: a senha do Cloud SQL vem da variavel de ambiente `PGPASSWORD` (nome
 configuravel por `--password-env`), populada a partir do **Secret Manager**:
@@ -33,7 +54,10 @@ do pgvector nao aceita colunas acima de 2000 -- ver `HNSW_MAX_DIM`/`DEFAULT_DIM`
 Uso:
     python -m gcp.slice.embed_job --bucket gs://govexe-bronze --blob-prefix bronze/ \
         --pg-host 127.0.0.1 --pg-db govexe --pg-user govexe
-    python -m gcp.slice.embed_job --images-dir pages --local-store /tmp/pgvector-fake  # dev
+    python -m gcp.slice.embed_job --records lote.jsonl --asr-model large-v3 \
+        --pg-host 127.0.0.1 --pg-db govexe --pg-user govexe
+    python -m gcp.slice.embed_job --records lote.jsonl --asr-backend fake \
+        --local-store /tmp/indice-fake.json --device cpu --dim 4            # dev
 """
 
 from __future__ import annotations
@@ -54,22 +78,39 @@ import numpy as np
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from benchmark.models.qwen3vl_embed import DEFAULT_MODEL_ID, embed_images  # noqa: E402
+from benchmark.models.qwen3vl_embed import (  # noqa: E402
+    DEFAULT_MODEL_ID,
+    embed_images,
+    embed_texts,
+)
+from gcp.slice.asr import Transcriber, add_asr_arguments, transcriber_from_args  # noqa: E402
 from gcp.slice.collector import (  # noqa: E402
     DEFAULT_PREFIX,
     DEFAULT_SOURCE,
     IMAGE_SUFFIXES,
     ObjectStore,
+    load_records,
     open_store,
+    store_from_location,
 )
 from scripts.embed_qwen3vl import build_manifest, collect_paths  # noqa: E402
 
 log = logging.getLogger(__name__)
 
-DEFAULT_TABLE = "govexe_pages"
+DEFAULT_TABLE = "govexe_items"
 DEFAULT_PASSWORD_ENV = "PGPASSWORD"
 DEFAULT_WORK_DIR = "/tmp/govexe-bronze"
 TOP_K = 5
+
+# -- modalidades (Abordagem A: todas no mesmo indice, pelo mesmo checkpoint) --------------
+MODALITY_DOC_IMAGE = "doc_image"   # pagina de documento rasterizada
+MODALITY_IMAGE = "image"           # foto de agencia publica (com credito)
+MODALITY_TEXT = "text"             # texto nativo (materia, legenda, ementa)
+MODALITY_AUDIO = "audio_asr"       # audio colapsado em texto pelo Whisper
+MODALITIES = (MODALITY_DOC_IMAGE, MODALITY_IMAGE, MODALITY_TEXT, MODALITY_AUDIO)
+# Quem vai por `embed_images` e quem vai por `embed_texts` -- mesmo checkpoint nos dois.
+IMAGE_MODALITIES = (MODALITY_DOC_IMAGE, MODALITY_IMAGE)
+TEXT_MODALITIES = (MODALITY_TEXT, MODALITY_AUDIO)
 
 # Teto do indice do pgvector: uma coluna indexada por `hnsw` (ou `ivfflat`) nao pode passar
 # de 2000 dimensoes -- acima disso o CREATE INDEX estoura
@@ -82,10 +123,15 @@ DEFAULT_DIM = 1024
 
 # DDL identica a do README-slice.md (secao "tabela"): o job cria a tabela se ela nao
 # existir, mas a criacao tambem pode ser feita a mao no Cloud SQL Studio/psql.
+# `govexe_items` e superset da antiga `govexe_pages` -- ver a nota de migracao no README.
 DDL_TABLE = """CREATE TABLE IF NOT EXISTS {table} (
-    page_id        TEXT PRIMARY KEY,
+    item_id        TEXT PRIMARY KEY,
+    modality       TEXT NOT NULL,
     source         TEXT NOT NULL,
     uri            TEXT NOT NULL,
+    pointer_uri    TEXT,
+    credit         TEXT,
+    content_text   TEXT,
     content_sha256 TEXT NOT NULL,
     model_id       TEXT NOT NULL,
     embedding      VECTOR({dim}) NOT NULL,
@@ -95,50 +141,75 @@ DDL_TABLE = """CREATE TABLE IF NOT EXISTS {table} (
 DDL_INDEX = ("CREATE INDEX IF NOT EXISTS {table}_embedding_cos "
              "ON {table} USING hnsw (embedding vector_cosine_ops)")
 
-# O upsert idempotente: chave = page_id. Reprocessar o mesmo Bronze atualiza a linha.
+# btree de apoio ao filtro `--modality` do query.py (o HNSW nao filtra por coluna comum).
+DDL_INDEX_MODALITY = ("CREATE INDEX IF NOT EXISTS {table}_modality "
+                      "ON {table} (modality)")
+
+# O upsert idempotente: chave = item_id. Reprocessar o mesmo lote atualiza a linha.
 SQL_UPSERT = """INSERT INTO {table}
-    (page_id, source, uri, content_sha256, model_id, embedding, updated_at)
-VALUES (%s, %s, %s, %s, %s, %s::vector, now())
-ON CONFLICT (page_id) DO UPDATE SET
+    (item_id, modality, source, uri, pointer_uri, credit, content_text,
+     content_sha256, model_id, embedding, updated_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, now())
+ON CONFLICT (item_id) DO UPDATE SET
+    modality       = EXCLUDED.modality,
     source         = EXCLUDED.source,
     uri            = EXCLUDED.uri,
+    pointer_uri    = EXCLUDED.pointer_uri,
+    credit         = EXCLUDED.credit,
+    content_text   = EXCLUDED.content_text,
     content_sha256 = EXCLUDED.content_sha256,
     model_id       = EXCLUDED.model_id,
     embedding      = EXCLUDED.embedding,
     updated_at     = now()"""
 
-SQL_SEARCH = """SELECT page_id, uri, 1 - (embedding <=> %s::vector) AS score
+SQL_SEARCH = """SELECT item_id, modality, uri, pointer_uri, credit, content_text,
+       1 - (embedding <=> %s::vector) AS score
 FROM {table}
-ORDER BY embedding <=> %s::vector
+{where}ORDER BY embedding <=> %s::vector
 LIMIT %s"""
+
+SQL_WHERE_MODALITY = "WHERE modality = %s\n"
 
 
 # -- linhas -----------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class PageRow:
-    """Uma pagina pronta para o indice: metadados + vetor L2-normalizado."""
+class ItemRow:
+    """Um item pronto para o indice: metadados + vetor L2-normalizado.
 
-    page_id: str
+    Vale para as quatro modalidades -- o que muda e quais campos opcionais vem
+    preenchidos: `content_text` nas de texto (incluindo a transcricao do audio),
+    `pointer_uri`/`credit` no que tem binario original e autoria a preservar.
+    """
+
+    item_id: str
+    modality: str
     source: str
     uri: str
     content_sha256: str
     model_id: str
     embedding: np.ndarray = field(repr=False)
+    pointer_uri: str | None = None
+    credit: str | None = None
+    content_text: str | None = None
 
 
 @dataclass(frozen=True)
 class Hit:
     """Resultado de busca (score = cosseno, porque os vetores saem L2-normalizados)."""
 
-    page_id: str
+    item_id: str
+    modality: str
     uri: str
     score: float
+    pointer_uri: str | None = None
+    credit: str | None = None
+    content_text: str | None = None
 
 
 def content_sha256(path: str | Path) -> str:
-    """sha256 do arquivo. Pagina ausente (manifest de outra maquina) -> hash da URI."""
+    """sha256 do arquivo. Item ausente (manifest de outra maquina) -> hash do caminho."""
     p = Path(path)
     if not p.is_file():
         log.warning("arquivo ausente, hash derivado do caminho: %s", p)
@@ -150,13 +221,30 @@ def content_sha256(path: str | Path) -> str:
     return h.hexdigest()
 
 
+def text_sha256(text: str) -> str:
+    """sha256 do texto embutido (nas modalidades de texto e ele que gera o vetor)."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def default_item_id(modality: str, uri: str) -> str:
+    """Id estavel de foto/texto/audio: `<modalidade>:<hash curto da uri>`.
+
+    Paginas de documento continuam usando o stem do arquivo (o id do `corpus.jsonl`);
+    para as outras modalidades nao ha id natural garantido, entao a chave sai da URI --
+    deterministica, legivel na origem pela modalidade e estavel entre execucoes, que e o
+    que o upsert precisa. Um `item_id` explicito no record sempre vence este default.
+    """
+    return f"{modality}:{hashlib.sha256(uri.encode('utf-8')).hexdigest()[:16]}"
+
+
 def build_rows(items: list[dict], vecs: np.ndarray, *, model_id: str = DEFAULT_MODEL_ID,
                source: str = DEFAULT_SOURCE,
-               uris: dict[str, str] | None = None) -> list[PageRow]:
-    """Manifest + matriz -> linhas do indice.
+               uris: dict[str, str] | None = None,
+               modality: str = MODALITY_DOC_IMAGE) -> list[ItemRow]:
+    """Manifest + matriz -> linhas do indice (caminho das paginas-documento).
 
     `items` segue o manifest de `scripts/embed_qwen3vl.py` (`{"row", "id", "path"}`), entao
-    o `page_id` ja e o stem do arquivo. `uris` mapeia caminho local -> URI de origem
+    o `item_id` ja e o stem do arquivo. `uris` mapeia caminho local -> URI de origem
     (`gs://...`) quando a pagina veio do Bronze; sem ele, a URI e o proprio caminho.
     """
     vecs = np.atleast_2d(np.asarray(vecs, dtype="float32"))
@@ -166,8 +254,9 @@ def build_rows(items: list[dict], vecs: np.ndarray, *, model_id: str = DEFAULT_M
     linhas = []
     for item in items:
         path = item["path"]
-        linhas.append(PageRow(
-            page_id=item["id"],
+        linhas.append(ItemRow(
+            item_id=item["id"],
+            modality=modality,
             source=source,
             uri=uris.get(path, str(path)),
             content_sha256=content_sha256(path),
@@ -175,6 +264,108 @@ def build_rows(items: list[dict], vecs: np.ndarray, *, model_id: str = DEFAULT_M
             embedding=np.asarray(vecs[item["row"]], dtype="float32"),
         ))
     return linhas
+
+
+# -- records: lote misto (foto, texto nativo, audio->ASR) ---------------------------------
+
+
+def prepare_record(rec: dict, *, source: str = DEFAULT_SOURCE,
+                   store: ObjectStore | None = None,
+                   work_dir: str | Path = DEFAULT_WORK_DIR,
+                   transcriber: Transcriber | None = None) -> dict:
+    """Record cru -> item normalizado, ja com `content_text` (ASR incluido) e hash.
+
+    Resolve, nesta ordem: o binario (caminho local ou `blob` baixado do Bronze), a URI da
+    representacao, o `item_id` e -- para `audio_asr` sem texto -- a transcricao pelo
+    `Transcriber`. O vetor NAO sai daqui: quem embute e o `embed_records`, que agrupa por
+    modalidade para chamar o encoder certo do mesmo checkpoint.
+    """
+    modality = rec.get("modality")
+    if modality not in MODALITIES:
+        raise ValueError(f"modalidade desconhecida: {modality!r} (use uma de {MODALITIES})")
+
+    path = rec.get("image_path") or rec.get("audio_path") or rec.get("path")
+    uri = rec.get("uri")
+    blob = rec.get("blob")
+    if blob and not path:
+        if store is None:
+            raise ValueError(f"record com `blob` ({blob}) exige --records-store para "
+                             "resolver o objeto no Bronze")
+        path = str(store.download(blob, work_dir).resolve())
+    if blob and store is not None and not uri:
+        uri = store.uri(blob)
+    if not uri:
+        uri = str(path) if path else rec.get("pointer_uri")
+    if not uri:
+        raise ValueError(f"record sem uri, caminho ou blob: {rec!r}")
+
+    content_text = rec.get("text") or rec.get("content_text")
+    if modality == MODALITY_AUDIO and not content_text:
+        if not path:
+            raise ValueError(f"record de audio sem arquivo nem transcricao: {rec!r}")
+        if transcriber is None:
+            raise ValueError("record `audio_asr` sem transcricao exige um transcritor "
+                             "(--asr-backend / parametro `transcriber`)")
+        content_text = transcriber.transcribe(path)
+        log.info("asr: %s -> %d caracteres", path, len(content_text))
+    if modality == MODALITY_TEXT and not content_text:
+        raise ValueError(f"record de texto sem campo `text`: {rec!r}")
+    if modality in IMAGE_MODALITIES and not path:
+        raise ValueError(f"record de imagem sem `image_path` nem `blob`: {rec!r}")
+
+    item_id = rec.get("item_id")
+    if not item_id:
+        item_id = (Path(path).stem if modality == MODALITY_DOC_IMAGE and path
+                   else default_item_id(modality, uri))
+    return {
+        "item_id": item_id,
+        "modality": modality,
+        "source": rec.get("source") or source,
+        "uri": uri,
+        "pointer_uri": rec.get("pointer_uri"),
+        "credit": rec.get("credit"),
+        "content_text": content_text if modality in TEXT_MODALITIES else None,
+        "path": str(path) if path else None,
+        "content_sha256": (text_sha256(content_text) if modality in TEXT_MODALITIES
+                           else content_sha256(path)),
+    }
+
+
+def embed_records(records: list[dict], *, model_id: str = DEFAULT_MODEL_ID,
+                  device: str = "cuda", dtype: str = "bfloat16", batch_size: int = 8,
+                  dim: int | None = DEFAULT_DIM, source: str = DEFAULT_SOURCE,
+                  transcriber: Transcriber | None = None,
+                  store: ObjectStore | None = None,
+                  work_dir: str | Path = DEFAULT_WORK_DIR) -> list[ItemRow]:
+    """Lote MISTO -> linhas do indice, cada modalidade pelo encoder certo.
+
+    Imagens (`doc_image`/`image`) vao por `embed_images`, texto e transcricao
+    (`text`/`audio_asr`) por `embed_texts` -- mesmo `model_id`, mesmo `dim`, mesma
+    L2-normalizacao, logo **mesmo espaco vetorial** (Abordagem A). As duas chamadas sao
+    separadas so por eficiencia de batch; a ordem do lote e reconstituida no fim.
+    """
+    preparados = [prepare_record(r, source=source, store=store, work_dir=work_dir,
+                                 transcriber=transcriber) for r in records]
+    kw = dict(model_id=model_id, device=device, dtype=dtype, batch_size=batch_size, dim=dim)
+    vetores: list[np.ndarray | None] = [None] * len(preparados)
+
+    idx_img = [i for i, p in enumerate(preparados) if p["modality"] in IMAGE_MODALITIES]
+    if idx_img:
+        m = np.atleast_2d(embed_images([preparados[i]["path"] for i in idx_img], **kw))
+        for linha, i in enumerate(idx_img):
+            vetores[i] = np.asarray(m[linha], dtype="float32")
+
+    idx_txt = [i for i, p in enumerate(preparados) if p["modality"] in TEXT_MODALITIES]
+    if idx_txt:
+        m = np.atleast_2d(embed_texts([preparados[i]["content_text"] for i in idx_txt], **kw))
+        for linha, i in enumerate(idx_txt):
+            vetores[i] = np.asarray(m[linha], dtype="float32")
+
+    return [ItemRow(item_id=p["item_id"], modality=p["modality"], source=p["source"],
+                    uri=p["uri"], content_sha256=p["content_sha256"], model_id=model_id,
+                    embedding=v, pointer_uri=p["pointer_uri"], credit=p["credit"],
+                    content_text=p["content_text"])
+            for p, v in zip(preparados, vetores, strict=True)]
 
 
 def load_vectors(prefix: str | Path) -> tuple[dict, np.ndarray]:
@@ -195,13 +386,14 @@ class VectorStore(Protocol):
     def ensure_schema(self, dim: int) -> None:
         ...
 
-    def upsert(self, rows: list[PageRow]) -> int:
-        """Grava as linhas por `page_id` (idempotente) e devolve quantas foram gravadas."""
+    def upsert(self, rows: list[ItemRow]) -> int:
+        """Grava as linhas por `item_id` (idempotente) e devolve quantas foram gravadas."""
 
     def count(self) -> int:
         ...
 
-    def search(self, vec: np.ndarray, k: int = TOP_K) -> list[Hit]:
+    def search(self, vec: np.ndarray, k: int = TOP_K,
+               modality: str | None = None) -> list[Hit]:
         ...
 
 
@@ -220,32 +412,64 @@ def rank_top_k(q_vec: np.ndarray, matrix: np.ndarray, ids: list[str],
 
 
 class InMemoryVectorStore:
-    """FAKE de `VectorStore`: dicionario por `page_id` + produto interno. Usado nos testes
-    e no modo dev (`--vectors` do `query.py`), nunca em producao."""
+    """FAKE de `VectorStore`: dicionario por `item_id` + produto interno. Usado nos testes
+    e no modo dev (`--local-store`, `--vectors` do `query.py`), nunca em producao.
 
-    def __init__(self, rows: list[PageRow] | None = None):
-        self.rows: dict[str, PageRow] = {}
+    Com `path`, o dicionario e espelhado num JSON a cada upsert: e so o que falta para o
+    modo dev atravessar dois processos (`embed_job.py` e depois `query.py`) sem Cloud SQL.
+    """
+
+    def __init__(self, rows: list[ItemRow] | None = None, path: str | Path | None = None):
+        self.rows: dict[str, ItemRow] = {}
+        self.path = Path(path) if path else None
+        if self.path and self.path.is_file():
+            self._load()
         if rows:
             self.upsert(rows)
 
+    # -- persistencia opcional (so modo dev) -------------------------------------
+    @staticmethod
+    def _to_json(row: ItemRow) -> dict:
+        d = {k: v for k, v in row.__dict__.items() if k != "embedding"}
+        d["embedding"] = [float(x) for x in np.asarray(row.embedding).ravel()]
+        return d
+
+    def _load(self) -> None:
+        for d in json.loads(self.path.read_text(encoding="utf-8")):
+            d = dict(d)
+            d["embedding"] = np.asarray(d["embedding"], dtype="float32")
+            self.rows[d["item_id"]] = ItemRow(**d)
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps([self._to_json(r) for r in self.rows.values()],
+                                        ensure_ascii=False), encoding="utf-8")
+
+    # -- VectorStore -------------------------------------------------------------
     def ensure_schema(self, dim: int) -> None:
         self.dim = dim
 
-    def upsert(self, rows: list[PageRow]) -> int:
+    def upsert(self, rows: list[ItemRow]) -> int:
         for row in rows:
-            self.rows[row.page_id] = row       # mesma chave -> substitui, nao duplica
+            self.rows[row.item_id] = row       # mesma chave -> substitui, nao duplica
+        self._save()
         return len(rows)
 
     def count(self) -> int:
         return len(self.rows)
 
-    def search(self, vec: np.ndarray, k: int = TOP_K) -> list[Hit]:
-        if not self.rows:
+    def search(self, vec: np.ndarray, k: int = TOP_K,
+               modality: str | None = None) -> list[Hit]:
+        ids = [i for i, r in self.rows.items() if modality in (None, r.modality)]
+        if not ids:
             return []
-        ids = list(self.rows)
         matriz = np.vstack([self.rows[i].embedding for i in ids])
-        return [Hit(pid, self.rows[pid].uri, score)
-                for pid, score in rank_top_k(vec, matriz, ids, k)]
+        return [Hit(iid, self.rows[iid].modality, self.rows[iid].uri, score,
+                    self.rows[iid].pointer_uri, self.rows[iid].credit,
+                    self.rows[iid].content_text)
+                for iid, score in rank_top_k(vec, matriz, ids, k)]
 
 
 class PgVectorStore:
@@ -296,12 +520,14 @@ class PgVectorStore:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
             cur.execute(DDL_TABLE.format(table=self.table, dim=dim))
             cur.execute(DDL_INDEX.format(table=self.table))
+            cur.execute(DDL_INDEX_MODALITY.format(table=self.table))
         self._conn.commit()
 
-    def upsert(self, rows: list[PageRow]) -> int:
+    def upsert(self, rows: list[ItemRow]) -> int:
         if not rows:
             return 0
-        params = [(r.page_id, r.source, r.uri, r.content_sha256, r.model_id,
+        params = [(r.item_id, r.modality, r.source, r.uri, r.pointer_uri, r.credit,
+                   r.content_text, r.content_sha256, r.model_id,
                    self.vector_literal(r.embedding)) for r in rows]
         with self._conn.cursor() as cur:
             cur.executemany(SQL_UPSERT.format(table=self.table), params)
@@ -313,17 +539,25 @@ class PgVectorStore:
             cur.execute(f"SELECT count(*) FROM {self.table}")
             return int(cur.fetchone()[0])
 
-    def search(self, vec: np.ndarray, k: int = TOP_K) -> list[Hit]:
+    def search(self, vec: np.ndarray, k: int = TOP_K,
+               modality: str | None = None) -> list[Hit]:
         literal = self.vector_literal(vec)
+        where = SQL_WHERE_MODALITY if modality else ""
+        params = [literal] + ([modality] if modality else []) + [literal, int(k)]
         with self._conn.cursor() as cur:
-            cur.execute(SQL_SEARCH.format(table=self.table), (literal, literal, int(k)))
-            return [Hit(page_id, uri, float(score)) for page_id, uri, score in cur.fetchall()]
+            cur.execute(SQL_SEARCH.format(table=self.table, where=where), tuple(params))
+            return [Hit(item_id, mod, uri, float(score), pointer_uri, credit, content_text)
+                    for item_id, mod, uri, pointer_uri, credit, content_text, score
+                    in cur.fetchall()]
 
 
 def open_vector_store(args: argparse.Namespace) -> VectorStore:
     """`--local-store` -> fake em memoria (dev/testes); senao, Cloud SQL + pgvector."""
-    if getattr(args, "local_store", None):
-        return InMemoryVectorStore()
+    local = getattr(args, "local_store", None)
+    if local:
+        # `--local-store` sozinho = so memoria; com um caminho, o indice fake persiste
+        # naquele JSON (e so assim embed_job e query se enxergam em processos diferentes).
+        return InMemoryVectorStore(path=local if isinstance(local, str) else None)
     return PgVectorStore.connect(host=args.pg_host, port=args.pg_port, dbname=args.pg_db,
                                  user=args.pg_user, password_env=args.password_env,
                                  table=args.table)
@@ -341,8 +575,11 @@ def add_pg_arguments(ap: argparse.ArgumentParser) -> None:
                          "preencha a partir do Secret Manager -- nunca por flag")
     ap.add_argument("--table", default=DEFAULT_TABLE,
                     help=f"tabela do indice (default: {DEFAULT_TABLE})")
-    ap.add_argument("--local-store", action="store_true",
-                    help="usa o indice fake em memoria (modo dev; nao toca o Cloud SQL)")
+    ap.add_argument("--local-store", nargs="?", const=True, default=None,
+                    metavar="ARQUIVO.json",
+                    help="usa o indice fake em memoria (modo dev; nao toca o Cloud SQL). "
+                         "Com um caminho .json, o indice fake e persistido nesse arquivo, "
+                         "para o query.py reabrir o mesmo lote em outro processo")
 
 
 # -- download do Bronze -------------------------------------------------------------------
@@ -370,16 +607,23 @@ def download_pages(store: ObjectStore, prefix: str, dest_dir: str | Path,
 # -- CLI ------------------------------------------------------------------------------------
 
 
-def main(argv: list[str] | None = None, *, store: VectorStore | None = None) -> int:
+def main(argv: list[str] | None = None, *, store: VectorStore | None = None,
+         transcriber: Transcriber | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     entrada = ap.add_mutually_exclusive_group(required=True)
     entrada.add_argument("--bucket", help="bucket GCS com o Bronze (ex.: gs://govexe-bronze)")
     entrada.add_argument("--local-bronze", help="diretorio que simula o bucket (modo dev)")
     entrada.add_argument("--images-dir", help="le as paginas direto de um diretorio local")
+    entrada.add_argument("--records",
+                         help="JSONL de records do lote misto (foto/texto/audio; formato "
+                              "no README-slice.md)")
     entrada.add_argument("--vectors",
                          help="prefixo .npy/.manifest.json de scripts/embed_qwen3vl.py "
                               "(nao carrega modelo)")
+    ap.add_argument("--records-store", default=None,
+                    help="Bronze onde resolver o campo `blob` dos records "
+                         "(gs://bucket ou diretorio local)")
     ap.add_argument("--blob-prefix", default=f"{DEFAULT_PREFIX}/",
                     help=f"prefixo dos objetos no bucket (default: {DEFAULT_PREFIX}/)")
     ap.add_argument("--work-dir", default=DEFAULT_WORK_DIR,
@@ -395,10 +639,27 @@ def main(argv: list[str] | None = None, *, store: VectorStore | None = None) -> 
                     help="trunca o vetor para N dimensoes (Matryoshka/MRL) e renormaliza "
                          f"(default: {DEFAULT_DIM}; o indice HNSW do pgvector so aceita ate "
                          f"{HNSW_MAX_DIM} dimensoes)")
-    ap.add_argument("--limit", type=int, default=None, help="processa so as N primeiras paginas")
+    ap.add_argument("--limit", type=int, default=None, help="processa so os N primeiros itens")
+    add_asr_arguments(ap)
     add_pg_arguments(ap)
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    if a.records:
+        registros = load_records(a.records)
+        if a.limit:
+            registros = registros[:a.limit]
+        if not registros:
+            log.error("nenhum record em %s", a.records)
+            return 1
+        objetos = store_from_location(a.records_store) if a.records_store else None
+        log.info("embutindo %d records (%s) com %s", len(registros),
+                 ", ".join(sorted({r.get("modality", "?") for r in registros})), a.model_id)
+        rows = embed_records(registros, model_id=a.model_id, device=a.device, dtype=a.dtype,
+                             batch_size=a.batch_size, dim=a.dim, source=a.source,
+                             transcriber=transcriber or transcriber_from_args(a),
+                             store=objetos, work_dir=a.work_dir)
+        return _index(rows, a, store, dim=len(rows[0].embedding))
 
     uris: dict[str, str] = {}
     if a.vectors:
@@ -422,12 +683,18 @@ def main(argv: list[str] | None = None, *, store: VectorStore | None = None) -> 
         model_id = a.model_id
 
     rows = build_rows(items, vecs, model_id=model_id, source=a.source, uris=uris)
+    return _index(rows, a, store, dim=int(np.shape(vecs)[1]))
+
+
+def _index(rows: list[ItemRow], a: argparse.Namespace, store: VectorStore | None,
+           *, dim: int) -> int:
+    """Upsert das linhas no indice (o mesmo fim para todos os modos de entrada)."""
     store = store or open_vector_store(a)
-    store.ensure_schema(int(np.shape(vecs)[1]))
+    store.ensure_schema(dim)
     gravadas = store.upsert(rows)
     total = store.count()
-    log.info("upsert: %d linhas gravadas; indice com %d paginas", gravadas, total)
-    print(f"{gravadas} paginas gravadas; total no indice: {total}")
+    log.info("upsert: %d linhas gravadas; indice com %d itens", gravadas, total)
+    print(f"{gravadas} itens gravados; total no indice: {total}")
     return 0
 
 

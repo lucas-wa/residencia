@@ -1,11 +1,18 @@
-"""Coletor Bronze: sobe as paginas-imagem dos planos para o GCS, particionadas por fonte/data.
+"""Coletor Bronze: sobe paginas, fotos e audios para o GCS, particionados por fonte/data.
 
 Primeiro passo da fatia vertical (`gcp/slice/README-slice.md`): as paginas que
 `data/govexe/build_planos_benchmark.py` rasteriza em `data/govexe/ptbr_planos/pages`
 viram objetos imutaveis na camada **Bronze**, no layout que `fusao/coleta-gcp.md` ja
 descreve:
 
-    bronze/fonte=<source>/dt=<YYYY-MM-DD>/<pagina>.png
+    bronze/fonte=<source>/dt=<YYYY-MM-DD>/<arquivo>.png
+
+O Bronze tambem recebe **audio** (sessoes de YouTube/RadioAgencia, §6 daquele doc) -- o
+binario fica preservado como *pointer* auditavel; quem vira vetor e a transcricao, no
+`embed_job.py`. Alem do modo "diretorio de paginas", ha o modo **`--records`**: um JSONL
+com o lote misto (foto + legenda + credito, texto nativo, audio), cujos binarios sobem
+para o Bronze e que sai enriquecido com `blob`/`uri` pronto para o
+`embed_job.py --records` (formato documentado no README-slice.md).
 
 A camada de storage fica atras da interface `ObjectStore` (5 metodos). Ha duas
 implementacoes:
@@ -27,6 +34,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import shutil
 import sys
@@ -46,6 +54,25 @@ DEFAULT_IMAGES_DIR = "data/govexe/ptbr_planos/pages"
 DEFAULT_SOURCE = "tse_planos"
 DEFAULT_PREFIX = "bronze"
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+# Audio tambem entra no Bronze (sessoes de YouTube/RadioAgencia, `fusao/coleta-gcp.md` §6).
+# O binario fica aqui como *pointer* auditavel; quem vira vetor e a transcricao (ASR).
+AUDIO_SUFFIXES = (".mp3", ".wav", ".m4a", ".ogg", ".opus", ".flac")
+MEDIA_SUFFIXES = IMAGE_SUFFIXES + AUDIO_SUFFIXES
+
+# Modalidades do indice (`gcp/slice/embed_job.py` e quem as consome). Repetidas aqui como
+# literais de proposito: o coletor nao importa o job (a dependencia corre no outro sentido).
+MODALITY_DOC_IMAGE = "doc_image"
+MODALITY_AUDIO = "audio_asr"
+
+
+def modality_for(path: str | Path, default: str = MODALITY_DOC_IMAGE) -> str:
+    """Modalidade a partir da extensao: audio -> `audio_asr`; o resto fica no `default`.
+
+    Imagem nao se resolve so pela extensao -- uma pagina de plano (`doc_image`) e uma foto
+    de agencia (`image`) sao ambas PNG/JPG -- entao quem decide e o `--modality` do CLI
+    (ou o proprio record, no modo `--records`).
+    """
+    return (MODALITY_AUDIO if str(path).lower().endswith(AUDIO_SUFFIXES) else default)
 
 
 # -- interface de storage --------------------------------------------------------------
@@ -144,6 +171,16 @@ def open_store(bucket: str | None = None, local_root: str | Path | None = None) 
     return GCSObjectStore(bucket) if bucket else LocalObjectStore(local_root)  # type: ignore
 
 
+def store_from_location(location: str | Path) -> ObjectStore:
+    """Uma flag so: `gs://...` -> GCS real; qualquer outro caminho -> fake de filesystem.
+
+    Usado por `--records-store` do `embed_job.py`, que precisa de UM destino (o Bronze de
+    onde os `blob` dos records serao baixados) sem repetir o par bucket/local-root.
+    """
+    texto = str(location)
+    return GCSObjectStore(texto) if texto.startswith("gs://") else LocalObjectStore(texto)
+
+
 # -- coleta ----------------------------------------------------------------------------
 
 
@@ -160,28 +197,85 @@ def blob_name(path: str | Path, source: str = DEFAULT_SOURCE, day: str | None = 
 
 def collect(paths: list[str], store: ObjectStore, *, source: str = DEFAULT_SOURCE,
             day: str | None = None, prefix: str = DEFAULT_PREFIX,
-            force: bool = False) -> list[dict]:
-    """Sobe cada pagina para o Bronze e devolve um registro por arquivo.
+            force: bool = False, modality: str = MODALITY_DOC_IMAGE) -> list[dict]:
+    """Sobe cada arquivo (imagem ou audio) para o Bronze e devolve um record por arquivo.
 
     Pula o que ja existe no destino (a menos de `force`), entao reprocessar uma fonte
-    nao reescreve o bucket inteiro nem duplica objetos.
+    nao reescreve o bucket inteiro nem duplica objetos. O record ja sai no formato que o
+    `embed_job.py --records` consome (`item_id`, `modality`, `blob`, `uri`).
     """
     day = day or _date.today().isoformat()
     registros: list[dict] = []
     for path in paths:
         name = blob_name(path, source, day, prefix)
-        if not force and store.exists(name):
+        rec = {"item_id": Path(path).stem, "modality": modality_for(path, modality),
+               "source": source, "blob": name, "uri": store.uri(name), "uploaded": False}
+        if force or not store.exists(name):
+            rec["uri"] = store.upload(path, name)
+            rec["uploaded"] = True
+        else:
             log.debug("objeto ja existe, pulando: %s", name)
-            registros.append({"page_id": Path(path).stem, "blob": name,
-                              "uri": store.uri(name), "uploaded": False})
-            continue
-        uri = store.upload(path, name)
-        registros.append({"page_id": Path(path).stem, "blob": name,
-                          "uri": uri, "uploaded": True})
+        registros.append(rec)
     enviados = sum(r["uploaded"] for r in registros)
-    log.info("bronze: %d paginas (%d enviadas, %d ja existiam) em fonte=%s dt=%s",
+    log.info("bronze: %d arquivos (%d enviados, %d ja existiam) em fonte=%s dt=%s",
              len(registros), enviados, len(registros) - enviados, source, day)
     return registros
+
+
+# -- records: lote misto (foto, texto nativo, audio) -------------------------------------
+
+
+def collect_records(records: list[dict], store: ObjectStore, *, source: str = DEFAULT_SOURCE,
+                    day: str | None = None, prefix: str = DEFAULT_PREFIX,
+                    force: bool = False) -> list[dict]:
+    """Sobe os BINARIOS dos records (foto/audio) para o Bronze e devolve os records prontos.
+
+    Cada record ganha `blob` (objeto no Bronze), `uri` (a URI canonica desse objeto) e,
+    quando o record nao traz um, `pointer_uri` apontando o binario original preservado --
+    o *pointer* auditavel de `fusao/coleta-gcp.md` §6, ao lado do `credit`, que o coletor
+    nunca descarta. Records de texto nativo nao tem binario e passam intactos.
+    """
+    day = day or _date.today().isoformat()
+    saida: list[dict] = []
+    for rec in records:
+        novo = dict(rec)
+        path = rec.get("image_path") or rec.get("audio_path") or rec.get("path")
+        if not path:
+            saida.append(novo)                       # texto nativo: nada a subir
+            continue
+        name = blob_name(path, novo.get("source", source), day, prefix)
+        uri = store.uri(name)
+        if force or not store.exists(name):
+            uri = store.upload(path, name)
+            novo["uploaded"] = True
+        else:
+            log.debug("objeto ja existe, pulando: %s", name)
+            novo["uploaded"] = False
+        novo.update(blob=name, uri=uri, modality=novo.get("modality")
+                    or modality_for(path, MODALITY_DOC_IMAGE),
+                    source=novo.get("source", source))
+        novo.setdefault("pointer_uri", uri)
+        saida.append(novo)
+    binarios = sum(1 for r in saida if r.get("blob"))
+    fontes = sorted({r.get("source", source) for r in saida})
+    log.info("bronze: %d records (%d com binario) em dt=%s, fonte(s): %s",
+             len(saida), binarios, day, ", ".join(fontes))
+    return saida
+
+
+def write_records(records: list[dict], path: str | Path) -> Path:
+    """Grava os records em JSONL (a entrada do `embed_job.py --records`)."""
+    destino = Path(path)
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    destino.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
+                       encoding="utf-8")
+    return destino
+
+
+def load_records(path: str | Path) -> list[dict]:
+    """Le um JSONL de records (um objeto por linha; linhas em branco ignoradas)."""
+    linhas = Path(path).read_text(encoding="utf-8").splitlines()
+    return [json.loads(ln) for ln in linhas if ln.strip()]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -193,7 +287,18 @@ def main(argv: list[str] | None = None) -> int:
                          help="diretorio que simula o bucket (modo dev; nao toca a nuvem)")
     ap.add_argument("--images-dir", default=DEFAULT_IMAGES_DIR,
                     help=f"diretorio das paginas (default: {DEFAULT_IMAGES_DIR})")
-    ap.add_argument("--glob", default=None, help="padrao das imagens dentro de --images-dir")
+    ap.add_argument("--glob", default=None,
+                    help="padrao dos arquivos dentro de --images-dir (use, por exemplo, "
+                         "'**/*.mp3' para subir audio)")
+    ap.add_argument("--records", default=None,
+                    help="JSONL de records (foto/texto/audio): sobe os binarios para o "
+                         "Bronze e reescreve os records com `blob`/`uri`")
+    ap.add_argument("--out-records", default=None,
+                    help="onde gravar o JSONL de records enriquecido (entrada do "
+                         "`embed_job.py --records`)")
+    ap.add_argument("--modality", default=MODALITY_DOC_IMAGE,
+                    help=f"modalidade dos arquivos de --images-dir (default: "
+                         f"{MODALITY_DOC_IMAGE}; audio e detectado pela extensao)")
     ap.add_argument("--source", default=DEFAULT_SOURCE,
                     help=f"fonte, usada na particao fonte=... (default: {DEFAULT_SOURCE})")
     ap.add_argument("--date", default=None,
@@ -206,18 +311,37 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
+    store = open_store(a.bucket, a.local_root)
+
+    if a.records:
+        records = load_records(a.records)[:a.limit] if a.limit else load_records(a.records)
+        if not records:
+            log.error("nenhum record em %s", a.records)
+            return 1
+        registros = collect_records(records, store, source=a.source, day=a.date,
+                                    prefix=a.prefix, force=a.force)
+        if a.out_records:
+            destino = write_records(registros, a.out_records)
+            print(f"{len(registros)} records -> {destino}")
+        else:
+            log.warning("sem --out-records: os records enriquecidos saem so no stdout")
+            for r in registros:
+                print(json.dumps(r, ensure_ascii=False))
+        return 0
+
     paths = collect_paths(a.images_dir, a.glob or "**/*.png", a.limit)
     if not paths:
-        log.error("nenhuma pagina encontrada em %s", a.images_dir)
+        log.error("nenhum arquivo encontrado em %s", a.images_dir)
         return 1
 
-    store = open_store(a.bucket, a.local_root)
     registros = collect(paths, store, source=a.source, day=a.date, prefix=a.prefix,
-                        force=a.force)
+                        force=a.force, modality=a.modality)
+    if a.out_records:
+        print(f"{len(registros)} records -> {write_records(registros, a.out_records)}")
     for r in registros[:5]:
         print(f"{'up ' if r['uploaded'] else 'skip'} {r['uri']}")
     if len(registros) > 5:
-        print(f"... e mais {len(registros) - 5} paginas")
+        print(f"... e mais {len(registros) - 5} arquivos")
     return 0
 
 
