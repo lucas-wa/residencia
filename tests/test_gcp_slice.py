@@ -453,6 +453,65 @@ def test_prepare_record_audio_sem_transcritor_falha(tmp_path):
         embed_job.prepare_record({"modality": "audio_asr", "audio_path": str(audio)})
 
 
+class _SpyStore(collector.LocalObjectStore):
+    """`LocalObjectStore` que anota cada download -- para provar que ele NAO aconteceu."""
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.baixados: list[str] = []
+
+    def download(self, name, dest_dir):
+        self.baixados.append(name)
+        return super().download(name, dest_dir)
+
+
+def _store_com_foto(tmp_path, blob="bronze/fonte=camara/dt=2026-10-22/dep_204379.jpg"):
+    """Bronze fake com a foto ja gravada sob `blob`."""
+    store = _SpyStore(tmp_path / "bucket")
+    origem = tmp_path / "origem.jpg"
+    origem.write_bytes(b"jpgfake")
+    store.upload(origem, blob)
+    return store, blob
+
+
+def test_prepare_record_baixa_do_bronze_quando_o_caminho_local_nao_existe(tmp_path):
+    """Record gerado em outra maquina: `image_path` nao existe aqui, mas o `blob` sim."""
+    store, blob = _store_com_foto(tmp_path)
+    ausente = tmp_path / "outra_maquina" / "data" / "govexe" / "fotos" / "dep_204379.jpg"
+    rec = {"modality": "image", "image_path": str(ausente),
+           "blob": blob, "credit": "Camara dos Deputados"}
+
+    p = embed_job.prepare_record(rec, store=store, work_dir=tmp_path / "work")
+
+    assert store.baixados == [blob]
+    assert Path(p["path"]).is_file() and p["path"] != rec["image_path"]
+    assert p["uri"] == store.uri(blob)
+    assert p["content_sha256"] == embed_job.content_sha256(p["path"])
+
+
+def test_prepare_record_prefere_o_arquivo_local_quando_ele_existe(tmp_path):
+    """Com o binario no disco, o Bronze nem e tocado (nada de download inutil)."""
+    store, blob = _store_com_foto(tmp_path)
+    local = tmp_path / "fotos" / "dep_204379.jpg"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_bytes(b"jpgfake-local")
+
+    p = embed_job.prepare_record({"modality": "image", "image_path": str(local),
+                                  "blob": blob}, store=store, work_dir=tmp_path / "work")
+
+    assert store.baixados == []
+    assert p["path"] == str(local)
+    assert p["content_sha256"] == embed_job.content_sha256(local)
+
+
+def test_prepare_record_com_blob_e_sem_store_falha(tmp_path):
+    ausente = tmp_path / "outra_maquina" / "data" / "govexe" / "fotos" / "dep_204379.jpg"
+    rec = {"modality": "image", "image_path": str(ausente),
+           "blob": "bronze/fonte=camara/dt=2026-10-22/dep_204379.jpg"}
+    with pytest.raises(ValueError, match="records-store"):
+        embed_job.prepare_record(rec)
+
+
 def test_prepare_record_modalidade_desconhecida_falha():
     with pytest.raises(ValueError, match="modalidade"):
         embed_job.prepare_record({"modality": "video", "uri": "x"})

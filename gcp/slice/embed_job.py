@@ -80,6 +80,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from benchmark.models.qwen3vl_embed import (  # noqa: E402
+    DEFAULT_MAX_PIXELS,
     DEFAULT_MODEL_ID,
     embed_images,
     embed_texts,
@@ -278,7 +279,10 @@ def prepare_record(rec: dict, *, source: str = DEFAULT_SOURCE,
     path = rec.get("image_path") or rec.get("audio_path") or rec.get("path")
     uri = rec.get("uri")
     blob = rec.get("blob")
-    if blob and not path:
+    # O caminho local so serve se o arquivo existir DE FATO: um record de foto costuma
+    # trazer `image_path` (valido na maquina que o gerou) **e** `blob` (a copia no
+    # Bronze). Numa VM sem o arquivo local, quem resolve o binario e o store.
+    if blob and not (path and Path(path).is_file()):
         if store is None:
             raise ValueError(f"record com `blob` ({blob}) exige --records-store para "
                              "resolver o objeto no Bronze")
@@ -325,6 +329,7 @@ def prepare_record(rec: dict, *, source: str = DEFAULT_SOURCE,
 def embed_records(records: list[dict], *, model_id: str = DEFAULT_MODEL_ID,
                   device: str = "cuda", dtype: str = "bfloat16", batch_size: int = 8,
                   dim: int | None = DEFAULT_DIM, source: str = DEFAULT_SOURCE,
+                  max_pixels: int | None = DEFAULT_MAX_PIXELS,
                   transcriber: Transcriber | None = None,
                   store: ObjectStore | None = None,
                   work_dir: str | Path = DEFAULT_WORK_DIR) -> list[ItemRow]:
@@ -334,10 +339,14 @@ def embed_records(records: list[dict], *, model_id: str = DEFAULT_MODEL_ID,
     (`text`/`audio_asr`) por `embed_texts` -- mesmo `model_id`, mesmo `dim`, mesma
     L2-normalizacao, logo **mesmo espaco vetorial** (Abordagem A). As duas chamadas sao
     separadas so por eficiencia de batch; a ordem do lote e reconstituida no fim.
+
+    `max_pixels` so afeta o lado da imagem; vai tambem na chamada de texto porque faz
+    parte da chave do cache do embedder (os dois lados compartilham o mesmo modelo).
     """
     preparados = [prepare_record(r, source=source, store=store, work_dir=work_dir,
                                  transcriber=transcriber) for r in records]
-    kw = dict(model_id=model_id, device=device, dtype=dtype, batch_size=batch_size, dim=dim)
+    kw = dict(model_id=model_id, device=device, dtype=dtype, batch_size=batch_size, dim=dim,
+              max_pixels=max_pixels)
     vetores: list[np.ndarray | None] = [None] * len(preparados)
 
     idx_img = [i for i, p in enumerate(preparados) if p["modality"] in IMAGE_MODALITIES]
@@ -630,11 +639,17 @@ def main(argv: list[str] | None = None, *, store: VectorStore | None = None,
                     help="trunca o vetor para N dimensoes (Matryoshka/MRL) e renormaliza "
                          f"(default: {DEFAULT_DIM}; o indice HNSW do pgvector so aceita ate "
                          f"{HNSW_MAX_DIM} dimensoes)")
+    ap.add_argument("--max-pixels", type=int, default=DEFAULT_MAX_PIXELS,
+                    help="teto de pixels por imagem antes do encoder de visao "
+                         f"(default ~1MP: {DEFAULT_MAX_PIXELS}; reduz custo em paginas "
+                         "grandes; 0 = sem teto)")
     ap.add_argument("--limit", type=int, default=None, help="processa so os N primeiros itens")
     add_asr_arguments(ap)
     add_pg_arguments(ap)
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    # `0` (ou negativo) na flag = sem teto, que e como o embedder le `None`.
+    max_pixels = a.max_pixels if a.max_pixels and a.max_pixels > 0 else None
 
     if a.records:
         registros = load_records(a.records)
@@ -648,6 +663,7 @@ def main(argv: list[str] | None = None, *, store: VectorStore | None = None,
                  ", ".join(sorted({r.get("modality", "?") for r in registros})), a.model_id)
         rows = embed_records(registros, model_id=a.model_id, device=a.device, dtype=a.dtype,
                              batch_size=a.batch_size, dim=a.dim, source=a.source,
+                             max_pixels=max_pixels,
                              transcriber=transcriber or transcriber_from_args(a),
                              store=objetos, work_dir=a.work_dir)
         return _index(rows, a, store, dim=len(rows[0].embedding))
@@ -669,7 +685,7 @@ def main(argv: list[str] | None = None, *, store: VectorStore | None = None,
             return 1
         log.info("embutindo %d paginas com %s", len(paths), a.model_id)
         vecs = embed_images(paths, model_id=a.model_id, device=a.device, dtype=a.dtype,
-                            batch_size=a.batch_size, dim=a.dim)
+                            batch_size=a.batch_size, dim=a.dim, max_pixels=max_pixels)
         items = build_manifest(paths, a.model_id, vecs.shape[1])["items"]
         model_id = a.model_id
 
