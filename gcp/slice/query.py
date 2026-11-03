@@ -109,7 +109,7 @@ def main(argv: list[str] | None = None, *, store: VectorStore | None = None) -> 
     for rank, hit in enumerate(hits, start=1):
         print(f"{rank:2d}. {hit.score:.4f}  [{hit.modality}]  {hit.item_id}  {hit.uri}")
         # o credito e o pointer do binario original acompanham o item em toda consulta
-        # (requisito de licenca das fontes de `fusao/coleta-gcp.md` §6).
+        # (requisito de licenca das fontes de `fusao/coleta-gcp.md` secao 6).
         if hit.credit:
             print(f"      credito: {hit.credit}")
         if hit.pointer_uri:

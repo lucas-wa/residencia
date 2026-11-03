@@ -4,7 +4,7 @@ Roda na **VM L4 efemera** (`g2-standard-4`, ver `gcp/slice/README-slice.md`): ba
 itens do bucket Bronze, embute cada um com `Qwen/Qwen3-VL-Embedding-2B` e faz **upsert**
 no Cloud SQL + pgvector.
 
-**Abordagem A -- modelo unificado** (`fusao/multimodal.md` §2): QUATRO modalidades no
+**Abordagem A -- modelo unificado** (`fusao/multimodal.md` secao 2): QUATRO modalidades no
 MESMO indice (`govexe_items`), pelo MESMO checkpoint e no MESMO espaco vetorial:
 
     doc_image   pagina de documento rasterizada  -> embed_images()
@@ -14,7 +14,8 @@ MESMO indice (`govexe_items`), pelo MESMO checkpoint e no MESMO espaco vetorial:
 
 O audio NAO tem embedder proprio aqui: ele e colapsado em texto pelo ASR (`gcp/slice/asr.py`,
 Whisper large-v3 atras da interface `Transcriber`) e embutido pelo mesmo `embed_texts` --
-o *pointer vector* de `fusao/multimodal.md` §3/§4. Embedding nativo de audio (CLAP) e
+o *pointer vector* de `fusao/multimodal.md` (secoes 3 e 4). Embedding nativo de audio
+(CLAP) e
 outro objetivo. O binario original fica em `pointer_uri` e o credito obrigatorio em
 `credit`.
 
@@ -89,6 +90,7 @@ from gcp.slice.collector import (  # noqa: E402
     DEFAULT_SOURCE,
     IMAGE_SUFFIXES,
     ObjectStore,
+    default_item_id,
     load_records,
     open_store,
     store_from_location,
@@ -224,17 +226,6 @@ def content_sha256(path: str | Path) -> str:
 def text_sha256(text: str) -> str:
     """sha256 do texto embutido (nas modalidades de texto e ele que gera o vetor)."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def default_item_id(modality: str, uri: str) -> str:
-    """Id estavel de foto/texto/audio: `<modalidade>:<hash curto da uri>`.
-
-    Paginas de documento continuam usando o stem do arquivo (o id do `corpus.jsonl`);
-    para as outras modalidades nao ha id natural garantido, entao a chave sai da URI --
-    deterministica, legivel na origem pela modalidade e estavel entre execucoes, que e o
-    que o upsert precisa. Um `item_id` explicito no record sempre vence este default.
-    """
-    return f"{modality}:{hashlib.sha256(uri.encode('utf-8')).hexdigest()[:16]}"
 
 
 def build_rows(items: list[dict], vecs: np.ndarray, *, model_id: str = DEFAULT_MODEL_ID,

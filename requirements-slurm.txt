@@ -22,6 +22,11 @@
 # NAO inclui faiss: benchmark/common/index.py cai para busca por produto interno em
 #   numpy quando faiss nao existe, e os corpora aqui sao pequenos (mesmo top-k).
 # NAO inclui flash-attn: os wrappers de modelo caem para attn_implementation="eager".
+# NAO inclui yt-dlp nem google-cloud-storage: sao do LADO COLETA da fatia GCP (baixar o
+#   audio da fonte publica e subir o Bronze), que roda na maquina local / Cloud Shell e
+#   nunca dentro do container de GPU. Moram em `gcp/slice/requirements-collect.txt`, fora
+#   da resolucao do pip deste ambiente. O ASR (faster-whisper, mais abaixo) e o contrario:
+#   roda na VM, junto do embedder, e por isso esta aqui.
 #
 # TODO confirmar em runtime: o container ja traz um `transformers` proprio (exigido pelo
 # vLLM) e o pin abaixo pode conflitar com ele. Nao e preciso adivinhar: o estagio

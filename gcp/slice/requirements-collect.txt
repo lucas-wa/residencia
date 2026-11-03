@@ -1,0 +1,38 @@
+# Dependencias do LADO COLETA da fatia GCP (maquina local ou Cloud Shell).
+#
+# Separado do `requirements-slurm.txt` de proposito. Aquele arquivo e a lista instalada
+# DENTRO do ambiente de GPU (container do cluster H100 e VM L4 da GCP), onde rodam o
+# embedding e o ASR; estas deps sao do passo anterior, que nunca roda la:
+#
+#     audio_collector.py  URL publica -> audio local + record JSONL   <- yt-dlp
+#     collector.py        record      -> objeto no Bronze (GCS)       <- google-cloud-storage
+#
+# Manter os dois separados evita (a) instalar yt-dlp na VM de GPU, onde ele nao serve para
+# nada, e (b) meter mais um pacote na resolucao do pip daquele ambiente, que e exatamente
+# o que o bloco no topo do requirements-slurm.txt pede para nao fazer. Nenhuma dep aqui
+# arrasta torch.
+#
+#     pip install -r gcp/slice/requirements-collect.txt
+#
+# ffmpeg NAO entra aqui: nao e pacote pip, e requisito de SISTEMA do yt-dlp (extrair a
+# trilha de audio e cortar com --max-seconds). Instale pelo gerenciador do SO --
+# `sudo apt-get install -y ffmpeg` no Cloud Shell / Debian, `winget install ffmpeg` no
+# Windows. Sem ele o yt-dlp baixa o container original e falha no postprocessor.
+#
+# Captura so de fonte publica oficial, pelo endereco publico: o `YtDlpDownloader` nao
+# expoe opcao de cookie, login ou chave -- nada de DRM, paywall ou area logada.
+
+# YouTube das casas legislativas (SenadoTV, TV Camara) e midia direta da RadioAgencia /
+# Senado Multimidia. Dependencia OPCIONAL: `gcp/slice/audio_collector.py` so a importa
+# dentro de `YtDlpDownloader.download()`, entao o modulo (e os testes, com o
+# `FakeDownloader`) funciona sem ela instalada. Serie datada: o yt-dlp quebra junto com
+# as mudancas dos sites, entao vale manter atualizado em vez de pinar para tras.
+yt-dlp>=2024.8.6
+
+# Backend real do `ObjectStore` do collector.py (camada Bronze). Tambem importado so
+# dentro do `GCSObjectStore`, pelo mesmo motivo.
+google-cloud-storage>=2.14
+
+# Para rodar o query.py contra o Cloud SQL a partir da mesma maquina, acrescente o driver
+# do Postgres (o README-slice.md §7 ja o instala na VM):
+#     pip install "psycopg[binary]"

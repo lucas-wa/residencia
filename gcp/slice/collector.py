@@ -7,7 +7,7 @@ descreve:
 
     bronze/fonte=<source>/dt=<YYYY-MM-DD>/<arquivo>.png
 
-O Bronze tambem recebe **audio** (sessoes de YouTube/RadioAgencia, §6 daquele doc) -- o
+O Bronze tambem recebe **audio** (sessoes de YouTube/RadioAgencia, secao 6 daquele doc) -- o
 binario fica preservado como *pointer* auditavel; quem vira vetor e a transcricao, no
 `embed_job.py`. Alem do modo "diretorio de paginas", ha o modo **`--records`**: um JSONL
 com o lote misto (foto + legenda + credito, texto nativo, audio), cujos binarios sobem
@@ -34,6 +34,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import shutil
@@ -54,7 +55,7 @@ DEFAULT_IMAGES_DIR = "data/govexe/ptbr_planos/pages"
 DEFAULT_SOURCE = "tse_planos"
 DEFAULT_PREFIX = "bronze"
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
-# Audio tambem entra no Bronze (sessoes de YouTube/RadioAgencia, `fusao/coleta-gcp.md` §6).
+# Audio tambem entra no Bronze (sessoes de YouTube/RadioAgencia, `fusao/coleta-gcp.md` secao 6).
 # O binario fica aqui como *pointer* auditavel; quem vira vetor e a transcricao (ASR).
 AUDIO_SUFFIXES = (".mp3", ".wav", ".m4a", ".ogg", ".opus", ".flac")
 MEDIA_SUFFIXES = IMAGE_SUFFIXES + AUDIO_SUFFIXES
@@ -63,6 +64,21 @@ MEDIA_SUFFIXES = IMAGE_SUFFIXES + AUDIO_SUFFIXES
 # literais de proposito: o coletor nao importa o job (a dependencia corre no outro sentido).
 MODALITY_DOC_IMAGE = "doc_image"
 MODALITY_AUDIO = "audio_asr"
+
+
+def default_item_id(modality: str, uri: str) -> str:
+    """Id estavel de foto/texto/audio: `<modalidade>:<hash curto da uri>`.
+
+    Paginas de documento usam o stem do arquivo (o id do `corpus.jsonl`); para as outras
+    modalidades nao ha id natural garantido, entao a chave sai da URI -- deterministica,
+    legivel na origem pela modalidade e estavel entre execucoes, que e o que o upsert do
+    `embed_job.py` precisa. Um `item_id` explicito no record sempre vence este default.
+
+    Mora aqui (e nao no job de embedding) porque quem emite record -- este coletor e o
+    `audio_collector.py` -- precisa do mesmo id ANTES de o indice existir; o
+    `embed_job.py` reexporta o nome.
+    """
+    return f"{modality}:{hashlib.sha256(uri.encode('utf-8')).hexdigest()[:16]}"
 
 
 def modality_for(path: str | Path, default: str = MODALITY_DOC_IMAGE) -> str:
@@ -232,7 +248,7 @@ def collect_records(records: list[dict], store: ObjectStore, *, source: str = DE
 
     Cada record ganha `blob` (objeto no Bronze), `uri` (a URI canonica desse objeto) e,
     quando o record nao traz um, `pointer_uri` apontando o binario original preservado --
-    o *pointer* auditavel de `fusao/coleta-gcp.md` §6, ao lado do `credit`, que o coletor
+    o *pointer* auditavel de `fusao/coleta-gcp.md` secao 6, ao lado do `credit`, que o coletor
     nunca descarta. Records de texto nativo nao tem binario e passam intactos.
     """
     day = day or _date.today().isoformat()

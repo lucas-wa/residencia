@@ -1,6 +1,6 @@
 """ASR da fatia GCP: audio -> transcricao (passo Silver), para o MESMO embedder de texto.
 
-E a materializacao do *pointer vector* de `fusao/multimodal.md` (§3 e §4): nenhum
+E a materializacao do *pointer vector* de `fusao/multimodal.md` (secoes 3 e 4): nenhum
 embedder unificado cobre audio, entao o audio NAO vira vetor proprio aqui -- ele vira
 **texto** (transcricao Whisper) e e embutido por `embed_texts` do mesmo checkpoint
 (`Qwen/Qwen3-VL-Embedding-2B`) que embute paginas e fotos. Um modelo, um espaco; o
@@ -36,7 +36,7 @@ from typing import Protocol
 
 log = logging.getLogger(__name__)
 
-# Whisper large-v3: o melhor pt-BR da familia (ver `fusao/multimodal.md` §4, FLEURS).
+# Whisper large-v3: o melhor pt-BR da familia (ver `fusao/multimodal.md` secao 4, FLEURS).
 DEFAULT_ASR_MODEL = "large-v3"
 DEFAULT_ASR_BACKEND = "faster-whisper"
 ASR_BACKENDS = ("faster-whisper", "openai-whisper", "fake")

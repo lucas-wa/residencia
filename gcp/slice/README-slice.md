@@ -27,6 +27,7 @@ páginas (*.png) · fotos (*.jpg) · textos · áudios (*.mp3)
 
 | Script | Onde roda | O que faz |
 |---|---|---|
+| `gcp/slice/audio_collector.py` | máquina local ou Cloud Shell | baixa áudio de fonte pública (yt-dlp) e emite os records `audio_asr` |
 | `gcp/slice/collector.py` | máquina local ou Cloud Shell | sobe páginas, fotos e áudios para o bucket **Bronze**; enriquece o JSONL de records |
 | `gcp/slice/asr.py` | VM L4 (dentro do job) | **Whisper large-v3** atrás da interface `Transcriber` (áudio → texto) |
 | `gcp/slice/embed_job.py` | **VM L4 efêmera** | baixa do Bronze, roteia por modalidade, embute e faz **upsert** no pgvector |
@@ -186,7 +187,7 @@ CREATE INDEX IF NOT EXISTS govexe_items_modality
   página do `corpus.jsonl`;
 - **foto/texto/áudio**: o `item_id` do record, quando ele traz um (ex.: `foto:ebc-1`);
   senão, `"<modality>:<16 hex do sha256 da uri>"` — determinístico e estável entre
-  execuções (`embed_job.default_item_id`).
+  execuções (`collector.default_item_id`, reexportado pelo `embed_job`).
 
 `content_sha256` registra o **conteúdo que gerou o vetor**: os bytes do arquivo nas
 modalidades de imagem e o próprio texto embutido (a transcrição, no caso do áudio) nas de
@@ -265,6 +266,57 @@ python -m gcp.slice.collector \
 
 Records de texto nativo não têm binário e passam intactos. `credit` nunca é descartado —
 é ele que cumpre a exigência de licença das fontes de `fusao/coleta-gcp.md` §6.
+
+### 5.2 Captura de áudio (`audio_collector.py`)
+
+Os records `audio_asr` da §5.1 podem ser escritos à mão, mas quem os produz em escala é o
+`audio_collector.py`: dada a URL pública de uma sessão (YouTube da **SenadoTV**/**TV
+Câmara**) ou de uma mídia direta (**RadioAgência**, **Senado Multimídia**), ele baixa o
+áudio e emite o JSONL. Cada etapa fica no seu lugar — **ele não sobe nada e não
+transcreve nada**:
+
+```
+audio_collector.py   URL pública  → áudio local + records      (local / Cloud Shell)
+collector.py         records      → binário no Bronze + blob/uri
+embed_job.py         records      → ASR (asr.py) → embed_texts → govexe_items
+```
+
+```bash
+pip install -r gcp/slice/requirements-collect.txt    # yt-dlp (+ google-cloud-storage)
+sudo apt-get install -y ffmpeg                       # requisito de SISTEMA do yt-dlp
+
+python -m gcp.slice.audio_collector \
+    --url "https://www.youtube.com/watch?v=<id-da-sessao>" \
+    --url "https://www.camara.leg.br/radio/programas/<id>.mp3" \
+    --source tv_camara --credit "TV Câmara" \
+    --audio-dir data/govexe/audio \
+    --out-records audios.jsonl \
+    --max-seconds 600                 # sessão legislativa passa de uma hora
+```
+
+```jsonl
+{"item_id": "audio_asr:552e77e1bc4d355a", "modality": "audio_asr", "audio_path": "data/govexe/audio/<id>.wav", "pointer_uri": "https://www.youtube.com/watch?v=<id-da-sessao>", "credit": "TV Câmara", "source": "tv_camara"}
+```
+
+Esse JSONL entra **sem alteração** no `collector.py --records` (§5.1) e depois no
+`embed_job.py --records` (§7). Detalhes que importam:
+
+- **`item_id` segue a fonte**, não o arquivo: `audio_asr:<hash da URL de origem>`
+  (`collector.default_item_id`). Recapturar a mesma sessão cai no mesmo item — upsert, não
+  duplicata — mesmo que o arquivo baixado mude de nome.
+- **`pointer_uri` = a URL pública** e `credit` é **obrigatório** (flag `--credit`): são o
+  *pointer* auditável exigido pelas licenças de `fusao/coleta-gcp.md` §6.
+- **ffmpeg é requisito de sistema** (não é pacote pip): o yt-dlp o usa para extrair a
+  trilha de áudio e para o corte de `--max-seconds`. Sem ele, o download falha no
+  pós-processamento.
+- **Só fonte pública, pelo endereço público.** O downloader não expõe cookie, login nem
+  chave — nada de DRM, paywall ou área logada. Captura de **sinal** de TV/rádio (que exige
+  ofício) está fora desta fatia.
+- URL repetida no lote baixa uma vez só; URL que falha é registrada no log e **pulada** —
+  um lote não morre inteiro por causa de uma sessão fora do ar (o CLI sai com `1` se
+  nenhuma URL vingar).
+- `--downloader fake` grava um WAV canônico (silêncio, duração = `--max-seconds`) **sem
+  rede nem yt-dlp**: é como ensaiar o fluxo inteiro offline (§11).
 
 ## 6. VM L4 efêmera (g2-standard-4)
 
@@ -479,6 +531,26 @@ python -m gcp.slice.embed_job --vectors data/embeddings/planos_qwen3vl --local-s
 python -m gcp.slice.query --text "educacao" --vectors data/embeddings/planos_qwen3vl
 ```
 
+**Captura de áudio sem rede** (`--downloader fake`: grava um WAV canônico no lugar do
+download, sem yt-dlp nem ffmpeg) — o JSONL resultante é o mesmo da captura real:
+
+```bash
+python -m gcp.slice.audio_collector \
+    --url "https://www.youtube.com/watch?v=sessao-camara-1" \
+    --url "https://www.camara.leg.br/radio/programas/999999.mp3" \
+    --source tv_camara --credit "TV Camara" --downloader fake --max-seconds 120 \
+    --audio-dir /tmp/audio --out-records /tmp/audios.jsonl
+#    INFO captura: 2 de 2 urls baixadas para /tmp/audio
+#    2 records -> /tmp/audios.jsonl
+#      audio_asr:552e77e1bc4d355a  /tmp/audio/watch-552e77e1.wav
+#      audio_asr:2aba99074d83898c  /tmp/audio/999999-2aba9907.wav
+
+python -m gcp.slice.embed_job --records /tmp/audios.jsonl \
+    --asr-backend fake --local-store /tmp/indice-fake.json --device cpu
+#    INFO asr: /tmp/audio/watch-552e77e1.wav -> 40 caracteres
+#    2 itens gravados; total no índice: 2
+```
+
 **Lote misto, fim a fim, sem nuvem.** `lote.jsonl` com 2 páginas + 1 foto (com legenda e
 crédito) + 1 texto nativo + 1 áudio (transcrito pelo *fake* do Whisper):
 
@@ -523,5 +595,5 @@ python -m gcp.slice.query --text "saude" --k 5 --modality image \
 > (`tests/test_gcp_slice.py`) fazem exatamente esse percurso com o encode monkeypatchado.
 
 Os testes offline da lógica (`tests/test_gcp_slice.py`) usam esses mesmos *fakes*
-(`LocalObjectStore`, `InMemoryVectorStore`, `FakeTranscriber`): `pytest
+(`LocalObjectStore`, `InMemoryVectorStore`, `FakeTranscriber`, `FakeDownloader`): `pytest
 tests/test_gcp_slice.py`.

@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from gcp.slice import asr, collector, embed_job, query
+from gcp.slice import asr, audio_collector, collector, embed_job, query
 
 
 def _pages(tmp_path, n, prefix="BR001"):
@@ -668,3 +668,141 @@ def test_collector_main_records_sobe_binarios_e_reescreve_o_jsonl(tmp_path):
     assert linhas[1]["blob"].endswith("sessao.mp3")
     assert "blob" not in linhas[2] and linhas[2]["text"] == "meta de saude"
     assert (root / "bronze/fonte=ebc/dt=2026-10-22/sessao.mp3").is_file()
+
+
+# -- audio_collector: captura de audio -> records ----------------------------------------
+
+
+URL_CAMARA = "https://www.youtube.com/watch?v=sessao-camara-1"
+URL_RADIO = "https://www.camara.leg.br/radio/programas/999999.mp3"
+
+
+def test_fake_downloader_grava_audio_deterministico_e_respeita_max_seconds(tmp_path):
+    d = audio_collector.FakeDownloader()
+
+    a = d.download(URL_CAMARA, tmp_path / "audio")
+    b = d.download(URL_CAMARA, tmp_path / "audio")
+    curto = d.download(URL_RADIO, tmp_path / "curto", max_seconds=2)
+    longo = d.download(URL_RADIO, tmp_path / "longo", max_seconds=8)
+
+    assert a == b and a.is_file() and a.read_bytes()[:4] == b"RIFF"
+    assert a.suffix == audio_collector.DEFAULT_AUDIO_SUFFIX
+    assert a.parent == (tmp_path / "audio") and a != curto
+    assert curto.stat().st_size < longo.stat().st_size      # max_seconds vale no contrato
+    assert d.calls[0] == (URL_CAMARA, str(tmp_path / "audio"), None)
+    assert d.calls[2][2] == 2
+
+
+def test_collect_audio_emite_record_no_formato_do_fluxo_records(tmp_path):
+    d = audio_collector.FakeDownloader()
+
+    [rec] = audio_collector.collect_audio([URL_CAMARA], source="tv_camara",
+                                          credit="TV Camara", dest_dir=tmp_path / "audio",
+                                          downloader=d)
+
+    assert rec["modality"] == embed_job.MODALITY_AUDIO
+    assert rec["pointer_uri"] == URL_CAMARA            # a URL de origem e o pointer
+    assert rec["credit"] == "TV Camara" and rec["source"] == "tv_camara"
+    assert Path(rec["audio_path"]).is_file()
+    # id estavel, derivado da URL de origem -- o mesmo esquema do embed_job
+    assert rec["item_id"] == collector.default_item_id(embed_job.MODALITY_AUDIO, URL_CAMARA)
+    # so campos que o fluxo --records entende
+    assert set(rec) <= {"item_id", "modality", "audio_path", "pointer_uri", "credit",
+                        "source", "uri"}
+
+
+def test_collect_audio_repassa_max_seconds_e_deduplica_urls(tmp_path):
+    d = audio_collector.FakeDownloader()
+
+    recs = audio_collector.collect_audio([URL_CAMARA, URL_RADIO, URL_CAMARA],
+                                         source="tv_camara", credit="TV Camara",
+                                         dest_dir=tmp_path / "audio", downloader=d,
+                                         max_seconds=30)
+
+    assert [c[2] for c in d.calls] == [30, 30]          # a URL repetida nao baixa de novo
+    assert [r["pointer_uri"] for r in recs] == [URL_CAMARA, URL_RADIO]
+
+
+def test_collect_audio_pula_url_que_falha(tmp_path, caplog):
+    class _Quebrado:
+        def download(self, url, dest_dir, max_seconds=None):
+            if "radio" in url:
+                raise RuntimeError("404")
+            return audio_collector.FakeDownloader().download(url, dest_dir, max_seconds)
+
+    recs = audio_collector.collect_audio([URL_RADIO, URL_CAMARA], source="tv_camara",
+                                         credit="TV Camara", dest_dir=tmp_path / "a",
+                                         downloader=_Quebrado())
+
+    assert [r["pointer_uri"] for r in recs] == [URL_CAMARA]
+
+
+def test_ytdlp_downloader_e_lazy_e_pede_bestaudio(tmp_path):
+    import sys
+
+    d = audio_collector.YtDlpDownloader()
+    opts = d._options(tmp_path / "audio")
+
+    assert "yt_dlp" not in sys.modules                  # import so dentro do download()
+    assert opts["format"] == "bestaudio/best"
+    assert str(tmp_path / "audio") in opts["outtmpl"]
+    assert opts["postprocessors"][0]["preferredcodec"] == audio_collector.DEFAULT_AUDIO_FORMAT
+    assert opts["noplaylist"] is True
+
+
+def test_open_downloader_escolhe_o_backend():
+    assert isinstance(audio_collector.open_downloader("fake"), audio_collector.FakeDownloader)
+    assert isinstance(audio_collector.open_downloader("yt-dlp"),
+                      audio_collector.YtDlpDownloader)
+    with pytest.raises(ValueError, match="downloader"):
+        audio_collector.open_downloader("curl")
+
+
+def test_audio_collector_main_escreve_o_jsonl_offline(tmp_path, capsys):
+    saida = tmp_path / "audios.jsonl"
+
+    rc = audio_collector.main(["--url", URL_CAMARA, "--url", URL_RADIO,
+                               "--source", "tv_camara", "--credit", "TV Camara",
+                               "--audio-dir", str(tmp_path / "audio"),
+                               "--out-records", str(saida), "--max-seconds", "60",
+                               "--downloader", "fake"])
+
+    assert rc == 0
+    linhas = [json.loads(ln) for ln in saida.read_text(encoding="utf-8").splitlines()]
+    assert [ln["modality"] for ln in linhas] == ["audio_asr", "audio_asr"]
+    assert all(Path(ln["audio_path"]).is_file() for ln in linhas)
+    assert "2 records" in capsys.readouterr().out
+
+
+def test_audio_collector_main_sem_nenhum_download_sai_1(tmp_path):
+    class _Quebrado:
+        def download(self, url, dest_dir, max_seconds=None):
+            raise RuntimeError("404")
+
+    rc = audio_collector.main(["--url", URL_RADIO, "--source", "x", "--credit", "y",
+                               "--audio-dir", str(tmp_path / "a"),
+                               "--out-records", str(tmp_path / "o.jsonl")],
+                              downloader=_Quebrado())
+    assert rc == 1
+
+
+def test_record_capturado_e_ingerido_pelo_embed_job_sem_alteracao(tmp_path, monkeypatch):
+    """Fim a fim da plumbing: captura -> JSONL -> `embed_job --records` -> indice."""
+    monkeypatch.setattr(embed_job, "embed_images", _fake_embed)
+    monkeypatch.setattr(embed_job, "embed_texts", _fake_embed_texts)
+    jsonl = tmp_path / "audios.jsonl"
+    assert audio_collector.main(["--url", URL_CAMARA, "--source", "tv_camara",
+                                 "--credit", "TV Camara", "--downloader", "fake",
+                                 "--audio-dir", str(tmp_path / "audio"),
+                                 "--out-records", str(jsonl)]) == 0
+
+    store = embed_job.InMemoryVectorStore()
+    assert embed_job.main(["--records", str(jsonl), "--asr-backend", "fake",
+                           "--device", "cpu", "--dim", "4"], store=store) == 0
+
+    [linha] = store.rows.values()
+    assert linha.modality == embed_job.MODALITY_AUDIO
+    assert linha.item_id == collector.default_item_id(embed_job.MODALITY_AUDIO, URL_CAMARA)
+    assert linha.credit == "TV Camara" and linha.pointer_uri == URL_CAMARA
+    assert asr.FAKE_PREFIX in linha.content_text         # transcrito pelo FakeTranscriber
+    np.testing.assert_allclose(linha.embedding, [0, 0, 0, 1])   # embutido por embed_texts
