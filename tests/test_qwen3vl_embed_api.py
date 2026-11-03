@@ -13,6 +13,7 @@ import pytest
 from benchmark.models import qwen3vl_embed as mod
 from benchmark.models.qwen3vl_embed import (
     DEFAULT_INSTRUCTION,
+    DEFAULT_MAX_PIXELS,
     DEFAULT_MODEL_ID,
     MAX_LENGTH,
     Qwen3VLEmbedRetriever,
@@ -39,6 +40,10 @@ def fake_libs(monkeypatch):
     opened: list[str] = []
 
     class _Img:
+        # `size` existe porque o wrapper aplica o teto de pixels na PIL de entrada;
+        # abaixo do teto ele nao redimensiona nada.
+        size = (320, 480)
+
         def __init__(self, path):
             self.path = path
 
@@ -76,7 +81,8 @@ class _ModelComEncode:
 
 
 def _bare(model, proc=None, batch_size=2, dim=None,
-          instruction=DEFAULT_INSTRUCTION) -> Qwen3VLEmbedRetriever:
+          instruction=DEFAULT_INSTRUCTION,
+          max_pixels=DEFAULT_MAX_PIXELS) -> Qwen3VLEmbedRetriever:
     """Instancia sem __init__ (nao carrega pesos)."""
     r = Qwen3VLEmbedRetriever.__new__(Qwen3VLEmbedRetriever)
     r.name = "qwen3vl:test"
@@ -86,6 +92,7 @@ def _bare(model, proc=None, batch_size=2, dim=None,
     r.dim = dim
     r.instruction = instruction
     r.max_length = MAX_LENGTH
+    r.max_pixels = max_pixels
     r._model = model
     r._proc = proc
     return r
@@ -283,6 +290,46 @@ def test_sem_qwen_vl_utils_manda_as_pil_cruas(tmp_path, fake_libs, monkeypatch):
     assert vecs.shape == (2, 4)
 
 
+def _imagem_grande(tmp_path):
+    """PNG 1242x1755 (2,18 MP) -- a pagina rasterizada a 150 DPI que custa caro na L4."""
+    from PIL import Image as PILImage
+
+    p = tmp_path / "pagina_grande.png"
+    PILImage.new("RGB", (1242, 1755), "white").save(p)
+    return p
+
+
+def _imagem_entregue(tmp_path, monkeypatch, max_pixels):
+    """Roda `_embed_images` com PIL REAL e devolve a imagem que chegou ao processor."""
+    torch = types.ModuleType("torch")
+    torch.no_grad = _NoGrad
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    proc = _Processor()
+    r = _bare(_ModelGenerico(), proc=proc, batch_size=1, max_pixels=max_pixels)
+    embed_images([str(_imagem_grande(tmp_path))], embedder=r)
+    (img,) = proc.chamadas[0]["images"]
+    return img
+
+
+def test_teto_de_pixels_reduz_a_imagem_antes_do_encoder(tmp_path, monkeypatch, fake_vision):
+    """Acima do teto a PIL encolhe ANTES do processor, preservando o aspecto."""
+    img = _imagem_entregue(tmp_path, monkeypatch, 1_024_000)
+    largura, altura = img.size
+    assert largura * altura <= 1_024_000
+    assert (largura, altura) != (1242, 1755)
+    assert abs(largura / altura - 1242 / 1755) < 0.01       # aspecto preservado
+
+
+def test_sem_teto_a_imagem_chega_em_resolucao_cheia(tmp_path, monkeypatch, fake_vision):
+    """`max_pixels=None` = comportamento antigo (nenhum resize do nosso lado)."""
+    assert _imagem_entregue(tmp_path, monkeypatch, None).size == (1242, 1755)
+
+
+def test_abaixo_do_teto_a_imagem_passa_intacta(tmp_path, monkeypatch, fake_vision):
+    img = _imagem_entregue(tmp_path, monkeypatch, 10_000_000)
+    assert img.size == (1242, 1755)
+
+
 def test_pooling_pega_o_ultimo_token_nao_pad():
     hidden = np.arange(2 * 3 * 2, dtype="float32").reshape(2, 3, 2)
     mask = _Tensor([[1, 1, 0], [1, 1, 1]])              # padding a direita
@@ -308,8 +355,9 @@ def test_get_embedder_cacheia_por_configuracao(monkeypatch):
     construidos: list[tuple] = []
 
     class _Fake:
-        def __init__(self, model_id, device="cuda", dtype="bfloat16", batch_size=8, dim=None):
-            construidos.append((model_id, device, dtype, batch_size, dim))
+        def __init__(self, model_id, device="cuda", dtype="bfloat16", batch_size=8, dim=None,
+                     max_pixels=DEFAULT_MAX_PIXELS):
+            construidos.append((model_id, device, dtype, batch_size, dim, max_pixels))
             self.model_id = model_id
 
         def embed_images(self, paths):
@@ -321,7 +369,7 @@ def test_get_embedder_cacheia_por_configuracao(monkeypatch):
     a = mod.get_embedder(device="cpu")
     b = mod.get_embedder(device="cpu")
     assert a is b
-    assert construidos == [(DEFAULT_MODEL_ID, "cpu", "bfloat16", 8, None)]
+    assert construidos == [(DEFAULT_MODEL_ID, "cpu", "bfloat16", 8, None, DEFAULT_MAX_PIXELS)]
 
     # sem `embedder`, as funcoes de modulo passam pelo mesmo cache
     out = embed_images(["a.png"], device="cpu")
@@ -329,3 +377,7 @@ def test_get_embedder_cacheia_por_configuracao(monkeypatch):
 
     mod.get_embedder(device="cpu", model_id="Qwen/Qwen3-VL-Embedding-8B")
     assert len(construidos) == 2
+
+    # `max_pixels` entra na chave: outro teto == outro embedder
+    mod.get_embedder(device="cpu", max_pixels=None)
+    assert len(construidos) == 3

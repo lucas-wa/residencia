@@ -24,17 +24,22 @@ como API de inferencia fora do benchmark -- e o embedder da fatia GCP:
     scores = q @ vecs.T                                   # produto interno = cosseno
 
 `get_embedder` guarda o modelo carregado num cache por (model_id, device, dtype,
-batch_size, dim), entao chamadas repetidas em um mesmo processo nao recarregam pesos.
+batch_size, dim, max_pixels), entao chamadas repetidas em um mesmo processo nao
+recarregam pesos.
+
+`max_pixels` poe um TETO de resolucao nas imagens antes do encoder de visao (ver
+`DEFAULT_MAX_PIXELS`): sem ele uma pagina a 150 DPI custa dezenas de segundos por item
+numa L4.
 
 API CONFIRMADA (card huggingface.co/Qwen/Qwen3-VL-Embedding-2B + modeling de referencia
 github.com/QwenLM/Qwen3-VL-Embedding, `src/models/qwen3_vl_embedding.py`)
 ---------------------------------------------------------------------------------------
 O `config.json` do checkpoint NAO tem `auto_map` e declara
-`architectures: ["Qwen3VLForConditionalGeneration"]`: `trust_remote_code=True` nao
-carrega codigo nenhum do repo e `AutoModel` instancia o `Qwen3VLModel` do proprio
-transformers -- um VLM comum, SEM metodo de encode. O `Qwen3VLEmbedder` do card e um
-script do repo (`scripts/qwen3_vl_embedding.py`), nao um metodo do modelo. Logo o
-caminho abaixo e o caminho REAL (nao um fallback):
+`architectures: ["Qwen3VLForConditionalGeneration"]`, `model_type: "qwen3_vl"`:
+`trust_remote_code=True` nao carrega codigo nenhum do repo e o modelo e um VLM comum do
+proprio transformers, SEM metodo de encode. O `Qwen3VLEmbedder` do card e um script do
+repo (`scripts/qwen3_vl_embedding.py`), nao um metodo do modelo. Logo o caminho abaixo
+e o caminho REAL (nao um fallback):
 
     1. messages = [system(instrucao), user([{type:image|text, ...}])]
     2. text  = processor.apply_chat_template(messages, add_generation_prompt=True,
@@ -44,6 +49,17 @@ caminho abaixo e o caminho REAL (nao um fallback):
                           max_length=8192, do_resize=False, return_tensors="pt")
     5. emb   = last_hidden_state[ultimo token NAO-pad]          # 1_Pooling: "lasttoken"
     6. emb   = emb / ||emb||                                    # modules.json: Normalize
+
+CLASSE DE CARREGAMENTO (verificado no checkpoint real, nao no papel): as 625 chaves do
+`model.safetensors` vivem TODAS sob o prefixo `model.` -- `model.language_model.*` (310)
+e `model.visual.*` (315); nao ha `lm_head` (`tie_word_embeddings`). `AutoModel` instancia
+a classe BASE `Qwen3VLModel`, cujo state_dict e `language_model.*` / `visual.*` (SEM o
+prefixo): nenhuma chave casa e o transformers reinicializa 100% dos pesos ("Some weights
+... are newly initialized"), devolvendo embeddings aleatorios SEM erro. Por isso
+carregamos `Qwen3VLForConditionalGeneration` (state_dict `model.*`, que CASA com o
+checkpoint) e usamos o submodulo `.model` -- o mesmo `Qwen3VLModel`, agora COM pesos.
+Ele e um `PreTrainedModel`, entao mantem a property `.device` e o forward devolve
+`last_hidden_state`, que e o que `_forward_generic` consome.
 
 Passar so `pixel_values` (`processor(images=...)` cru) estoura
 `ValueError: You must specify exactly one of input_ids or inputs_embeds` -- o VLM precisa
@@ -82,6 +98,16 @@ MAX_LENGTH = 8192
 # Patch do encoder visual do Qwen3-VL (o Qwen2-VL usava 14): o smart-resize precisa dele
 # para gerar um grid que case com o processor rodando com `do_resize=False`.
 IMAGE_PATCH_SIZE = 16
+# Teto de pixels por imagem antes do encoder de visao (`max_pixels=None` desliga).
+#
+# Racional: cada token de visao do Qwen3-VL cobre ~32x32 px da imagem (patch 16 com merge
+# espacial 2x2), entao o numero de tokens -- e com ele o custo do encoder -- cresce
+# LINEARMENTE com a area em pixels. Uma pagina rasterizada a 150 DPI passa de 2 MP
+# (1242x1755 = 2,18 MP ~= 2130 tokens so de visao) e, medido numa L4, custa ~73,9 s/pagina;
+# o mesmo item em ~0,74 MP cai para ~25 s/pagina com cosseno 0,967 contra o vetor full-res.
+# 1_024_000 px = exatamente 1000 tokens de visao: o equilibrio escolhido entre velocidade e
+# fidelidade do vetor. Paginas menores que o teto passam intactas.
+DEFAULT_MAX_PIXELS = 1_024_000
 # Conteudo quando o item vem vazio (mesma convencao do modeling de referencia).
 _EMPTY_TEXT = "NULL"
 
@@ -144,12 +170,38 @@ def _vision_inputs(convs: list[list[dict]]):
     return images or None
 
 
+def _cap_pixels(image, max_pixels: int | None):
+    """Reduz a PIL (IN PLACE) para caber em `max_pixels`, preservando o aspecto.
+
+    Vale para os DOIS caminhos de imagem: o teto e aplicado na PIL de ENTRADA, antes do
+    `_vision_inputs` (smart-resize do qwen_vl_utils, com o processor em `do_resize=False`)
+    e antes do fallback que manda as PIL cruas ao processor. `Image.thumbnail` so encolhe,
+    entao imagem menor que o teto passa sem tocar em nada.
+    """
+    if not max_pixels or max_pixels <= 0:
+        return image
+    from PIL import Image
+
+    largura, altura = image.size
+    if largura * altura <= max_pixels:
+        return image
+    escala = (max_pixels / float(largura * altura)) ** 0.5
+    alvo = (max(1, int(largura * escala)), max(1, int(altura * escala)))
+    image.thumbnail(alvo, Image.LANCZOS)
+    return image
+
+
 class Qwen3VLEmbedRetriever:
     def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: str = "cuda",
                  dtype: str = "bfloat16", batch_size: int = 8, dim: int | None = None,
-                 instruction: str | None = None, max_length: int = MAX_LENGTH):
+                 instruction: str | None = None, max_length: int = MAX_LENGTH,
+                 max_pixels: int | None = DEFAULT_MAX_PIXELS):
         import torch
-        from transformers import AutoModel, AutoProcessor
+        from transformers import AutoProcessor
+        try:    # classe cujo state_dict casa com o checkpoint (ver docstring do modulo)
+            from transformers import Qwen3VLForConditionalGeneration as _ModelCls
+        except ImportError:   # transformers sem o nome exportado -> rota Auto equivalente
+            from transformers import AutoModelForImageTextToText as _ModelCls
 
         self.name = f"qwen3vl:{model_id}"
         self.model_id = model_id
@@ -158,18 +210,35 @@ class Qwen3VLEmbedRetriever:
         self.dim = dim
         self.instruction = instruction or DEFAULT_INSTRUCTION
         self.max_length = max_length
+        # teto de resolucao do lado da imagem (`None` = sem teto) -- ver DEFAULT_MAX_PIXELS
+        self.max_pixels = max_pixels
         self.torch_dtype = getattr(torch, dtype)
-        try:
-            model = AutoModel.from_pretrained(
-                model_id, trust_remote_code=True, torch_dtype=self.torch_dtype,
-                device_map=device, attn_implementation="flash_attention_2",
-            )
-        except Exception:  # flash-attn ausente -> fallback obrigatorio
-            model = AutoModel.from_pretrained(
-                model_id, trust_remote_code=True, torch_dtype=self.torch_dtype,
-                device_map=device, attn_implementation="eager",
-            )
-        self._model = model.eval()
+        # Cadeia de fallback da atencao, na ordem: flash_attention_2 (melhor, mas exige
+        # flash-attn compilado -- normalmente ausente) -> sdpa (eficiente em memoria,
+        # nativo do PyTorch 2.x, sem instalar nada) -> eager (ultimo recurso). O `sdpa`
+        # no meio NAO e cosmetico: `eager` materializa a matriz de atencao inteira (O(n^2)
+        # em memoria) e uma unica pagina de documento (muitos tokens de visao) estoura
+        # CUDA OOM numa L4 24 GB (~8,78 GiB so na atencao); com `sdpa` a mesma pagina
+        # passa folgada.
+        full = None
+        self.attn_implementation = None
+        last_error: Exception | None = None
+        for attn in ("flash_attention_2", "sdpa", "eager"):
+            try:
+                full = _ModelCls.from_pretrained(
+                    model_id, trust_remote_code=True, dtype=self.torch_dtype,
+                    device_map=device, attn_implementation=attn,
+                )
+            except Exception as exc:
+                last_error = exc
+                continue
+            self.attn_implementation = attn
+            break
+        if full is None:   # nem `eager` carregou: o problema nao e a atencao
+            raise last_error  # noqa: TRY201 -- erro real do ultimo from_pretrained
+        # `.model` e o Qwen3VLModel base COM os pesos carregados: PreTrainedModel, logo
+        # tem `.device` e devolve `last_hidden_state` -- o que `_forward_generic` espera.
+        self._model = getattr(full, "model", full).eval()
         # padding a DIREITA: o pooling pega o ultimo token nao-pad por `soma(mask) - 1`,
         # que so vale com essa convencao (a mesma do modeling de referencia).
         self._proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True,
@@ -278,7 +347,10 @@ class Qwen3VLEmbedRetriever:
         fn = first_method(self._model, _IMAGE_FNS)
         out: list[np.ndarray] = []
         for start in range(0, len(paths), self.batch_size):
-            images = [Image.open(p).convert("RGB") for p in paths[start:start + self.batch_size]]
+            # o teto entra AQUI, na PIL de entrada: vale tanto para o caminho do
+            # qwen_vl_utils (`do_resize=False`) quanto para o fallback do processor.
+            images = [_cap_pixels(Image.open(p).convert("RGB"), self.max_pixels)
+                      for p in paths[start:start + self.batch_size]]
             try:
                 if fn is not None:
                     with torch.no_grad():
@@ -320,33 +392,43 @@ _EMBEDDERS: dict[tuple, Qwen3VLEmbedRetriever] = {}
 
 def get_embedder(model_id: str = DEFAULT_MODEL_ID, device: str = "cuda",
                  dtype: str = "bfloat16", batch_size: int = 8,
-                 dim: int | None = None) -> Qwen3VLEmbedRetriever:
+                 dim: int | None = None,
+                 max_pixels: int | None = DEFAULT_MAX_PIXELS) -> Qwen3VLEmbedRetriever:
     """Embedder carregado (cache por configuracao) -- evita recarregar pesos no processo."""
-    key = (model_id, device, dtype, batch_size, dim)
+    key = (model_id, device, dtype, batch_size, dim, max_pixels)
     emb = _EMBEDDERS.get(key)
     if emb is None:
         emb = _EMBEDDERS[key] = Qwen3VLEmbedRetriever(
-            model_id, device=device, dtype=dtype, batch_size=batch_size, dim=dim)
+            model_id, device=device, dtype=dtype, batch_size=batch_size, dim=dim,
+            max_pixels=max_pixels)
     return emb
 
 
 def embed_images(paths: list[str], *, model_id: str = DEFAULT_MODEL_ID, device: str = "cuda",
                  dtype: str = "bfloat16", batch_size: int = 8, dim: int | None = None,
+                 max_pixels: int | None = DEFAULT_MAX_PIXELS,
                  embedder: Qwen3VLEmbedRetriever | None = None) -> np.ndarray:
     """Embute imagens de pagina -> `np.ndarray [N, dim]` float32 L2-normalizado.
 
-    `embedder` injeta um wrapper ja carregado (ou um duble, nos testes); sem ele o
-    modelo vem de `get_embedder(...)`.
+    `max_pixels` e o teto de resolucao por imagem (`None` = sem teto, comportamento
+    anterior). `embedder` injeta um wrapper ja carregado (ou um duble, nos testes); sem
+    ele o modelo vem de `get_embedder(...)`.
     """
     emb = embedder or get_embedder(model_id=model_id, device=device, dtype=dtype,
-                                   batch_size=batch_size, dim=dim)
+                                   batch_size=batch_size, dim=dim, max_pixels=max_pixels)
     return emb.embed_images(list(paths))
 
 
 def embed_texts(texts: list[str], *, model_id: str = DEFAULT_MODEL_ID, device: str = "cuda",
                 dtype: str = "bfloat16", batch_size: int = 8, dim: int | None = None,
+                max_pixels: int | None = DEFAULT_MAX_PIXELS,
                 embedder: Qwen3VLEmbedRetriever | None = None) -> np.ndarray:
-    """Embute textos (consultas) -> `np.ndarray [N, dim]` float32 L2-normalizado."""
+    """Embute textos (consultas) -> `np.ndarray [N, dim]` float32 L2-normalizado.
+
+    `max_pixels` nao toca no caminho de texto: existe (com o MESMO default de
+    `embed_images`) so para que uma chamada de texto e uma de imagem com os demais
+    argumentos iguais caiam no mesmo embedder em cache.
+    """
     emb = embedder or get_embedder(model_id=model_id, device=device, dtype=dtype,
-                                   batch_size=batch_size, dim=dim)
+                                   batch_size=batch_size, dim=dim, max_pixels=max_pixels)
     return emb.embed_texts(list(texts))
