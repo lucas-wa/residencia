@@ -75,6 +75,27 @@ modelo); o **ensemble** vence em **precisão por modalidade** (especialistas, ex
 late-interaction em documento), ao custo de complexidade e storage. O A/B decide o que vai
 para a camada Gold de produção.
 
+### 5.1 Avaliação além da recuperação (Semana 9)
+
+As métricas acima medem só o **índice**. O produto é **geração/simplificação** de ato
+oficial — para dado governamental, **fidelidade** e **rastreabilidade** pesam mais que
+recall. A régua completa (spec no Notion, "Semana 9 — avaliação da pipeline além da
+recuperação") estende este protocolo com seis eixos:
+
+- **Qualidade da geração** — fidelidade/*groundedness*, relevância, completude (RAGAS;
+  RAGChecker, arXiv:2408.08067; UniDoc-Bench, arXiv:2510.03663).
+- **Multimodal** — atribuição cross-modal e conflito texto×imagem (MM-RAGChecker,
+  arXiv:2509.24253; CMC-Bench, MAGMaR 2026).
+- **Rastreabilidade** — acurácia de citação à fonte oficial (MIRAGE).
+- **Confiabilidade** — abstenção × fabricação (CMC-Bench).
+- **Simplificação** — fidelidade factual + ganho de legibilidade (produto GovExe).
+- **Operacional** — latência e2e, custo (GPU-hora de indexação + storage + geração), throughput.
+
+**Método:** LLM-as-judge claim-level em pt-BR (ressalva: o juiz pega concordância
+superficial e fidelidade ≠ correção) + conjunto-âncora com anotação humana (estilo ARES)
+para calibrar; **gating por threshold** (ex. fidelidade ≥ 0.80) e controles fixos (corpus,
+query-set, gerador, hardware) entre **A × B × A+áudio**.
+
 ## 6. Decisão da Semana 7
 
 - **Implementar A** (unificado **Qwen3-VL-Embedding-2B**) na fatia GCP — ver

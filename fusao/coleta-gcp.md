@@ -24,7 +24,7 @@ oficial), e **só fontes públicas oficiais**.
 | **API REST/JSON** | Câmara e Senado (Dados Abertos), IBGE, BCB, Portal da Transparência, Comprasnet, TSE (dados abertos), Datajud/CNJ | *pull* paginado por API; incremental por data/`id` |
 | **Portal / boletim** | DOU (Imprensa Nacional), TCU, CGU | download estruturado quando há API; *scraping leve* respeitando `robots`/termos |
 | **Arquivos** | PDFs de planos de governo (TSE/Storage), fotos de candidatos (TSE 161×225) | download por URL estável; render de PDF → página-imagem |
-| **Mídia (futuro)** | Vídeos do YouTube (sessões, pronunciamentos, comissões), áudio | captura por URL; transcodificação; ASR **só em casos específicos** |
+| **Imagem de notícia / mídia (Semana 9)** | Agências públicas (EBC/Agência Brasil, Agência Câmara, Agência Senado), fotos de parlamentares (`urlFoto`), YouTube (sessões), RadioAgência/Senado Multimídia | *pull* por URL/API com **crédito**; áudio → **ASR default** / embedding direto (#4); ver §6 |
 
 ## 3. Arquitetura (GCP, alinhada ao medalhão)
 
@@ -114,11 +114,53 @@ A alternativa de **ensemble de especialistas + pointer vector** e o **protocolo 
 - **Entrega ao menos uma vez** do Pub/Sub ⇒ consumidores idempotentes (chave de deduplicação + *upsert*).
 - **DLQ** no Pub/Sub para itens que falham; reprocesso controlado.
 
-## 6. Mídia (extensão futura)
+## 6. Áudio e imagem — fontes de captura e indexação (Semana 9)
 
-- **Vídeo (YouTube)**: captura por URL → **GCS**; **Transcoder API** para normalizar; extração de *frames-chave*; embedding de vídeo.
-- **Áudio**: **Speech-to-Text** apenas em **casos específicos** (ASR como sinal auxiliar, não redução padrão — coerente com `fusao/arquitetura.md`).
-- Observar a Resolução TSE 23.732/2024: nada de síntese de imagem/áudio de candidatos.
+Promove a "mídia futura" a **plano concreto da Semana 9** (objetivo #5). Toda captura é
+de **fonte oficial pública**, com **crédito preservado** (`autor/fonte`) — o crédito + a
+URI viram o *pointer* rastreável da camada Gold (coerente com "o resumo é porta para a
+fonte" e com a régua de avaliação de `multimodal.md` §5.1).
+
+### 6.1 Imagem
+
+| Fonte | Captura | Licença / crédito |
+|---|---|---|
+| **Agências públicas de notícia** — EBC/Agência Brasil, Agência Câmara, Agência Senado (foto **+ legenda da matéria**) | *pull* da matéria → imagem + texto-legenda | uso livre **com crédito**; EBC CC BY 3.0 BR até 2017, pós-2017 caso-a-caso ⚠ |
+| **Fotos de parlamentares** — Câmara (`urlFoto`), Senado (`UrlFotoParlamentar`) | *pull* da API JSON → URL direta | crédito `fonte` |
+| **Fotos de candidatos TSE** (dados abertos, por UF + BR, JPEG) | *pull* do CDN, ZIP por UF | crédito; observar Res. TSE 23.732/2024 |
+| **Páginas-imagem de PDF** (planos TSE) | já na pipeline (render ~150 dpi) | já coberto (doc-visual) |
+
+A **legenda da notícia** é um ganho: vira **descritor textual** nativo da imagem (bom para
+o *pointer vector* e para medir atribuição cross-modal, §5.1). Contas institucionais em
+redes sociais entram só como **fonte secundária de baixa confiança** — exigem verificação
+da origem oficial antes de indexar; preferir sempre a agência. A imagem entra
+**nativamente** na Abordagem A (Qwen3-VL embeda imagem) e na B (SigLIP 2 especialista).
+
+### 6.2 Áudio (em escopo na Semana 9)
+
+| Fonte | Captura | Observação |
+|---|---|---|
+| **YouTube** (SenadoTV, TV Câmara: sessões, pronunciamentos) | captura por URL → GCS | termos do YouTube ⚠ |
+| **RadioAgência / Senado Multimídia / Rádio Senado** | download de áudio de atividade legislativa | **captura de sinal** exige ofício → adiado |
+
+- **Default = ASR→texto (Whisper large-v3) como *pointer vector***, executado no **Silver**
+  (fala governamental é semântica densa → ASR ganha em recuperação; coerente com §4 de
+  `multimodal.md`).
+- **Embedding de áudio direto (CLAP)** é a variante testada no **objetivo #4** (ensemble
+  com modelo distinto só para áudio): indexa-se primeiro pelo caminho texto-pointer e
+  compara-se contra o nativo, pela régua do objetivo #1.
+
+### 6.3 Fluxo (encaixe no medalhão)
+
+- **Bronze**: GCS raw por `fonte/dt` (imagem JPEG, áudio + legenda/metadados), *pull*
+  idempotente, **crédito preservado**.
+- **Silver**: normaliza + resolve entidade + dedup por `hash(conteúdo)`; **ASR do áudio
+  aqui**; a legenda da notícia vira descritor da imagem.
+- **Gold**: embedding (A unificado / B especialista) + índice pgvector; *upsert* por hash.
+
+A indexação em si (coletores + ASR + embedding) é **implementação** → vai para o
+`implementer`, medida pela régua do objetivo #1. Observar a **Resolução TSE 23.732/2024**
+(nada de síntese de imagem/áudio de candidatos).
 
 ## 7. Mapeamento ao medalhão (consistência com a fusão)
 
