@@ -906,6 +906,20 @@ exige_relativo() {
 exige_relativo --audio-records "$AUDIO_RECORDS"
 exige_relativo --audio-dir "$AUDIO_DIR"
 exige_relativo --out "$OUT_CSV"
+
+# O conjunto de avaliacao de audio entra em QUALQUER arquitetura, nao so nas que tem CLAP:
+# o espaco qwen3vl ja indexa os mesmos clipes como `audio_asr` (Whisper -> texto), e e essa
+# a baseline "A (ASR->texto)" que a tarefa de audio da spec (secao 5) compara com o CLAP
+# nativo. Sem isto, `--arch A` indexava o audio e nunca o media.
+#
+# Gate humano: enquanto o mini-set nao for capturado e julgado, o diretorio nao existe e a
+# rodada mede so a tarefa doc-visual -- aviso, nao erro.
+if [ -d "$REPO_DIR/$EVAL_AUDIO_DIR" ]; then
+    EVAL_DIRS="$EVAL_DIRS $EVAL_AUDIO_DIR"
+else
+    echo "--- aviso: sem $EVAL_AUDIO_DIR: a rodada mede so a tarefa doc-visual ---"
+fi
+
 for _dir in $EVAL_DIRS; do exige_relativo --eval-dirs "$_dir"; done
 
 # O espaco clap so existe se houver audio para indexar -- descobrir isso DEPOIS de subir
@@ -917,13 +931,6 @@ case " $SPACES " in
                 "a arquitetura $ARCH indexa o espaco clap, mas nao existe" \
                 "$AUDIO_RECORDS (records do mini-set de audio)." \
                 "Capture com gcp/slice/audio_collector.py ou passe --audio-records."
-        fi
-        # O conjunto de avaliacao de audio entra na lista quando existe (gate humano:
-        # sem qrels julgados, a tarefa de audio nao tem o que medir).
-        if [ -d "$REPO_DIR/$EVAL_AUDIO_DIR" ]; then
-            EVAL_DIRS="$EVAL_DIRS $EVAL_AUDIO_DIR"
-        else
-            echo "--- aviso: sem $EVAL_AUDIO_DIR: a rodada mede so a tarefa doc-visual ---"
         fi
         ;;
 esac
