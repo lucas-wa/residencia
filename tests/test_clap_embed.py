@@ -8,6 +8,7 @@ e entra no caminho real (`ClapProcessor` -> `get_audio_features`), com `torch` e
 512 e a dimensao do `laion/larger_clap_general` declarada em `SPACES["clap"].dim`.
 """
 
+import logging
 import sys
 import types
 
@@ -50,6 +51,7 @@ def test_defaults_concordam_com_o_registro_de_espacos():
     assert clap_embed.DEFAULT_CLAP_ID == SPACES["clap"].model_id
     assert clap_embed.CLAP_DIM == SPACES["clap"].dim == 512
     assert clap_embed.CLAP_SAMPLE_RATE == 48_000
+    assert clap_embed.CLAP_MAX_SECONDS == 10.0
 
 
 # -- caminho real: librosa -> ClapProcessor -> get_audio_features/get_text_features ----
@@ -77,7 +79,11 @@ class _Tensor:
 
 @pytest.fixture
 def fake_libs(monkeypatch):
-    """`torch.no_grad` e `librosa.load` dublados; devolve as chamadas de `load`."""
+    """`torch.no_grad` e `librosa.load` dublados; devolve as chamadas de `load`.
+
+    A onda devolvida dura `sys.modules["librosa"].segundos` (1 s por padrao) -- o teste do
+    aviso de truncacao aumenta esse valor para simular um clipe longo.
+    """
     torch = types.ModuleType("torch")
     torch.no_grad = _NoGrad
     monkeypatch.setitem(sys.modules, "torch", torch)
@@ -86,16 +92,18 @@ def fake_libs(monkeypatch):
 
     def load(path, sr=None, mono=True):
         chamadas.append({"path": str(path), "sr": sr, "mono": mono})
-        return np.zeros(int(sr or 16_000), dtype="float32"), sr
+        return np.zeros(int((sr or 16_000) * librosa.segundos), dtype="float32"), sr
 
     librosa = types.ModuleType("librosa")
     librosa.load = load
+    librosa.segundos = 1.0
     monkeypatch.setitem(sys.modules, "librosa", librosa)
     return chamadas
 
 
 class _FeatureExtractor:
     sampling_rate = 48_000
+    max_length_s = 10          # janela do CLAP: acima disso o extractor trunca
 
 
 class _Proc:
@@ -184,10 +192,34 @@ def test_embed_texts_usa_o_encoder_de_texto(fake_libs):
     assert [c["text"] for c in proc.chamadas] == [["metas de saude", "orcamento"],
                                                   ["meio ambiente"]]
     assert all(c["padding"] is True for c in proc.chamadas)
+    # consulta longa demais e CORTADA, nao estoura o limite posicional do text tower
+    assert all(c["truncation"] is True for c in proc.chamadas)
     assert not fake_libs                      # texto nao abre arquivo de audio
     assert not model.audio_batches            # nem passa pelo encoder de audio
     assert vecs.shape == (3, 4) and vecs.dtype == np.float32
     assert np.allclose(vecs[0], [0.6, 0.8, 0.0, 0.0])
+
+
+def test_audio_longo_avisa_que_sera_truncado(fake_libs, caplog):
+    """Clipe de 90 s > janela de ~10 s do extractor: a perda tem de aparecer no log."""
+    sys.modules["librosa"].segundos = 90.0
+    emb = _bare(_Model(), _Proc(), batch_size=2)
+
+    with caplog.at_level(logging.WARNING, logger="benchmark.models.clap_embed"):
+        vecs = clap_embed.embed_audio(["sessao_longa.m4a"], embedder=emb)
+
+    avisos = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(avisos) == 1
+    assert "sessao_longa.m4a" in avisos[0] and "90.0 s" in avisos[0] and "10 s" in avisos[0]
+    # o aviso nao interrompe nada: o vetor sai normalmente (truncado pelo extractor)
+    assert vecs.shape == (1, 4)
+
+
+def test_audio_dentro_da_janela_nao_avisa(fake_libs, caplog):
+    emb = _bare(_Model(), _Proc(), batch_size=2)
+    with caplog.at_level(logging.WARNING, logger="benchmark.models.clap_embed"):
+        clap_embed.embed_audio(["curto.m4a"], embedder=emb)
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 def test_texto_e_audio_sao_comparaveis(fake_libs):

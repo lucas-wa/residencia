@@ -41,6 +41,16 @@ Dois detalhes que NAO sao cosmeticos:
    passamos `truncation`/`padding` ao lado de audio: valem os defaults do
    `preprocessor_config.json` do checkpoint, que casam com o `config.json` dele.
 
+JANELA DE ~10 s (limite conhecido, nao e bug)
+---------------------------------------------
+O feature extractor do CLAP tem `max_length_s=10`: um arquivo mais longo NAO e coberto
+inteiro -- o extractor recorta/compacta a onda para essa janela e o vetor representa so
+esse trecho. Audio longo que cai aqui inteiro sai com um aviso (`log.warning` nomeando o
+arquivo e a duracao), para a truncacao nunca ser silenciosa. **Chunking/pooling de audio
+longo e responsabilidade do CHAMADOR** (fatiar o item em janelas, embutir cada uma e
+agregar/indexar como preferir) -- este wrapper e deliberadamente um vetor por entrada, e
+o fatiamento mora em quem monta os itens `audio_native`.
+
 `_audio_vectors`/`_text_vectors` sao metodos de instancia de proposito: o teste de
 contrato os substitui para exercitar o wrapper sem baixar pesos. O carregamento real mora
 em `_load` (lazy, idempotente), entao importar este modulo -- e construir o embedder --
@@ -60,6 +70,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "CLAP_DIM",
+    "CLAP_MAX_SECONDS",
     "CLAP_SAMPLE_RATE",
     "DEFAULT_CLAP_ID",
     "ClapEmbedder",
@@ -76,6 +87,10 @@ CLAP_DIM = 512
 # Taxa do feature extractor do CLAP. E o fallback: a taxa real sai do proprio processor
 # do checkpoint (`_sampling_rate`).
 CLAP_SAMPLE_RATE = 48_000
+# Janela do feature extractor (`ClapFeatureExtractor.max_length_s`). Entrada mais longa e
+# truncada POR ELE -- aqui so viramos o aviso. Fallback: a janela real sai do checkpoint
+# (`_max_seconds`).
+CLAP_MAX_SECONDS = 10.0
 
 
 def _l2_normalize(x: np.ndarray) -> np.ndarray:
@@ -84,12 +99,17 @@ def _l2_normalize(x: np.ndarray) -> np.ndarray:
     return x / (norms + 1e-9)
 
 
-def _read_audio(path: str, sampling_rate: int) -> np.ndarray:
+def _read_audio(path: str, sampling_rate: int,
+                max_seconds: float = CLAP_MAX_SECONDS) -> np.ndarray:
     """Arquivo de audio -> onda mono float32 JA reamostrada para `sampling_rate`.
 
     `librosa` entra tardiamente (mesmo padrao de `gcp/slice/asr.py`): o modulo precisa ser
     importavel -- e os testes offline precisam rodar -- sem o decodificador instalado.
     Ele cobre os formatos que o coletor baixa (m4a/mp3/wav) e ja devolve mono.
+
+    A onda sai INTEIRA (quem trunca e o feature extractor, que so enxerga `max_seconds`):
+    acima da janela, emitimos um `log.warning` nomeando arquivo e duracao para a perda ser
+    visivel. Fatiar audio longo em janelas e do chamador -- ver docstring do modulo.
     """
     try:
         import librosa
@@ -100,7 +120,14 @@ def _read_audio(path: str, sampling_rate: int) -> np.ndarray:
         ) from exc
 
     onda, _sr = librosa.load(path, sr=sampling_rate, mono=True)
-    return np.asarray(onda, dtype="float32")
+    onda = np.asarray(onda, dtype="float32")
+    duracao = len(onda) / float(sampling_rate or CLAP_SAMPLE_RATE)
+    if max_seconds and duracao > max_seconds:
+        log.warning(
+            "audio %s tem %.1f s e excede a janela de ~%.0f s do feature extractor do "
+            "CLAP: o vetor cobre so o trecho que ele seleciona, o resto e descartado "
+            "(fatiar em janelas e do chamador)", path, duracao, max_seconds)
+    return onda
 
 
 class ClapEmbedder:
@@ -137,6 +164,12 @@ class ClapEmbedder:
         fe = getattr(proc, "feature_extractor", None)
         return int(getattr(fe, "sampling_rate", None) or CLAP_SAMPLE_RATE)
 
+    @staticmethod
+    def _max_seconds(proc) -> float:
+        """Janela que o feature extractor do CHECKPOINT cobre (~10 s no CLAP)."""
+        fe = getattr(proc, "feature_extractor", None)
+        return float(getattr(fe, "max_length_s", None) or CLAP_MAX_SECONDS)
+
     def _to_device(self, inputs) -> dict:
         return {k: (v.to(self.device) if hasattr(v, "to") else v)
                 for k, v in dict(inputs).items()}
@@ -158,9 +191,11 @@ class ClapEmbedder:
 
         model, proc = self._load()
         taxa = self._sampling_rate(proc)
+        janela = self._max_seconds(proc)      # so para avisar; quem trunca e o extractor
         out: list[np.ndarray] = []
         for start in range(0, len(paths), self.batch_size):
-            ondas = [_read_audio(p, taxa) for p in paths[start:start + self.batch_size]]
+            ondas = [_read_audio(p, taxa, janela)
+                     for p in paths[start:start + self.batch_size]]
             # sem `truncation`/`padding` aqui: valem os defaults do checkpoint (ver docstring)
             inputs = proc(audios=ondas, sampling_rate=taxa, return_tensors="pt")
             with torch.no_grad():
@@ -178,7 +213,9 @@ class ClapEmbedder:
         out: list[np.ndarray] = []
         for start in range(0, len(texts), self.batch_size):
             batch = texts[start:start + self.batch_size]
-            inputs = proc(text=batch, return_tensors="pt", padding=True)
+            # `truncation=True`: consulta longa demais e CORTADA no limite do text tower,
+            # em vez de estourar o embedding posicional do RoBERTa.
+            inputs = proc(text=batch, return_tensors="pt", padding=True, truncation=True)
             with torch.no_grad():
                 feats = model.get_text_features(**self._to_device(inputs))
             out.append(self._as_numpy(feats))
