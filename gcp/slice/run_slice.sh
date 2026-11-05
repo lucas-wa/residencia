@@ -8,7 +8,9 @@
 # Consolida num fluxo unico e versionado os tres scripts descartaveis que funcionaram na
 # rodada manual do objetivo #2 (bootstrap da VM, ingestao das paginas, fase de audio). A
 # fraqueza daquela rodada era o teardown MANUAL: aqui ele esta num `trap ... EXIT`, entao
-# roda no sucesso, no erro e na interrupcao (Ctrl-C).
+# roda no sucesso, no erro, na interrupcao (Ctrl-C) e na queda do terminal (SIGHUP) -- e,
+# uma vez comecado, IGNORA sinais, faz retry de cada delete e ASSERTA no fim que nada
+# sobrou (se sobrou, grita LEAK e sai com status 70).
 #
 # -------------------------------------------------------------------------------------
 # ATENCAO -- ESTE SCRIPT E DONO DO CICLO DE VIDA DOS RECURSOS
@@ -39,6 +41,10 @@
 #       -> a etapa de indexacao falha DE PROPOSITO e a saida mostra o teardown rodando
 #          assim mesmo. `SLICE_FAIL_AT` existe so para provar o trap (etapas: provision,
 #          bootstrap, index, eval); nao tem uso em producao.
+#
+#   Em `--dry-run`, precondicao de AMBIENTE que falta (gcloud fora do PATH, mini-set de
+#   audio ainda nao capturado) vira AVISO e a rodada segue: a verificacao do script nao
+#   pode depender de ter nuvem autenticada e dado local na maquina de quem revisa.
 #
 # A arquitetura (`--arch`) define os ESPACOS a indexar -- o registro e
 # `gcp/slice/spaces.py`, e a VM confere a lista deste script contra ele antes de indexar:
@@ -106,7 +112,7 @@ RESULTADOS_COLETADOS=0
 # Flags
 # -------------------------------------------------------------------------------------
 uso() {
-    sed -n '2,48p' "$0"
+    sed -n '2,54p' "$0"
     exit "${1:-0}"
 }
 
@@ -167,14 +173,39 @@ run_secreto() {
     "$@"
 }
 
-# Teste de existencia de recurso. Em `--dry-run` devolve 1 (NAO existe) de proposito: o
-# caminho de criacao e o que interessa imprimir.
+# Teste de existencia de recurso. Em `--dry-run` devolve 1 (NAO existe) sem consultar a
+# nuvem: no provisionamento isso imprime o caminho de criacao (o que interessa ver) e na
+# conferencia do teardown significa "nada a vazar", que e a verdade num dry-run.
 existe() {
     if [ "$DRY_RUN" = "1" ]; then
-        printf '    [dry-run] %s   # (dry-run assume que NAO existe)\n' "$*"
+        printf '    [dry-run] %s   # (dry-run nao consulta a nuvem: segue como inexistente)\n' "$*"
         return 1
     fi
     "$@" >/dev/null 2>&1
+}
+
+# `run` com teto de tempo, para o que nao pode travar o fluxo (o scp de resgate do CSV
+# numa VM meio-bootada). Onde nao houver `timeout` (coreutils), segue sem o teto -- melhor
+# sem limite que sem resgate.
+com_timeout() {
+    local segundos="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then
+        run timeout "$segundos" "$@"
+    else
+        run "$@"
+    fi
+}
+
+# Precondicao de AMBIENTE que falta. Numa rodada de verdade e erro fatal; em `--dry-run` e
+# so um aviso: a verificacao do script (sintaxe, fluxo, teardown) nao pode depender de ter
+# nuvem autenticada e mini-set de audio na maquina de quem revisa.
+precondicao_ausente() {
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "--- aviso (dry-run segue assim mesmo): $* ---" >&2
+        return 0
+    fi
+    echo "ERRO: $*" >&2
+    exit 2
 }
 
 # Gancho de verificacao do trap: `SLICE_FAIL_AT=<etapa>` faz a etapa falhar de proposito.
@@ -205,53 +236,116 @@ remoto() {   # executa um comando DENTRO da VM
 # TEARDOWN -- a razao de ser deste script
 #
 # Registrado em `trap ... EXIT` logo antes do primeiro recurso ser criado, entao roda no
-# sucesso, no erro (`set -e`) e na interrupcao (os traps de INT/TERM convertem o sinal
-# numa saida normal, que e o que dispara o EXIT de forma confiavel).
+# sucesso, no erro (`set -e`), na interrupcao e na queda do terminal (os traps de
+# INT/TERM/HUP convertem o sinal numa saida normal, que e o que dispara o EXIT de forma
+# confiavel).
 #
-# Regras: `set +e` (nenhuma falha de limpeza pode abortar a limpeza), tudo com `|| true`,
-# e a VM e apagada em TODA zona onde um `create` foi tentado -- um create que estourou no
-# meio pode ter deixado instancia de pe.
+# Regras de robustez -- a limpeza nao pode ser derrotada por nada:
+#
+#   1. `trap '' INT TERM HUP`: o teardown IGNORA sinais. Um segundo Ctrl-C no meio dele
+#      nao pode matar o shell deixando L4 e Cloud SQL de pe, cobrando.
+#   2. `set +eu +o pipefail`: nem erro, nem variavel nao-setada, nem pipe quebrado podem
+#      abortar a limpeza antes dos deletes.
+#   3. O resgate do CSV vem antes dos deletes (apagar a VM destroi o arquivo), mas com
+#      TIMEOUT: um scp travado numa VM meio-bootada nao pode adiar a limpeza para sempre.
+#   4. Todo delete tem RETRY: "operation in progress" logo apos um create interrompido e
+#      falha transitoria, e engoli-la com `|| true` seria vazar recurso pago.
+#   5. Conferencia final que ASSERTA: se algo sobreviveu, o script grita LEAK, imprime os
+#      comandos de delete manuais e sai com status != 0.
 # -------------------------------------------------------------------------------------
+TEARDOWN_RETRIES="${TEARDOWN_RETRIES:-3}"
+TEARDOWN_ESPERA="${TEARDOWN_ESPERA:-20}"      # segundos entre tentativas de delete
+RESGATE_TIMEOUT="${RESGATE_TIMEOUT:-120}"     # teto do scp de resgate do CSV
+LEAK_EXIT="${LEAK_EXIT:-70}"                  # status quando sobra recurso de pe
+
+# Apaga com retry. Devolve 0 so se um delete passou.
+apagar_com_retry() {
+    local rotulo="$1"; shift
+    local tentativa=1
+    while [ "$tentativa" -le "$TEARDOWN_RETRIES" ]; do
+        if run "$@"; then
+            return 0
+        fi
+        if [ "$tentativa" -lt "$TEARDOWN_RETRIES" ]; then
+            echo "--- $rotulo: tentativa $tentativa falhou (operacao em andamento?);" \
+                 "nova tentativa em ${TEARDOWN_ESPERA}s ---" >&2
+            run sleep "$TEARDOWN_ESPERA"
+        fi
+        tentativa=$((tentativa + 1))
+    done
+    echo "--- $rotulo: FALHOU em $TEARDOWN_RETRIES tentativas ---" >&2
+    return 1
+}
+
 teardown() {
     local rc=$?
-    set +e
-    trap - EXIT INT TERM
+    # Ordem importa: desligar `set -e`/`-u` e ignorar sinais ANTES de qualquer comando.
+    set +e +u +o pipefail
+    trap - EXIT
+    trap '' INT TERM HUP
 
     etapa "TEARDOWN (saida com status $rc) -- apagando VM e Cloud SQL"
+    echo "--- a partir daqui INT/TERM/HUP sao IGNORADOS: a limpeza nao se interrompe ---"
 
     # Ultima chance de salvar o CSV: se a rodada morreu depois de avaliar mas antes de
-    # coletar, o arquivo ainda esta na VM que estamos prestes a apagar.
-    if [ "$RESULTADOS_COLETADOS" = "0" ] && [ -n "$ZONE" ]; then
-        echo "--- tentativa final de trazer os resultados antes de apagar a VM ---"
-        coletar_resultados || true
+    # coletar, o arquivo ainda esta na VM que estamos prestes a apagar. Com timeout: a
+    # garantia de nao-vazamento vem antes do CSV.
+    if [ "${RESULTADOS_COLETADOS:-0}" = "0" ] && [ -n "${ZONE:-}" ]; then
+        echo "--- tentativa final de trazer os resultados (teto: ${RESGATE_TIMEOUT}s) ---"
+        coletar_resultados || echo "--- resgate do CSV falhou ou estourou o tempo; seguindo para os deletes ---" >&2
     fi
 
     local zona
-    for zona in $ZONAS_TENTADAS; do
+    for zona in ${ZONAS_TENTADAS:-}; do
         echo "--- apagando a VM $VM em $zona (se existir) ---"
-        run gcloud compute instances delete "$VM" --zone="$zona" \
-            --project="$PROJECT_ID" --quiet || true
+        apagar_com_retry "delete da VM em $zona" \
+            gcloud compute instances delete "$VM" --zone="$zona" \
+                --project="$PROJECT_ID" --quiet
     done
-    if [ -z "$ZONAS_TENTADAS" ]; then
+    if [ -z "${ZONAS_TENTADAS:-}" ]; then
         echo "--- nenhuma VM foi criada nesta rodada ---"
     fi
 
-    if [ "$SQL_TOCADA" = "1" ]; then
+    if [ "${SQL_TOCADA:-0}" = "1" ]; then
         echo "--- apagando a instancia Cloud SQL $INSTANCE (o indice morre com ela) ---"
-        run gcloud sql instances delete "$INSTANCE" --project="$PROJECT_ID" --quiet || true
+        apagar_com_retry "delete do Cloud SQL $INSTANCE" \
+            gcloud sql instances delete "$INSTANCE" --project="$PROJECT_ID" --quiet
     else
         echo "--- nenhuma instancia Cloud SQL foi tocada nesta rodada ---"
     fi
 
-    # Conferencia final: as duas listas tem de sair VAZIAS (criterio de aceite do plano).
-    echo "--- conferencia: o que sobrou com estes nomes ---"
-    run gcloud compute instances list --project="$PROJECT_ID" \
-        --filter="name=$VM" || true
-    run gcloud sql instances list --project="$PROJECT_ID" \
-        --filter="name=$INSTANCE" || true
+    # -- conferencia que ASSERTA (criterio de aceite do plano: nao pode sobrar nada) -----
+    # Pequena espera para o estado da API assentar e nao gerar LEAK falso logo apos um
+    # delete que ja retornou sucesso.
+    run sleep 10
+    echo "--- conferencia final: nada pode ter sobrado ---"
+    local vazou=0
+    for zona in ${ZONAS_TENTADAS:-}; do
+        if existe gcloud compute instances describe "$VM" --zone="$zona" \
+                  --project="$PROJECT_ID"; then
+            vazou=1
+            echo "!!! LEAK: a VM $VM AINDA EXISTE em $zona -- ela CONTINUA COBRANDO !!!" >&2
+            echo "    apague a mao:" >&2
+            echo "    gcloud compute instances delete $VM --zone=$zona --project=$PROJECT_ID --quiet" >&2
+        fi
+    done
+    if [ "${SQL_TOCADA:-0}" = "1" ] \
+       && existe gcloud sql instances describe "$INSTANCE" --project="$PROJECT_ID"; then
+        vazou=1
+        echo "!!! LEAK: a instancia Cloud SQL $INSTANCE AINDA EXISTE -- ela CONTINUA COBRANDO !!!" >&2
+        echo "    apague a mao:" >&2
+        echo "    gcloud sql instances delete $INSTANCE --project=$PROJECT_ID --quiet" >&2
+    fi
 
-    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
-        rm -rf "$TMP_DIR" || true
+    if [ -n "${TMP_DIR:-}" ] && [ -d "${TMP_DIR:-}" ]; then
+        rm -rf "$TMP_DIR"
+    fi
+
+    if [ "$vazou" = "1" ]; then
+        echo "!!! TEARDOWN INCOMPLETO: ha recurso pago de pe (veja os LEAK acima) !!!" >&2
+        if [ "$rc" = "0" ]; then rc="$LEAK_EXIT"; fi
+    else
+        echo "--- conferencia ok: nem VM nem instancia Cloud SQL sobraram ---"
     fi
 
     echo "=== teardown concluido (status final: $rc) ==="
@@ -773,13 +867,17 @@ enviar_repo() {
     fi
 }
 
+# Chamada no fluxo normal E dentro do teardown; por isso todo scp tem teto de tempo (um
+# scp travado numa VM meio-bootada nao pode adiar a limpeza).
 coletar_resultados() {
-    echo "--- trazendo $OUT_CSV e os logs da VM ---"
+    echo "--- trazendo $OUT_CSV e os logs da VM (teto: ${RESGATE_TIMEOUT}s por arquivo) ---"
     run mkdir -p "$REPO_DIR/$(dirname "$OUT_CSV")" "$REPO_DIR/logs" || true
-    run gcloud compute scp "$VM:~/residencia/$OUT_CSV" "$REPO_DIR/$OUT_CSV" \
-        --zone="$ZONE" --project="$PROJECT_ID" --quiet || return 1
-    run gcloud compute scp "$VM:~/proxy.log" "$REPO_DIR/logs/proxy-$VM.log" \
-        --zone="$ZONE" --project="$PROJECT_ID" --quiet || true
+    com_timeout "$RESGATE_TIMEOUT" \
+        gcloud compute scp "$VM:~/residencia/$OUT_CSV" "$REPO_DIR/$OUT_CSV" \
+            --zone="$ZONE" --project="$PROJECT_ID" --quiet || return 1
+    com_timeout "$RESGATE_TIMEOUT" \
+        gcloud compute scp "$VM:~/proxy.log" "$REPO_DIR/logs/proxy-$VM.log" \
+            --zone="$ZONE" --project="$PROJECT_ID" --quiet || true
     RESULTADOS_COLETADOS=1
     return 0
 }
@@ -792,8 +890,7 @@ echo "    projeto=$PROJECT_ID  regiao=$REGION  instancia=$INSTANCE  vm=$VM"
 echo "    bucket=$BUCKET  fonte=$SOURCE  dt=$DT  csv=$OUT_CSV"
 
 if ! command -v gcloud >/dev/null 2>&1; then
-    echo "ERRO: gcloud nao esta no PATH" >&2
-    exit 2
+    precondicao_ausente "gcloud nao esta no PATH"
 fi
 
 # Os caminhos de dados sao RELATIVOS a raiz do repo: eles viajam dentro do tarball e sao
@@ -816,10 +913,10 @@ for _dir in $EVAL_DIRS; do exige_relativo --eval-dirs "$_dir"; done
 case " $SPACES " in
     *" clap "*)
         if [ ! -f "$REPO_DIR/$AUDIO_RECORDS" ]; then
-            echo "ERRO: a arquitetura $ARCH indexa o espaco clap, mas nao existe" >&2
-            echo "      $AUDIO_RECORDS (records do mini-set de audio)." >&2
-            echo "      Capture com gcp/slice/audio_collector.py ou passe --audio-records." >&2
-            exit 2
+            precondicao_ausente \
+                "a arquitetura $ARCH indexa o espaco clap, mas nao existe" \
+                "$AUDIO_RECORDS (records do mini-set de audio)." \
+                "Capture com gcp/slice/audio_collector.py ou passe --audio-records."
         fi
         # O conjunto de avaliacao de audio entra na lista quando existe (gate humano:
         # sem qrels julgados, a tarefa de audio nao tem o que medir).
@@ -837,12 +934,14 @@ gerar_scripts_remotos
 # -------------------------------------------------------------------------------------
 # A partir daqui existe recurso pago em jogo: o teardown passa a ser obrigatorio.
 #
-# INT/TERM viram uma saida normal para que o EXIT dispare de forma confiavel (bash nem
-# sempre roda o trap de EXIT quando o shell morre por sinal nao tratado).
+# INT/TERM/HUP viram uma saida normal para que o EXIT dispare de forma confiavel (bash nem
+# sempre roda o trap de EXIT quando o shell morre por sinal nao tratado). HUP cobre o caso
+# de uma rodada paga longa: terminal fechado ou ssh caido nao pode pular a limpeza.
 # -------------------------------------------------------------------------------------
 trap 'teardown' EXIT
 trap 'echo ""; echo "--- interrompido (SIGINT) ---" >&2; exit 130' INT
 trap 'echo ""; echo "--- terminado (SIGTERM) ---" >&2; exit 143' TERM
+trap 'echo ""; echo "--- terminal caiu (SIGHUP) ---" >&2; exit 129' HUP
 
 gancho_de_falha provision
 provisionar_sql
