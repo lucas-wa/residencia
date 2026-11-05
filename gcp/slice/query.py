@@ -17,7 +17,10 @@ ordena e o operador `<=>` do pgvector (`PgVectorStore.search`), e na logica test
 Acima disso ha a consulta MULTI-ESPACO (`search_architecture`): a arquitetura `A+audio`
 soma ao Qwen3-VL o indice do CLAP (audio nativo), e os dois rankings se fundem por RRF
 (`gcp/slice/fusion.py`) -- posicao, nunca score, porque a similaridade de espacos
-diferentes nao se compara. A CLI abaixo continua sendo a de espaco unico.
+diferentes nao se compara. Por default ela funde TODOS os espacos da arquitetura (a busca
+cross-modal); `only_spaces` restringe a fusao a um subconjunto, que e como a avaliacao
+mede UMA tarefa por vez (`gcp/slice/eval.py`). A CLI abaixo continua sendo a de espaco
+unico.
 
 Uso:
     export PGPASSWORD="$(gcloud secrets versions access latest --secret=govexe-pg-password)"
@@ -31,7 +34,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import numpy as np
@@ -91,8 +94,9 @@ def search(text: str, store: VectorStore, *, k: int = TOP_K, model_id: str = DEF
 def search_architecture(arch: str, query_text: str, *, k: int = MULTI_TOP_K,
                         stores: dict[str, VectorStore],
                         embedders: dict[str, Callable[[list[str]], np.ndarray]],
+                        only_spaces: Iterable[str] | None = None,
                         ) -> list[tuple[str, float]]:
-    """Consulta textual em TODOS os espacos da arquitetura e funde os rankings por RRF.
+    """Consulta textual nos espacos da arquitetura e funde os rankings por RRF.
 
     Um espaco por vez: a consulta e embutida pelo embedder de texto DAQUELE espaco (e so
     assim o vetor cai na geometria certa -- Qwen3-VL e CLAP nem tem a mesma dimensao) e o
@@ -103,13 +107,34 @@ def search_architecture(arch: str, query_text: str, *, k: int = MULTI_TOP_K,
     declara (`Space.modalities`), e e a busca cross-modal que se quer aqui -- em `A+audio`
     o mesmo texto recupera pagina pelo Qwen3-VL e audio NATIVO pelo CLAP.
 
+    `only_spaces` restringe a fusao a um SUBCONJUNTO dos espacos da arquitetura; o default
+    (`None`) funde todos, que e a busca cross-modal da CLI. Quem o usa e a AVALIACAO: uma
+    tarefa doc-visual nao pode fundir o espaco do CLAP, que so indexa clipes de audio e
+    entremearia audio entre as paginas -- faria `A+audio` diferir de `A` numa tarefa em
+    que a spec (secao 5) as declara identicas. Nome fora da arquitetura (ou filtro que nao
+    sobra espaco nenhum) e `ValueError` na hora: avaliar sobre indice nenhum devolveria um
+    zero que parece metrica.
+
     `stores` e `embedders` sao injetados por `name` de espaco (producao monta a partir de
     `SPACES`; o teste passa fakes), o que mantem esta funcao sem carregar checkpoint nenhum.
     Devolve `[(item_id, score_rrf), ...]` com o melhor primeiro -- o score e o do RRF, nao
     um cosseno, e so faz sentido DENTRO deste ranking.
     """
+    espacos = architecture_spaces(arch)           # ValueError na hora se `arch` nao existe
+    if only_spaces is not None:
+        pedidos = set(only_spaces)
+        da_arquitetura = {espaco.name for espaco in espacos}
+        if not pedidos <= da_arquitetura:
+            raise ValueError(
+                f"only_spaces={sorted(pedidos)} pede espaco que nao esta na arquitetura "
+                f"{arch!r} (ela tem: {sorted(da_arquitetura)})")
+        espacos = [espaco for espaco in espacos if espaco.name in pedidos]
+        if not espacos:
+            raise ValueError(f"only_spaces vazio para a arquitetura {arch!r}: nao ha "
+                             f"espaco nenhum a consultar")
+
     rankings: list[list[str]] = []
-    for espaco in architecture_spaces(arch):      # ValueError na hora se `arch` nao existe
+    for espaco in espacos:
         if espaco.name not in stores or espaco.name not in embedders:
             faltando = "store" if espaco.name not in stores else "embedder"
             raise KeyError(f"{faltando} ausente para o espaco {espaco.name!r}, exigido pela "

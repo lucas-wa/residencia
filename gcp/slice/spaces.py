@@ -27,6 +27,7 @@ Uso:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "SPACES",
     "Space",
     "architecture_spaces",
+    "spaces_for_modalities",
 ]
 
 # Teto do indice do pgvector: uma coluna indexada por `hnsw` nao passa de 2000 dimensoes
@@ -107,3 +109,20 @@ def architecture_spaces(name: str) -> list[Space]:
             f"arquitetura desconhecida: {name!r} (conhecidas: {conhecidas})"
         ) from None
     return [SPACES[espaco] for espaco in nomes]
+
+
+def spaces_for_modalities(name: str, modalities: Iterable[str]) -> list[Space]:
+    """Espacos de `name` que indexam ALGUMA das `modalities`, na ordem da arquitetura.
+
+    E o que permite avaliar uma tarefa sem arrastar os espacos que nao tem o que dizer
+    sobre ela: numa tarefa doc-visual (`doc_image`) o CLAP nao indexa nada do corpus, e
+    fundi-lo so entremearia clipes de audio entre as paginas -- o que faria `A+audio`
+    diferir de `A` numa tarefa em que a spec (secao 5) as declara IDENTICAS.
+
+    Quem decide e o registro (`Space.modalities`), nunca o nome do espaco. Pode devolver
+    lista vazia (nenhum espaco da arquitetura indexa aquela modalidade); cabe a quem chama
+    decidir o que fazer com isso.
+    """
+    alvo = set(modalities)
+    return [espaco for espaco in architecture_spaces(name)
+            if alvo.intersection(espaco.modalities)]

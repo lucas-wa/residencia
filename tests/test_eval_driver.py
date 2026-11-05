@@ -8,11 +8,19 @@ nDCG e MRR continua sendo `benchmark.common.metrics`, ja coberto por `test_metri
 
 import csv
 
+import numpy as np
 import pytest
 
-from benchmark.common.types import Query
+from benchmark.common.types import Doc, Query
 from gcp.slice import eval as eval_mod
-from gcp.slice.eval import evaluate_architecture, write_comparison_csv
+from gcp.slice.embed_job import Hit
+from gcp.slice.eval import (
+    corpus_modalities,
+    evaluate_architecture,
+    spaces_for_corpus,
+    write_comparison_csv,
+)
+from gcp.slice.query import search_architecture
 
 
 def test_metricas_com_retriever_conhecido():
@@ -141,3 +149,102 @@ def test_csv_sem_linhas_nao_quebra(tmp_path):
     write_comparison_csv(destino, [])
 
     assert destino.exists() and destino.read_text(encoding="utf-8") == ""
+
+
+# -- modalidade do corpus -> espacos fundidos ---------------------------------------------
+#
+# A tarefa e definida pelo CORPUS, e so os espacos que indexam aquela modalidade entram na
+# fusao. E o que mantem `A` e `A+audio` IDENTICAS na tarefa doc-visual (spec secao 5).
+
+PAGINAS = [Doc(id="110002543953_p00", image_path="pages/110002543953_p00.png"),
+           Doc(id="110002543953_p01", image_path="pages/110002543953_p01.png")]
+# Formato do mini-set de audio (spec secao 3.4): `id` + `audio_path`. O id vem de
+# `collector.default_item_id` -- `<modalidade>:<hash da uri de origem>`.
+CLIPES = [{"id": "audio_asr:552e77e1bc4d355a", "audio_path": "audio_eval/audio/a.wav"},
+          {"id": "audio_asr:2aba99074d83898c", "audio_path": "audio_eval/audio/b.wav"}]
+
+
+def test_corpus_de_paginas_e_doc_visual():
+    assert corpus_modalities(PAGINAS) == {"doc_image"}
+
+
+def test_corpus_de_clipes_cobra_as_duas_trilhas_de_audio():
+    """O mesmo clipe, mesmo `item_id`: `audio_asr` no Qwen3-VL e `audio_native` no CLAP."""
+    assert corpus_modalities(CLIPES) == {"audio_asr", "audio_native"}
+
+
+def test_clipe_reconhecido_pela_extensao_quando_o_id_nao_diz():
+    assert corpus_modalities([{"id": "sessao-1", "uri": "gs://b/sessao.MP3"}]) == {
+        "audio_asr", "audio_native"}
+
+
+def test_corpus_sem_pista_e_indecidivel():
+    assert corpus_modalities([{"id": "x"}]) == set()
+
+
+def test_doc_visual_funde_so_o_qwen3vl_nas_duas_arquiteturas():
+    assert spaces_for_corpus("A", PAGINAS) == {"qwen3vl"}
+    assert spaces_for_corpus("A+audio", PAGINAS) == {"qwen3vl"}   # o CLAP fica de fora
+
+
+def test_audio_funde_os_espacos_capazes_de_cada_arquitetura():
+    assert spaces_for_corpus("A", CLIPES) == {"qwen3vl"}           # so a trilha ASR
+    assert spaces_for_corpus("A+audio", CLIPES) == {"qwen3vl", "clap"}
+
+
+def test_corpus_indecidivel_funde_todos_os_espacos():
+    """`None` = o comportamento antigo (todos os espacos da arquitetura)."""
+    assert spaces_for_corpus("A+audio", [{"id": "x"}]) is None
+
+
+class FakeStore:
+    """`VectorStore` de mentira: ranking fixo, com registro das chamadas."""
+
+    def __init__(self, ids):
+        self.ids, self.calls = ids, []
+
+    def search(self, vec, k=5, modality=None):
+        self.calls.append({"k": k})
+        return [Hit(iid, "text", f"gs://x/{iid}", 1.0 - 0.1 * pos)
+                for pos, iid in enumerate(self.ids[:k])]
+
+
+def _ranking(arch, docs, stores):
+    """O mesmo encanamento do `main()`: corpus -> espacos da tarefa -> fusao."""
+    embedders = {"qwen3vl": lambda ts: np.ones((len(ts), 4), dtype="float32"),
+                 "clap": lambda ts: np.ones((len(ts), 2), dtype="float32")}
+    return [i for i, _ in search_architecture(
+        arch, "metas para a saude publica", stores=stores, embedders=embedders,
+        only_spaces=spaces_for_corpus(arch, docs))]
+
+
+def test_doc_visual_em_Aaudio_nao_toca_o_clap_e_iguala_A():
+    """Spec secao 5: na tarefa doc-visual, `A` e `A+audio` sao IDENTICAS."""
+    paginas, clipes = ["p1", "p2", "p3"], ["audio_asr:552e77e1bc4d355a"]
+    stores_a = {"qwen3vl": FakeStore(paginas), "clap": FakeStore(clipes)}
+    stores_aa = {"qwen3vl": FakeStore(paginas), "clap": FakeStore(clipes)}
+
+    assert _ranking("A+audio", PAGINAS, stores_aa) == _ranking("A", PAGINAS, stores_a)
+    assert stores_aa["clap"].calls == []        # o CLAP nem e consultado
+
+
+def test_tarefa_de_audio_em_Aaudio_funde_os_dois_espacos():
+    clipes = ["audio_asr:552e77e1bc4d355a", "audio_asr:2aba99074d83898c"]
+    stores = {"qwen3vl": FakeStore(clipes[::-1]), "clap": FakeStore(clipes)}
+
+    ranking = _ranking("A+audio", CLIPES, stores)
+
+    assert len(stores["clap"].calls) == 1 and len(stores["qwen3vl"].calls) == 1
+    assert sorted(ranking) == sorted(clipes)
+
+
+def test_arquitetura_sem_espaco_para_o_corpus_falha_na_hora(monkeypatch):
+    """0.0 em tudo pareceria metrica: melhor parar antes de medir o nada.
+
+    Hoje nenhuma arquitetura do registro cai nesse caso (A ja cobre audio por ASR), entao
+    o que se exercita aqui e a guarda -- ela protege o dia em que o registro crescer.
+    """
+    monkeypatch.setattr(eval_mod, "spaces_for_modalities", lambda *_a, **_k: [])
+
+    with pytest.raises(ValueError, match="nao indexa nada do corpus"):
+        spaces_for_corpus("A", CLIPES, tarefa="audio_eval")

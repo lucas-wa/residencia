@@ -11,6 +11,13 @@ consulta multi-espaco de producao e a um duble no teste. Em producao quem o mont
 `main()` abaixo, adaptando `search_architecture` (que devolve `[(item_id, score_rrf), ...]`)
 para a lista de ids que as metricas esperam.
 
+Cada execucao mede UMA tarefa, e e o CORPUS que diz qual: paginas (`doc_image`) ou clipes
+de audio. So os espacos que indexam a modalidade daquele corpus entram na fusao
+(`spaces_for_corpus` -> `search_architecture(only_spaces=...)`) -- na tarefa doc-visual o
+CLAP nao indexa nada do corpus, e fundi-lo entremearia clipes de audio entre as paginas
+julgadas, fazendo `A+audio` diferir de `A` justamente onde a spec (secao 5) as declara
+IDENTICAS.
+
 As metricas NAO sao reimplementadas: vem de `benchmark/common/metrics.py`, que ja trata os
 casos de borda (query sem relevante -> 0.0 e nao NaN; `k` maior que o ranking; relevante
 fora do ranking). A lista fundida pode ser mais longa que `k` -- nao se corta antes, porque
@@ -41,12 +48,34 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from benchmark.common.metrics import aggregate, mrr, ndcg_at_k, recall_at_k  # noqa: E402
+from gcp.slice.spaces import SPACES, spaces_for_modalities  # noqa: E402
 
 log = logging.getLogger(__name__)
 
-__all__ = ["DEFAULT_K_VALUES", "evaluate_architecture", "main", "write_comparison_csv"]
+__all__ = ["DEFAULT_K_VALUES", "corpus_modalities", "evaluate_architecture", "main",
+           "spaces_for_corpus", "write_comparison_csv"]
 
 DEFAULT_K_VALUES = (1, 5, 10)
+
+# -- modalidade-alvo do conjunto de avaliacao ---------------------------------------------
+#
+# Modalidades que o registro conhece -- a uniao do que os espacos declaram indexar.
+MODALIDADES = frozenset(m for espaco in SPACES.values() for m in espaco.modalities)
+# O MESMO clipe entra no indice duas vezes, com o MESMO `item_id` (e e disso que o RRF
+# vive): como `audio_asr` (Whisper -> texto -> Qwen3-VL) e, em `A+audio`, como
+# `audio_native` (forma de onda -> CLAP). Uma tarefa de audio cobra as duas: em `A` sobra
+# so a trilha ASR (a baseline da spec secao 5), em `A+audio` as duas se fundem.
+MODALIDADES_DE_AUDIO = ("audio_asr", "audio_native")
+MODALIDADE_DE_IMAGEM = "doc_image"
+MODALIDADE_DE_TEXTO = "text"
+
+# Os nomes acima sao os MESMOS do registro: um erro de digitacao aqui nao casaria com
+# espaco nenhum e viraria uma fusao silenciosamente errada. Falha no import, nao na rodada.
+_FORA_DO_REGISTRO = ({*MODALIDADES_DE_AUDIO, MODALIDADE_DE_IMAGEM, MODALIDADE_DE_TEXTO}
+                     - MODALIDADES)
+if _FORA_DO_REGISTRO:
+    raise ValueError(f"modalidade que nenhum espaco indexa: {sorted(_FORA_DO_REGISTRO)} "
+                     f"(o registro gcp/slice/spaces.py conhece: {sorted(MODALIDADES)})")
 
 
 def _campo(item, nome: str):
@@ -87,6 +116,84 @@ def _texto(query) -> str:
         raise ValueError(f"query {_campo(query, 'id')!r} sem texto para consultar "
                          f"(text={texto!r}): este driver avalia consulta TEXTUAL")
     return texto
+
+
+def _modalidade_do_doc(doc, audio_suffixes: tuple[str, ...]) -> str | None:
+    """Modalidade de UM item do corpus, ou `None` quando nao da para dizer.
+
+    Tres sinais, nesta ordem (do mais explicito ao mais inferido):
+
+    1. o proprio `id`, quando ele carrega a modalidade -- `<modalidade>:<hash da uri>` e o
+       id que `collector.default_item_id` gera e com que `audio_collector.py` emite os
+       clipes (`audio_asr:552e77e1...`), entao e o mesmo id que o qrels referencia;
+    2. um caminho de audio (campo proprio ou extensao conhecida) -> clipe;
+    3. imagem -> `doc_image` (pagina de documento, o corpus desta fatia; uma foto seria
+       `image`, mas as duas moram no mesmo espaco, entao a distincao nao mudaria a fusao),
+       e texto nativo -> `text`.
+    """
+    doc_id = str(_campo(doc, "id") or "")
+    prefixo, _, resto = doc_id.partition(":")
+    if resto and prefixo in MODALIDADES:
+        return prefixo
+    if _campo(doc, "audio_path"):                 # campo proprio: qualquer extensao
+        return MODALIDADES_DE_AUDIO[0]
+    for campo in ("uri", "image_path", "path"):   # sem campo proprio: pela extensao
+        caminho = _campo(doc, campo)
+        if caminho and str(caminho).lower().endswith(audio_suffixes):
+            return MODALIDADES_DE_AUDIO[0]
+    if _campo(doc, "image_path"):
+        return MODALIDADE_DE_IMAGEM
+    if _campo(doc, "text"):
+        return MODALIDADE_DE_TEXTO
+    return None
+
+
+def corpus_modalities(docs) -> set[str]:
+    """Modalidades que o corpus de avaliacao cobra do indice (vazio = indecidivel).
+
+    Um clipe conta pelas DUAS modalidades de audio (`MODALIDADES_DE_AUDIO`): e o mesmo
+    item indexado pelo caminho ASR e pelo nativo, sob o mesmo `item_id`.
+
+    Conjunto vazio nao e erro -- e "nao sei dizer", e quem chama cai de volta no
+    comportamento antigo (fundir todos os espacos da arquitetura).
+    """
+    from gcp.slice.collector import AUDIO_SUFFIXES   # import tardio: so para as extensoes
+
+    modalidades: set[str] = set()
+    for doc in docs:
+        inferida = _modalidade_do_doc(doc, AUDIO_SUFFIXES)
+        if inferida in MODALIDADES_DE_AUDIO:
+            modalidades.update(MODALIDADES_DE_AUDIO)
+        elif inferida:
+            modalidades.add(inferida)
+    return modalidades
+
+
+def spaces_for_corpus(arch: str, docs, *, tarefa: str = "") -> set[str] | None:
+    """Nomes dos espacos de `arch` que indexam o corpus -- ou `None` para "todos".
+
+    E a ponte entre o conjunto de avaliacao e `search_architecture(only_spaces=...)`:
+    quem decide quais espacos indexam a modalidade do corpus e o registro
+    (`spaces.spaces_for_modalities`), nunca uma lista escrita aqui.
+
+    `ValueError` quando a arquitetura nao tem espaco algum para aquele corpus: avaliar
+    assim devolveria 0.0 em tudo -- um numero que parece metrica e nao e.
+    """
+    alvo = corpus_modalities(docs)
+    rotulo = f" ({tarefa})" if tarefa else ""
+    if not alvo:
+        log.warning("nao deu para inferir a modalidade do corpus%s: fundindo TODOS os "
+                    "espacos de %s", rotulo, arch)
+        return None
+    espacos = spaces_for_modalities(arch, alvo)
+    if not espacos:
+        raise ValueError(
+            f"a arquitetura {arch!r} nao indexa nada do corpus{rotulo} "
+            f"(modalidades: {', '.join(sorted(alvo))}): nao ha o que avaliar")
+    nomes = {espaco.name for espaco in espacos}
+    log.info("corpus%s: modalidades %s -> espacos fundidos: %s", rotulo,
+             ", ".join(sorted(alvo)), ", ".join(sorted(nomes)))
+    return nomes
 
 
 def evaluate_architecture(arch: str, queries: list[dict], qrels,
@@ -176,15 +283,22 @@ def _text_embedder(espaco, *, device: str, dtype: str) -> Callable[[list[str]], 
                      f"(kind={espaco.kind!r})")
 
 
-def _stores_e_embedders(arch: str, a: argparse.Namespace) -> tuple[dict, dict]:
+def _stores_e_embedders(arch: str, a: argparse.Namespace,
+                        apenas: set[str] | None = None) -> tuple[dict, dict]:
     """Um store e um embedder por espaco da arquitetura, na chave que `search_architecture`
     espera (`Space.name`). Com `--local-store DIR`, cada espaco reabre o seu
-    `DIR/<espaco>.json` (modo dev); sem ele, a tabela do espaco no Cloud SQL."""
+    `DIR/<espaco>.json` (modo dev); sem ele, a tabela do espaco no Cloud SQL.
+
+    `apenas` (os espacos que a tarefa vai consultar) evita abrir conexao e montar embedder
+    de espaco que nao entra na fusao -- numa rodada paga, o checkpoint do CLAP nem precisa
+    sair do disco para medir a tarefa doc-visual."""
     from gcp.slice.embed_job import InMemoryVectorStore, PgVectorStore
     from gcp.slice.spaces import architecture_spaces
 
     stores, embedders = {}, {}
     for espaco in architecture_spaces(arch):
+        if apenas is not None and espaco.name not in apenas:
+            continue
         if a.local_store:
             stores[espaco.name] = InMemoryVectorStore(
                 path=str(Path(a.local_store) / f"{espaco.name}.json"))
@@ -246,15 +360,21 @@ def main(argv: list[str] | None = None) -> int:
                  "<dir>/<espaco>.json), e nao um arquivo so")
 
     from benchmark.common.datasets import load_local
-    queries, _docs, qrels = load_local(a.data_dir)
+    queries, docs, qrels = load_local(a.data_dir)
     tarefa = a.tarefa or Path(a.data_dir).name
-    stores, embedders = _stores_e_embedders(a.arch, a)
+
+    # A tarefa manda nos espacos: so os que indexam a modalidade DESTE corpus entram na
+    # fusao. E o que mantem `A` e `A+audio` identicas na tarefa doc-visual (spec secao 5)
+    # -- fundir o CLAP ali entremearia clipes de audio entre as paginas julgadas.
+    espacos_da_tarefa = spaces_for_corpus(a.arch, docs, tarefa=tarefa)
+    stores, embedders = _stores_e_embedders(a.arch, a, apenas=espacos_da_tarefa)
 
     # `search_architecture` devolve [(item_id, score_rrf), ...]; as metricas querem so os ids
     # (e na ordem). Nao se corta em `k` aqui: cada metrica trunca no seu proprio corte.
     def retrieve(texto: str) -> list[str]:
         return [item_id for item_id, _ in search_architecture(
-            a.arch, texto, k=a.k, stores=stores, embedders=embedders)]
+            a.arch, texto, k=a.k, stores=stores, embedders=embedders,
+            only_spaces=espacos_da_tarefa)]
 
     metricas = evaluate_architecture(a.arch, queries, qrels, retrieve,
                                      k_values=tuple(a.k_values))
