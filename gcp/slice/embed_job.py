@@ -58,10 +58,13 @@ configuravel por `--password-env`), populada a partir do **Secret Manager**:
 Nada de senha em flag, em codigo ou no git.
 
 **Dimensao**: cada espaco indexa na dimensao que declara (`SPACES[...].dim` -- 1024 no
-Qwen3-VL, 512 no CLAP), e e ela o default de `--dim`. No Qwen3-VL o corte e Matryoshka/MRL
-(trunca e renormaliza, preservando o cosseno): o checkpoint entrega 2048 nativas, e o
-indice HNSW do pgvector nao aceita colunas acima de 2000 -- ver `HNSW_MAX_DIM`. Vetor que
-sair em outra largura NAO e gravado: `check_dim` aborta antes do upsert.
+Qwen3-VL, 512 no CLAP), e no Cloud SQL ela nao se negocia: a tabela e `VECTOR(dim)` e
+`--dim` diferente disso e recusado (`resolve_dim`) antes de baixar, embutir ou criar
+schema. Reduzir a largura so e aceito num indice LOCAL (`--local-store`) e em backbone
+Matryoshka/MRL -- no Qwen3-VL, truncar e renormalizar preserva o cosseno; o checkpoint
+entrega 2048 nativas, e o HNSW do pgvector nao aceita colunas acima de 2000 (ver
+`HNSW_MAX_DIM`). Vetor que sair em outra largura NAO e gravado: `check_dim` aborta antes
+do upsert.
 
 Uso:
     python -m gcp.slice.embed_job --bucket gs://govexe-bronze --blob-prefix bronze/ \
@@ -422,6 +425,44 @@ def _embed_clap(group: str, payload: list[str], *, model_id: str, device: str,
 # companhia -- o que os testes fazem -- continua valendo para o roteamento.
 EMBEDDERS = {"qwen3vl": _embed_qwen3vl, "clap": _embed_clap}
 
+# Familias com representacao Matryoshka/MRL, as unicas em que pedir outra dimensao faz
+# sentido (truncar + renormalizar preserva o cosseno). O CLAP nao esta aqui: a largura dele
+# e a da projecao do checkpoint, e `--dim` nem chega ao `embed_audio`.
+MRL_KINDS = frozenset({"qwen3vl"})
+
+
+def resolve_dim(requested: int | None, space: Space, *, local: bool) -> int:
+    """Dimensao com que este job vai indexar -- a do espaco, salvo override legitimo.
+
+    A largura da tabela de um espaco e a que o registro declara: `govexe_qwen3vl` e
+    `VECTOR(1024)` e `govexe_clap` e `VECTOR(512)`, ponto. Pedir `--dim` diferente disso no
+    Cloud SQL e pedir para criar/alimentar a tabela canonica com a largura errada, entao
+    aqui isso e `ValueError` -- antes de baixar, embutir ou criar schema.
+
+    O override so vale no indice LOCAL (`--local-store` / fake em memoria), onde nao ha
+    tabela canonica para corromper: e o que permite o modo dev rodar com embedders falsos
+    de 4 dimensoes. E so vale em familia Matryoshka (`MRL_KINDS`): num backbone que nao
+    trunca, pedir outra largura nao e override nenhum -- e so um vetor que nao vai chegar.
+    """
+    if requested is None or int(requested) == space.dim:
+        return space.dim
+    requested = int(requested)
+    if space.kind not in MRL_KINDS:
+        raise ValueError(
+            f"--dim {requested} nao se aplica ao espaco {space.name!r}: o backbone "
+            f"{space.kind} nao e Matryoshka, entrega sempre {space.dim} dimensoes e "
+            "truncar destruiria o alinhamento do espaco. Remova o --dim")
+    if not local:
+        raise ValueError(
+            f"--dim {requested} conflita com o espaco {space.name!r}, que declara "
+            f"dim={space.dim} (`SPACES[{space.name!r}].dim`): a tabela {space.table} e "
+            f"VECTOR({space.dim}) e nao aceita outra largura. Remova o --dim, ou use "
+            "--local-store se o que voce quer e um indice de desenvolvimento")
+    log.warning("--dim %d diverge da dimensao do espaco %s (%d): aceito porque o indice e "
+                "local (--local-store); a tabela %s continua sendo VECTOR(%d)",
+                requested, space.name, space.dim, space.table, space.dim)
+    return requested
+
 
 def check_dim(rows: list[ItemRow], expected: int, *, space: str) -> None:
     """Falha ANTES do upsert se a largura dos vetores nao for a do espaco.
@@ -461,14 +502,19 @@ def embed_records(records: list[dict], *, space: str = DEFAULT_SPACE,
     espaco = get_space(space)
     model_id = model_id or espaco.model_id
     dim = espaco.dim if dim is None else dim
+    # A triagem por modalidade vem ANTES do `prepare_record`: preparar custa download do
+    # Bronze e transcricao do Whisper, e um lote enderecado ao espaco errado nao pode pagar
+    # isso para so entao falhar.
+    for i, rec in enumerate(records):
+        modalidade = rec.get("modality")
+        if modalidade not in espaco.modalities:
+            raise ValueError(
+                f"o espaco {espaco.name!r} nao indexa a modalidade {modalidade!r} "
+                f"(indexa: {', '.join(espaco.modalities)}) -- record #{i} "
+                f"({rec.get('item_id') or rec.get('uri') or '?'})")
+
     preparados = [prepare_record(r, source=source, store=store, work_dir=work_dir,
                                  transcriber=transcriber) for r in records]
-    for p in preparados:
-        if p["modality"] not in espaco.modalities:
-            raise ValueError(
-                f"o espaco {espaco.name!r} nao indexa a modalidade {p['modality']!r} "
-                f"(indexa: {', '.join(espaco.modalities)}) -- item {p['item_id']!r}")
-
     embutir = EMBEDDERS[espaco.kind]
     kw = dict(model_id=model_id, device=device, dtype=dtype, batch_size=batch_size, dim=dim,
               max_pixels=max_pixels)
@@ -683,6 +729,17 @@ def table_for(args: argparse.Namespace) -> str:
             or get_space(getattr(args, "space", None) or DEFAULT_SPACE).table)
 
 
+def _is_local_index(args: argparse.Namespace, store: VectorStore | None = None) -> bool:
+    """O indice desta execucao e de desenvolvimento (fake/`--local-store`), e nao a tabela?
+
+    E o que separa "posso indexar numa largura inventada" de "vou criar a tabela canonica
+    do espaco": so o indice local nao tem um `VECTOR(n)` canonico a corromper.
+    """
+    if store is not None:
+        return not isinstance(store, PgVectorStore)
+    return bool(getattr(args, "local_store", None))
+
+
 def open_vector_store(args: argparse.Namespace) -> VectorStore:
     """`--local-store` -> fake em memoria (dev/testes); senao, Cloud SQL + pgvector."""
     local = getattr(args, "local_store", None)
@@ -774,11 +831,12 @@ def main(argv: list[str] | None = None, *, store: VectorStore | None = None,
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--dim", type=int, default=None,
-                    help="trunca o vetor para N dimensoes (Matryoshka/MRL) e renormaliza "
-                         f"(default: a dimensao do --space, {DEFAULT_DIM} no espaco "
-                         f"{DEFAULT_SPACE}; o indice HNSW do pgvector so aceita ate "
-                         f"{HNSW_MAX_DIM} dimensoes). O vetor gravado TEM de sair nessa "
-                         "largura -- divergir aborta antes do upsert")
+                    help="trunca o vetor para N dimensoes (Matryoshka/MRL) e renormaliza. "
+                         "A dimensao do indice e SEMPRE a que o --space declara "
+                         f"({DEFAULT_DIM} no espaco {DEFAULT_SPACE}; o HNSW do pgvector so "
+                         f"aceita ate {HNSW_MAX_DIM}), entao --dim diferente dela so e "
+                         "aceito com --local-store (indice de desenvolvimento) e em "
+                         "backbone Matryoshka -- fora disso, erro antes de indexar")
     ap.add_argument("--max-pixels", type=int, default=DEFAULT_MAX_PIXELS,
                     help="teto de pixels por imagem antes do encoder de visao "
                          f"(default ~1MP: {DEFAULT_MAX_PIXELS}; reduz custo em paginas "
@@ -794,13 +852,9 @@ def main(argv: list[str] | None = None, *, store: VectorStore | None = None,
     espaco = get_space(a.space)
     a.table = a.table or espaco.table
     a.model_id = a.model_id or espaco.model_id
-    if a.dim is None:
-        a.dim = espaco.dim
-    elif a.dim != espaco.dim:
-        # Legitimo em dev (fakes de 4 dimensoes) e proibido na tabela real, que ja nasceu
-        # com `VECTOR(espaco.dim)` -- por isso o aviso, alto, em vez de um erro.
-        log.warning("--dim %d diverge da dimensao do espaco %s (%d): a tabela %s so aceita "
-                    "a largura com que foi criada", a.dim, espaco.name, espaco.dim, a.table)
+    # `--dim` diferente do registro so passa num indice LOCAL -- e a checagem vem aqui, no
+    # topo, para o conflito custar zero download, zero ASR e zero GPU.
+    a.dim = resolve_dim(a.dim, espaco, local=_is_local_index(a, store))
     log.info("espaco %s: tabela %s, checkpoint %s, dim %d",
              espaco.name, a.table, a.model_id, a.dim)
 
