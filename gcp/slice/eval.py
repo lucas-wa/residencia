@@ -1,0 +1,271 @@
+"""Driver de avaliacao da fatia GovExe: roda um retriever sobre um conjunto de avaliacao
+e devolve QUALIDADE (recall@k, nDCG@k, MRR) e EFICIENCIA (latencia media por consulta).
+
+E o que fecha a comparacao entre arquiteturas (`A` x `A+audio`, registro em
+`gcp/slice/spaces.py`): cada execucao produz UMA linha -- uma arquitetura, uma tarefa --
+e `write_comparison_csv` junta as linhas no CSV que vai para o relatorio.
+
+O retriever e **injetado** (`fn(texto) -> list[item_id]`, melhor primeiro). Esse e o ponto
+de desacoplamento: aqui nao entra checkpoint, GPU nem Cloud SQL, e o mesmo driver serve a
+consulta multi-espaco de producao e a um duble no teste. Em producao quem o monta e o
+`main()` abaixo, adaptando `search_architecture` (que devolve `[(item_id, score_rrf), ...]`)
+para a lista de ids que as metricas esperam.
+
+As metricas NAO sao reimplementadas: vem de `benchmark/common/metrics.py`, que ja trata os
+casos de borda (query sem relevante -> 0.0 e nao NaN; `k` maior que o ranking; relevante
+fora do ranking). A lista fundida pode ser mais longa que `k` -- nao se corta antes, porque
+cada metrica trunca no seu proprio `k` (`ranked_ids[:k]`).
+
+Uso:
+    export PGPASSWORD="$(gcloud secrets versions access latest --secret=govexe-pg-password)"
+    CSV=results/comparacao.csv
+    python -m gcp.slice.eval --arch A       --data-dir data/govexe/planos --out "$CSV"
+    python -m gcp.slice.eval --arch A+audio --data-dir data/govexe/planos --out "$CSV"
+
+A segunda rodada ACRESCENTA a sua linha ao mesmo CSV (a anterior fica), que e como a
+comparacao entre arquiteturas se forma.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import logging
+import sys
+import time
+from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
+
+# permite tanto `python gcp/slice/eval.py` quanto `python -m gcp.slice.eval`
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from benchmark.common.metrics import aggregate, mrr, ndcg_at_k, recall_at_k  # noqa: E402
+
+log = logging.getLogger(__name__)
+
+__all__ = ["DEFAULT_K_VALUES", "evaluate_architecture", "main", "write_comparison_csv"]
+
+DEFAULT_K_VALUES = (1, 5, 10)
+
+
+def _campo(item, nome: str):
+    """Le `nome` de uma query vinda como dict OU como `benchmark.common.types.Query`.
+
+    `load_local` devolve o dataclass; os testes (e qualquer conjunto montado a mao) usam
+    dicts. Aceitar os dois evita converter o conjunto so para avaliar.
+    """
+    if isinstance(item, Mapping):
+        return item.get(nome)
+    return getattr(item, nome, None)
+
+
+def _relevantes(qrels, qid: str) -> dict[str, float]:
+    """Julgamentos da query `qid` como `{item_id: ganho}`, no formato que o nDCG espera.
+
+    Aceita as duas formas que circulam no repo: o `{qid: {docid: score}}` do `load_local`
+    e o `{qid: {docid, ...}}` binario (conjunto). Julgamento <= 0 e NEGATIVO e cai fora --
+    deixa-lo entrar inflaria o denominador do recall (`len(relevant_ids)`) com documentos
+    que nao contam como acerto.
+    """
+    rel = qrels.get(qid) if qrels else None
+    if not rel:
+        return {}
+    if isinstance(rel, Mapping):
+        return {str(d): float(s) for d, s in rel.items() if float(s) > 0}
+    return {str(d): 1.0 for d in rel}      # set/list/tuple -> binario
+
+
+def _texto(query) -> str:
+    """Texto da consulta, ou `ValueError` na hora se faltar.
+
+    `Query.text` e opcional (ha query so-imagem no dataclass), e um `retrieve(None)` so
+    estouraria la na frente, dentro do embedder, no meio de uma rodada ja paga.
+    """
+    texto = _campo(query, "text")
+    if not isinstance(texto, str) or not texto.strip():
+        raise ValueError(f"query {_campo(query, 'id')!r} sem texto para consultar "
+                         f"(text={texto!r}): este driver avalia consulta TEXTUAL")
+    return texto
+
+
+def evaluate_architecture(arch: str, queries: list[dict], qrels,
+                          retrieve: Callable[[str], list[str]], *,
+                          k_values: Iterable[int] = DEFAULT_K_VALUES) -> dict:
+    """Avalia `retrieve` sobre `queries`/`qrels` e devolve as metricas medias + latencia.
+
+    Para cada query: cronometra UMA chamada a `retrieve(texto)` (so o retrieve entra no
+    relogio -- montar as metricas nao e custo da arquitetura), calcula recall@k/nDCG@k/MRR
+    contra os julgamentos daquela query e guarda a linha; no fim, `aggregate` tira a media
+    de todas as chaves, latencia inclusa.
+
+    `arch` nao muda o calculo: viaja junto para a linha sair auto-contida no CSV comparativo.
+    Conjunto vazio devolve so `arquitetura`/`n_queries` -- metrica media de zero query seria
+    um numero inventado.
+    """
+    k_values = tuple(k_values)
+    por_query: list[dict[str, float]] = []
+    for query in queries:
+        qid = str(_campo(query, "id"))
+        texto = _texto(query)
+        relevante = _relevantes(qrels, qid)
+        relevante_ids = set(relevante)
+
+        inicio = time.perf_counter()
+        ranked_ids = [str(i) for i in retrieve(texto)]
+        latencia = time.perf_counter() - inicio
+
+        linha: dict[str, float] = {}
+        for k in k_values:
+            linha[f"recall@{k}"] = recall_at_k(ranked_ids, relevante_ids, k)
+            linha[f"ndcg@{k}"] = ndcg_at_k(ranked_ids, relevante, k)
+        linha["mrr"] = mrr(ranked_ids, relevante_ids)
+        linha["latencia_s"] = latencia
+        por_query.append(linha)
+        log.debug("%s %s: %d hits em %.3fs", arch, qid, len(ranked_ids), latencia)
+
+    if not por_query:
+        log.warning("arquitetura %s: conjunto de avaliacao vazio", arch)
+    return {"arquitetura": arch, "n_queries": len(por_query), **aggregate(por_query)}
+
+
+def write_comparison_csv(path: str | Path, rows: list[dict]) -> None:
+    """Escreve o CSV comparativo -- uma linha por (arquitetura, tarefa).
+
+    As colunas sao a UNIAO das chaves das linhas, na ordem em que aparecem: duas
+    arquiteturas avaliadas com `k_values` diferentes continuam cabendo no mesmo arquivo (o
+    que faltar fica vazio) em vez de derrubar a escrita com `ValueError: dict contains
+    fields not in fieldnames`.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    colunas: list[str] = []
+    for row in rows:
+        for coluna in row:
+            if coluna not in colunas:
+                colunas.append(coluna)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        if not colunas:
+            log.warning("nenhuma linha para %s: arquivo vazio", path)
+            return
+        w = csv.DictWriter(f, fieldnames=colunas, restval="")
+        w.writeheader()
+        w.writerows(rows)
+
+
+# -- producao: monta o retriever multi-espaco ----------------------------------------------
+
+
+def _text_embedder(espaco, *, device: str, dtype: str) -> Callable[[list[str]], object]:
+    """Embedder de TEXTO do espaco (`list[str] -> np.ndarray`), carregado sob demanda.
+
+    Import tardio de proposito: e o que mantem este modulo (e os seus testes) livres de
+    torch/transformers. A consulta de cada espaco tem de ser embutida pelo backbone DAQUELE
+    espaco -- Qwen3-VL e CLAP nem tem a mesma dimensao.
+    """
+    if espaco.kind == "qwen3vl":
+        from benchmark.models.qwen3vl_embed import embed_texts
+        # `dim` = a largura declarada do espaco: a consulta sai na mesma dimensao da tabela.
+        return lambda ts: embed_texts(ts, model_id=espaco.model_id, device=device,
+                                      dtype=dtype, dim=espaco.dim)
+    if espaco.kind == "clap":
+        from benchmark.models.clap_embed import embed_texts as clap_embed_texts
+        # o CLAP nao e Matryoshka: nada de `dim`/`dtype` (ver `embed_job._embed_clap`).
+        return lambda ts: clap_embed_texts(ts, model_id=espaco.model_id, device=device)
+    raise ValueError(f"sem embedder de texto para o espaco {espaco.name!r} "
+                     f"(kind={espaco.kind!r})")
+
+
+def _stores_e_embedders(arch: str, a: argparse.Namespace) -> tuple[dict, dict]:
+    """Um store e um embedder por espaco da arquitetura, na chave que `search_architecture`
+    espera (`Space.name`). Com `--local-store DIR`, cada espaco reabre o seu
+    `DIR/<espaco>.json` (modo dev); sem ele, a tabela do espaco no Cloud SQL."""
+    from gcp.slice.embed_job import InMemoryVectorStore, PgVectorStore
+    from gcp.slice.spaces import architecture_spaces
+
+    stores, embedders = {}, {}
+    for espaco in architecture_spaces(arch):
+        if a.local_store:
+            stores[espaco.name] = InMemoryVectorStore(
+                path=str(Path(a.local_store) / f"{espaco.name}.json"))
+        else:
+            stores[espaco.name] = PgVectorStore.connect(
+                host=a.pg_host, port=a.pg_port, dbname=a.pg_db, user=a.pg_user,
+                password_env=a.password_env, table=espaco.table)
+        embedders[espaco.name] = _text_embedder(espaco, device=a.device, dtype=a.dtype)
+    return stores, embedders
+
+
+def _linhas_anteriores(path: Path, arch: str, tarefa: str) -> list[dict]:
+    """Linhas ja gravadas em `path`, menos a desta (arquitetura, tarefa).
+
+    Cada execucao avalia UMA arquitetura, entao o CSV comparativo se forma ao longo de
+    varias: reescrever do zero apagaria a linha da rodada anterior, e so acrescentar
+    duplicaria a linha numa reexecucao.
+    """
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as f:
+        return [r for r in csv.DictReader(f)
+                if (r.get("arquitetura"), r.get("tarefa")) != (arch, tarefa)]
+
+
+def main(argv: list[str] | None = None) -> int:
+    from gcp.slice.embed_job import add_pg_arguments
+    from gcp.slice.query import MULTI_TOP_K, search_architecture
+    from gcp.slice.spaces import ARCHITECTURES
+
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--arch", required=True, choices=sorted(ARCHITECTURES),
+                    help="arquitetura a avaliar (registro em gcp/slice/spaces.py)")
+    ap.add_argument("--data-dir", required=True,
+                    help="pasta com queries.jsonl/corpus.jsonl/qrels.tsv")
+    ap.add_argument("--out", required=True, help="CSV comparativo (acumulado entre rodadas)")
+    ap.add_argument("--tarefa", default=None,
+                    help="nome da tarefa na linha do CSV (default: o nome de --data-dir)")
+    ap.add_argument("--k", type=int, default=MULTI_TOP_K,
+                    help=f"profundidade pedida a cada espaco antes do RRF (default: "
+                         f"{MULTI_TOP_K})")
+    ap.add_argument("--k-values", type=int, nargs="+", default=list(DEFAULT_K_VALUES),
+                    help="cortes das metricas (default: %(default)s)")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dtype", default="bfloat16")
+    add_pg_arguments(ap)
+    a = ap.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    # Duas flags herdadas de `add_pg_arguments` mudam de sentido numa avaliacao MULTI-espaco
+    # -- aqui nao ha uma tabela nem um indice, ha um por espaco. Falhar e melhor que aceitar
+    # a flag e ignora-la em silencio.
+    if a.table:
+        ap.error("--table nao se aplica a avaliacao multi-espaco: a tabela de cada espaco "
+                 "vem do registro (gcp/slice/spaces.py)")
+    if a.local_store is True:
+        ap.error("--local-store aqui pede um DIRETORIO (um indice por espaco, "
+                 "<dir>/<espaco>.json), e nao um arquivo so")
+
+    from benchmark.common.datasets import load_local
+    queries, _docs, qrels = load_local(a.data_dir)
+    tarefa = a.tarefa or Path(a.data_dir).name
+    stores, embedders = _stores_e_embedders(a.arch, a)
+
+    # `search_architecture` devolve [(item_id, score_rrf), ...]; as metricas querem so os ids
+    # (e na ordem). Nao se corta em `k` aqui: cada metrica trunca no seu proprio corte.
+    def retrieve(texto: str) -> list[str]:
+        return [item_id for item_id, _ in search_architecture(
+            a.arch, texto, k=a.k, stores=stores, embedders=embedders)]
+
+    metricas = evaluate_architecture(a.arch, queries, qrels, retrieve,
+                                     k_values=tuple(a.k_values))
+    linha = {"arquitetura": a.arch, "tarefa": tarefa, **metricas}
+
+    destino = Path(a.out)
+    write_comparison_csv(destino, [*_linhas_anteriores(destino, a.arch, tarefa), linha])
+    log.info("%s", "  ".join(f"{c}={v}" for c, v in linha.items()))
+    print(f"linha gravada em {destino}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
