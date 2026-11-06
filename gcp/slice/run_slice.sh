@@ -531,11 +531,6 @@ bootstrap)
         python3 -m pip install --quiet -r requirements-slurm.txt
         echo "--- adaptadores desta fatia: gcs, psycopg[binary], yt-dlp ---"
         python3 -m pip install --quiet google-cloud-storage "psycopg[binary]" yt-dlp
-        # librosa/soundfile: o decode de audio do CLAP (benchmark/models/clap_embed.py) os
-        # importa de forma LAZY e eles ainda nao estao no requirements -- sem eles, o
-        # espaco `clap` so quebraria la na frente, com a GPU ja paga.
-        echo "--- decode de audio do CLAP: librosa, soundfile ---"
-        python3 -m pip install --quiet librosa soundfile
         touch "$DEPS_MARKER"
     fi
 
