@@ -15,3 +15,4 @@ class Doc:
     id: str
     text: str | None = None
     image_path: str | None = None
+    audio_path: str | None = None
