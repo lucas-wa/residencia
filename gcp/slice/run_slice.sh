@@ -840,15 +840,25 @@ enviar_repo() {
         --exclude='data/govexe/ptbr_planos/pdf_cache' \
         --exclude=data/vidore_cache .
 
-    run gcloud compute scp "$TMP_DIR/repo.tgz" "$TMP_DIR/slice_remote.sh" \
-        "$TMP_DIR/slice_env.sh" "$VM:~/" --zone="$ZONE" --project="$PROJECT_ID" --quiet
+    # No Windows o `gcloud compute scp` delega ao `pscp.exe`, que NAO aceita `~` como
+    # destino remoto nem varios arquivos de origem de uma vez. Dai o padrao usado em todo
+    # upload daqui: um arquivo por chamada, com destino RELATIVO (o pscp resolve a partir
+    # do home de login, entao equivale ao antigo `~/`).
+    run gcloud compute scp "$TMP_DIR/repo.tgz" "$VM:repo.tgz" \
+        --zone="$ZONE" --project="$PROJECT_ID" --quiet
+    run gcloud compute scp "$TMP_DIR/slice_remote.sh" "$VM:slice_remote.sh" \
+        --zone="$ZONE" --project="$PROJECT_ID" --quiet
+    run gcloud compute scp "$TMP_DIR/slice_env.sh" "$VM:slice_env.sh" \
+        --zone="$ZONE" --project="$PROJECT_ID" --quiet
 
     # Os binarios de audio nao cabem no repo: vao a parte, para o diretorio que o script
-    # remoto usa ao reescrever `audio_path`.
+    # remoto usa ao reescrever `audio_path`. Vao num tar unico (em vez de `--recurse`)
+    # pela mesma limitacao do pscp, e sao desempacotados na VM.
     if [ -d "$REPO_DIR/$AUDIO_DIR" ]; then
-        remoto "mkdir -p ~/govexe-audio"
-        run gcloud compute scp --recurse "$REPO_DIR/$AUDIO_DIR/." "$VM:~/govexe-audio/" \
+        run tar czf "$TMP_DIR/audio.tgz" -C "$REPO_DIR/$AUDIO_DIR" .
+        run gcloud compute scp "$TMP_DIR/audio.tgz" "$VM:govexe-audio.tgz" \
             --zone="$ZONE" --project="$PROJECT_ID" --quiet
+        remoto "mkdir -p ~/govexe-audio && tar xzf ~/govexe-audio.tgz -C ~/govexe-audio"
     else
         echo "--- sem diretorio de audio ($AUDIO_DIR): nada a enviar ---"
     fi
@@ -857,7 +867,7 @@ enviar_repo() {
     # reescrever o arquivo do zero.
     if [ -f "$REPO_DIR/$OUT_CSV" ]; then
         remoto "mkdir -p ~/residencia/$(dirname "$OUT_CSV")"
-        run gcloud compute scp "$REPO_DIR/$OUT_CSV" "$VM:~/residencia/$OUT_CSV" \
+        run gcloud compute scp "$REPO_DIR/$OUT_CSV" "$VM:residencia/$OUT_CSV" \
             --zone="$ZONE" --project="$PROJECT_ID" --quiet
     fi
 }
