@@ -878,10 +878,10 @@ coletar_resultados() {
     echo "--- trazendo $OUT_CSV e os logs da VM (teto: ${RESGATE_TIMEOUT}s por arquivo) ---"
     run mkdir -p "$REPO_DIR/$(dirname "$OUT_CSV")" "$REPO_DIR/logs" || true
     com_timeout "$RESGATE_TIMEOUT" \
-        gcloud compute scp "$VM:~/residencia/$OUT_CSV" "$REPO_DIR/$OUT_CSV" \
+        gcloud compute scp "$VM:residencia/$OUT_CSV" "$REPO_DIR/$OUT_CSV" \
             --zone="$ZONE" --project="$PROJECT_ID" --quiet || return 1
     com_timeout "$RESGATE_TIMEOUT" \
-        gcloud compute scp "$VM:~/proxy.log" "$REPO_DIR/logs/proxy-$VM.log" \
+        gcloud compute scp "$VM:proxy.log" "$REPO_DIR/logs/proxy-$VM.log" \
             --zone="$ZONE" --project="$PROJECT_ID" --quiet || true
     RESULTADOS_COLETADOS=1
     return 0
