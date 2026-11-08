@@ -78,6 +78,10 @@
 # ResolutionImpossible aqui; so entao vale reavaliar.
 
 transformers>=4.57,<5
+# transformers renderiza o chat template do Qwen3-VL (apply_chat_template, usado em
+# qwen3vl_embed.embed_images) via jinja, e exige jinja2>=3.1.0; a imagem DLVM traz 3.0.3,
+# que quebra com "ImportError: apply_chat_template requires jinja2>=3.1.0". Pin minimo.
+jinja2>=3.1.0
 colpali-engine>=0.3.10,<0.4
 sentence-transformers>=3.0
 open_clip_torch>=2.24
@@ -153,6 +157,17 @@ soxr>=0.3.2
 # instala sob demanda com --no-deps, como o bitsandbytes do QLoRA.
 # E dep de GPU/VM: os testes offline usam o `FakeTranscriber` e nao precisam dela.
 faster-whisper>=1.0
+
+# Decode de audio do CLAP (`benchmark/models/clap_embed.py`, import LAZY): o espaco `clap`
+# le a forma de onda NATIVA dos clipes e precisa de librosa (resample + leitura) com
+# soundfile como backend de I/O. Mesma regra do topo deste arquivo que o faster-whisper
+# acima: NENHUM dos dois arrasta torch para o --user -- librosa puxa numba/llvmlite/
+# audioread/soxr/scipy/soundfile e soundfile puxa cffi, nada com torch na arvore -- entao
+# entram aqui com seguranca. Vinham sendo instalados ad-hoc no bootstrap da fatia GCP
+# (gcp/slice/run_slice.sh); agora que estao no requirements, o espaco `clap` nao quebra
+# mais la na frente com a GPU ja paga.
+librosa>=0.10
+soundfile>=0.12
 
 mteb>=1.14
 datasets>=2.19

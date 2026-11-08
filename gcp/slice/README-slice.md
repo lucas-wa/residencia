@@ -6,21 +6,40 @@ unificado** `Qwen/Qwen3-VL-Embedding-2B` (o mesmo wrapper do benchmark:
 
 É a validação prática da **Abordagem A** de `fusao/multimodal.md` (§2): **quatro
 modalidades no mesmo índice, pelo mesmo modelo, no mesmo espaço vetorial** — uma consulta
-textual recupera página de documento, foto, texto nativo e áudio transcrito do **mesmo**
-`govexe_items`.
+textual recupera página de documento, foto, texto nativo e áudio transcrito da **mesma**
+tabela `govexe_qwen3vl`.
+
+Sobre ela a fatia ganhou um **segundo espaço**: `govexe_clap` (áudio **nativo**). Um
+**espaço** é um modelo com a sua própria geometria — checkpoint, dimensão e **tabela
+própria** —, e uma **arquitetura** é a lista de espaços que ela consulta:
+
+| Arquitetura | Espaços | Tabelas |
+|---|---|---|
+| `A` | `qwen3vl` | `govexe_qwen3vl` |
+| `A+áudio` | `qwen3vl` + `clap` | `govexe_qwen3vl` + `govexe_clap` |
+
+O registro declarativo (fonte única de verdade de tabela, checkpoint, dimensão e
+modalidades de cada espaço) é `gcp/slice/spaces.py`; `embed_job --space` e a consulta
+multi-espaço só o leem. Espaços **não** se somam: os dois rankings se encontram na **fusão
+por RRF** (`gcp/slice/fusion.py`) — posição, nunca score, porque a similaridade de espaços
+diferentes não se compara.
 
 ```
 páginas (*.png) · fotos (*.jpg) · textos · áudios (*.mp3)
         │  collector.py            (Bronze, particionado por fonte/data; JSONL de records)
         ▼
   gs://<bucket>/bronze/fonte=<fonte>/dt=YYYY-MM-DD/<arquivo>
-        │  embed_job.py            (VM L4 g2-standard-4, EFÊMERA)
-        │     ├─ doc_image · image  → embed_images()   ─┐  MESMO checkpoint,
-        │     ├─ text               → embed_texts()    ─┤  MESMO dim, L2-norm
-        │     └─ audio_asr → Whisper large-v3 (asr.py) → embed_texts()  ─┘
-        ▼
-  Cloud SQL (PostgreSQL + pgvector) · tabela govexe_items · UPSERT por item_id
-        │  query.py                (texto → embedding → top-k por `<=>`, `--modality`)
+        │  embed_job.py --space    (VM L4 g2-standard-4, EFÊMERA)
+        │
+        │  --space qwen3vl                           --space clap
+        │     ├─ doc_image · image → embed_images() ─┐    └─ audio_native →
+        │     ├─ text              → embed_texts()  ─┤       embed_audio() (CLAP)
+        │     └─ audio_asr → Whisper (asr.py)       ─┘       forma de onda, SEM ASR
+        ▼                                            ▼
+  Cloud SQL (PostgreSQL + pgvector) — UMA TABELA POR ESPAÇO, UPSERT por item_id
+    govexe_qwen3vl  VECTOR(1024)                 govexe_clap  VECTOR(512)
+        │  query.py       (espaço único: texto → top-k por `<=>`, `--modality`)
+        │  eval.py        (multi-espaço: top-k de cada espaço → RRF → métricas)
         ▼
   top-k itens — de qualquer modalidade (cross-modal), com crédito e pointer
 ```
@@ -30,23 +49,31 @@ páginas (*.png) · fotos (*.jpg) · textos · áudios (*.mp3)
 | `gcp/slice/audio_collector.py` | máquina local ou Cloud Shell | baixa áudio de fonte pública (yt-dlp) e emite os records `audio_asr` |
 | `gcp/slice/collector.py` | máquina local ou Cloud Shell | sobe páginas, fotos e áudios para o bucket **Bronze**; enriquece o JSONL de records |
 | `gcp/slice/asr.py` | VM L4 (dentro do job) | **Whisper large-v3** atrás da interface `Transcriber` (áudio → texto) |
-| `gcp/slice/embed_job.py` | **VM L4 efêmera** | baixa do Bronze, roteia por modalidade, embute e faz **upsert** no pgvector |
-| `gcp/slice/query.py` | VM ou Cloud Shell (com proxy) | consulta texto → top-k itens, com filtro `--modality` |
+| `gcp/slice/spaces.py` | — (registro) | declara espaços (tabela, checkpoint, dimensão, modalidades) e arquiteturas |
+| `gcp/slice/embed_job.py` | **VM L4 efêmera** | baixa do Bronze, roteia por modalidade, embute no espaço do `--space` e faz **upsert** no pgvector |
+| `gcp/slice/fusion.py` | onde a consulta rodar | **RRF**: funde os rankings de espaços diferentes por posição |
+| `gcp/slice/query.py` | VM ou Cloud Shell (com proxy) | CLI de **espaço único**: texto → top-k, com filtro `--modality`; e `search_architecture`, a consulta multi-espaço |
+| `gcp/slice/eval.py` | VM ou Cloud Shell (com proxy) | roda um conjunto de avaliação por arquitetura → recall@k/nDCG@k/MRR + latência no CSV comparativo |
+| `gcp/slice/run_slice.sh` | máquina local | orquestra a rodada paga inteira (provisiona → indexa → avalia → **teardown garantido**) |
 
 ## Modalidades indexadas
 
-| `modality` | O que é | Como vira vetor | Campos típicos |
-|---|---|---|---|
-| `doc_image` | página de plano de governo rasterizada | `embed_images()` | `uri` = objeto no Bronze |
-| `image` | foto de agência pública (EBC, Agência Câmara…) | `embed_images()` | `credit` **obrigatório**, `pointer_uri` = foto original |
-| `text` | texto nativo (matéria, legenda, ementa) | `embed_texts()` | `content_text`, `uri` da matéria; `pointer_uri` NULL |
-| `audio_asr` | áudio (sessão, RadioAgência) | ASR (Whisper) → `embed_texts()` | `content_text` = **transcrição**, `pointer_uri` = áudio original |
+| `modality` | Espaço | O que é | Como vira vetor | Campos típicos |
+|---|---|---|---|---|
+| `doc_image` | `qwen3vl` | página de plano de governo rasterizada | `embed_images()` | `uri` = objeto no Bronze |
+| `image` | `qwen3vl` | foto de agência pública (EBC, Agência Câmara…) | `embed_images()` | `credit` **obrigatório**, `pointer_uri` = foto original |
+| `text` | `qwen3vl` | texto nativo (matéria, legenda, ementa) | `embed_texts()` | `content_text`, `uri` da matéria; `pointer_uri` NULL |
+| `audio_asr` | `qwen3vl` | áudio (sessão, RadioAgência) | ASR (Whisper) → `embed_texts()` | `content_text` = **transcrição**, `pointer_uri` = áudio original |
+| `audio_native` | `clap` | o **mesmo** áudio, como forma de onda | `embed_audio()` (CLAP) | sem `content_text` (não há transcrição); `pointer_uri` = áudio original |
 
-> **Áudio não tem embedder próprio aqui.** Ele é colapsado em texto pelo Whisper
-> (*pointer vector*, `fusao/multimodal.md` §3 e §4) e embutido pelo **mesmo**
-> `Qwen3-VL-Embedding` que embute as imagens — por isso tudo cai no mesmo espaço e um
-> único índice basta. Embedding **nativo** de áudio (CLAP) e *ensemble* multi-modelo são
-> outros objetivos, fora desta fatia.
+> **No espaço `qwen3vl` o áudio não tem embedder próprio.** Ele é colapsado em texto pelo
+> Whisper (*pointer vector*, `fusao/multimodal.md` §3 e §4) e embutido pelo **mesmo**
+> `Qwen3-VL-Embedding` que embute as imagens — por isso as quatro modalidades caem no
+> mesmo espaço e um único índice basta. O embedding **nativo** de áudio é o espaço `clap`
+> (`--space clap`, tabela própria): o **mesmo clipe**, com o **mesmo `item_id`**, indexado
+> em paralelo pelos dois caminhos — e é esse `item_id` compartilhado que permite ao RRF
+> somar as contribuições. *Ensemble* multi-modelo sobre a mesma modalidade continua fora
+> desta fatia.
 
 **Custo e disciplina:** a VM L4 só fica ligada durante a ingestão (`start` → job →
 `stop`/`delete`); o Cloud SQL é parado ou apagado no fim (§9). A senha do banco **nunca**
@@ -67,7 +94,7 @@ export ZONE="us-central1-a"                     # zona com L4 disponível
 export BUCKET="gs://${PROJECT_ID}-bronze"
 export INSTANCE="govexe-pg"
 export DB="govexe"
-export DB_USER="govexe"
+export DB_USER="postgres"                       # o superusuário que a instância já traz
 export SECRET="govexe-pg-password"
 export VM="govexe-embed"
 export DT="$(date +%F)"                         # partição dt=YYYY-MM-DD
@@ -125,15 +152,18 @@ gcloud sql instances create "$INSTANCE" \
 
 gcloud sql databases create "$DB" --instance="$INSTANCE"
 
-gcloud sql users create "$DB_USER" \
+# `postgres` já existe na instância: o que falta é dar a ele a senha do Secret Manager.
+gcloud sql users set-password "$DB_USER" \
     --instance="$INSTANCE" \
     --password="$(gcloud secrets versions access latest --secret=$SECRET)"
 ```
 
 > `--tier=db-g1-small` é mais barato e também dá conta desta fatia (algumas centenas de
-> páginas). O `--password=` acima deixa a senha no histórico do shell da sua máquina —
-> se isso incomodar, use `gcloud sql users set-password "$DB_USER" --instance="$INSTANCE"
-> --prompt-for-password` e cole o valor do secret.
+> páginas). O `--password=` acima deixa a senha no histórico do shell da sua máquina (e na
+> tabela de processos enquanto o `gcloud` roda) — se isso incomodar, use
+> `gcloud sql users set-password "$DB_USER" --instance="$INSTANCE" --prompt-for-password`
+> e cole o valor do secret. O `run_slice.sh` faz exatamente este `set-password` (com
+> `users create` como fallback) e mantém a linha fora do log.
 
 **Habilitar o pgvector** (uma vez, dentro do banco):
 
@@ -147,12 +177,20 @@ CREATE EXTENSION IF NOT EXISTS vector;
 \dx                       -- confirma: vector | 0.8.x | public
 ```
 
-**Tabela**: o `embed_job.py` a cria sozinho no primeiro upsert (ele conhece a dimensão
-com que está indexando). Para criar à mão, use a mesma dimensão do `--dim` do job (1024
-por padrão):
+**Tabelas — uma por espaço.** O `embed_job.py` as cria sozinho no primeiro upsert (ele lê
+tabela e dimensão do registro, `gcp/slice/spaces.py`, a partir do `--space`). Duas tabelas,
+mesmo DDL, dimensões diferentes — espaços distintos não são comparáveis no mesmo índice:
+
+| `--space` | Tabela | `VECTOR(n)` | Checkpoint | Modalidades |
+|---|---|---|---|---|
+| `qwen3vl` (default) | `govexe_qwen3vl` | 1024 | `Qwen/Qwen3-VL-Embedding-2B` | `doc_image`, `image`, `text`, `audio_asr` |
+| `clap` | `govexe_clap` | 512 | `laion/larger_clap_general` | `audio_native` |
+
+Para criar à mão, use a dimensão que o espaço declara (`{table}`/`{dim}` abaixo saem do
+registro — é literalmente o DDL do `embed_job.py`):
 
 ```sql
-CREATE TABLE IF NOT EXISTS govexe_items (
+CREATE TABLE IF NOT EXISTS govexe_qwen3vl (     -- govexe_clap: idem, com VECTOR(512)
     item_id        TEXT PRIMARY KEY,
     modality       TEXT NOT NULL,          -- doc_image | image | text | audio_asr
     source         TEXT NOT NULL,
@@ -162,13 +200,13 @@ CREATE TABLE IF NOT EXISTS govexe_items (
     content_text   TEXT,                   -- texto nativo OU transcrição ASR
     content_sha256 TEXT NOT NULL,
     model_id       TEXT NOT NULL,
-    embedding      VECTOR(1024) NOT NULL,  -- = --dim do embed_job (teto do HNSW: 2000)
+    embedding      VECTOR(1024) NOT NULL,  -- = a dimensão do espaço (teto do HNSW: 2000)
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS govexe_items_embedding_cos
-    ON govexe_items USING hnsw (embedding vector_cosine_ops);
-CREATE INDEX IF NOT EXISTS govexe_items_modality
-    ON govexe_items (modality);            -- apoia o `--modality` do query.py
+CREATE INDEX IF NOT EXISTS govexe_qwen3vl_embedding_cos
+    ON govexe_qwen3vl USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS govexe_qwen3vl_modality
+    ON govexe_qwen3vl (modality);          -- apoia o `--modality` do query.py
 ```
 
 > **Teto de 2000 dimensões.** O índice do pgvector (`hnsw` e também `ivfflat`) não aceita
@@ -193,24 +231,28 @@ CREATE INDEX IF NOT EXISTS govexe_items_modality
 modalidades de imagem e o próprio texto embutido (a transcrição, no caso do áudio) nas de
 texto.
 
-> **Migração `govexe_pages` → `govexe_items`.** A tabela antiga não é alterada nem
-> apagada pelo job: `govexe_items` é uma tabela **nova** (superset — `page_id` virou
-> `item_id` e entraram `modality`, `pointer_uri`, `credit`, `content_text`). Como o
-> Cloud SQL desta fatia é efêmero, o caminho normal é **reingerir** o corpus no
-> `govexe_items` (o `embed_job.py` cria tabela e índices no primeiro upsert). Para
-> aproveitar uma `govexe_pages` já populada com a mesma `--dim`, sem reprocessar GPU:
+> **Tabelas antigas (`govexe_pages`, `govexe_items`).** Nenhuma das duas é alterada ou
+> apagada pelo job — e nenhuma é mais usada: cada espaço tem a **sua** tabela
+> (`govexe_qwen3vl`, `govexe_clap`), que é o que torna possível indexar geometrias
+> diferentes lado a lado. Como o Cloud SQL desta fatia é **efêmero** (o `run_slice.sh` o
+> apaga no teardown de toda rodada), não há migração a fazer: o caminho é **reingerir**,
+> e o `embed_job.py` cria tabela e índices no primeiro upsert. Para aproveitar uma
+> `govexe_items` já populada com a mesma dimensão, sem reprocessar GPU:
 >
 > ```sql
-> INSERT INTO govexe_items
->     (item_id, modality, source, uri, content_sha256, model_id, embedding, updated_at)
-> SELECT page_id, 'doc_image', source, uri, content_sha256, model_id, embedding, updated_at
-> FROM govexe_pages
+> INSERT INTO govexe_qwen3vl
+>     (item_id, modality, source, uri, pointer_uri, credit, content_text,
+>      content_sha256, model_id, embedding, updated_at)
+> SELECT item_id, modality, source, uri, pointer_uri, credit, content_text,
+>        content_sha256, model_id, embedding, updated_at
+> FROM govexe_items
 > ON CONFLICT (item_id) DO NOTHING;
 > ```
 >
-> (Rode o `embed_job.py` uma vez antes, para a tabela e os índices existirem.) Quem
-> quiser continuar na tabela antiga passa `--table govexe_pages` — mas aí o DDL novo não
-> bate com a tabela velha; prefira reingerir.
+> (Rode o `embed_job.py` uma vez antes, para a tabela e os índices existirem.) `--table
+> <nome>` ainda existe e sobrescreve a tabela do espaço — mas ele **não** muda checkpoint
+> nem dimensão, então apontá-lo para uma tabela de outro espaço é erro na certa; use-o só
+> para indexar o MESMO espaço num nome diferente, e passe o mesmo `--table` ao `query.py`.
 
 ## 5. Coletor → Bronze (da máquina local)
 
@@ -278,7 +320,8 @@ transcreve nada**:
 ```
 audio_collector.py   URL pública  → áudio local + records      (local / Cloud Shell)
 collector.py         records      → binário no Bronze + blob/uri
-embed_job.py         records      → ASR (asr.py) → embed_texts → govexe_items
+embed_job.py         records      → ASR (asr.py) → embed_texts → govexe_qwen3vl
+                     (ou, com --space clap, o MESMO clipe → embed_audio → govexe_clap)
 ```
 
 ```bash
@@ -340,13 +383,24 @@ gcloud compute instances create "$VM" \
     --machine-type=g2-standard-4 \
     --accelerator=type=nvidia-l4,count=1 \
     --maintenance-policy=TERMINATE \
-    --image-family=common-cu124-ubuntu-2204-py310 \
+    --image-family=pytorch-2-9-cu129-ubuntu-2204-nvidia-580 \
     --image-project=deeplearning-platform-release \
     --boot-disk-size=200GB \
     --boot-disk-type=pd-balanced \
     --metadata="install-nvidia-driver=True" \
     --scopes=https://www.googleapis.com/auth/cloud-platform
 ```
+
+> **A família de imagem importa.** `pytorch-2-9-cu129-ubuntu-2204-nvidia-580` (torch 2.9 +
+> CUDA 12.9 + driver 580) é a que funcionou de ponta a ponta — é o default do
+> `run_slice.sh`. O venv da VM é criado com `--system-site-packages` **de propósito**: ele
+> enxerga o torch da imagem, já casado com o driver. Reinstalar torch por `pip` (direta ou
+> indiretamente, por uma dependência que o declare) sombreia o torch bom com um sem as
+> libs CUDA do nó — o `run_slice.sh` chega a remover um torch de venv se encontrar.
+>
+> **L4 dá STOCKOUT.** Na rodada real nenhuma zona `us-*` tinha capacidade de
+> `g2-standard-4`; só `northamerica-northeast2-a`. Por isso o `run_slice.sh` tenta uma
+> lista de zonas em ordem (`--zones`) em vez de uma só.
 
 Liga/desliga (a VM parada **não** cobra vCPU/GPU, só o disco):
 
@@ -369,11 +423,17 @@ git clone <URL-DO-REPO> residencia && cd residencia
 python3 -m venv --system-site-packages .venv-gcp && source .venv-gcp/bin/activate
 pip install -r requirements-slurm.txt        # mesmas deps do run_gcp.sh (sem torch)
 pip install google-cloud-storage "psycopg[binary]"   # adaptadores desta fatia
+pip install librosa soundfile                # só para --space clap (decode de áudio)
 ```
+
+> O venv é `--system-site-packages` **de propósito**: o torch tem de ser o da imagem (§6).
 
 O `faster-whisper` (ASR da modalidade `audio_asr`) já vem no `requirements-slurm.txt`;
 os pesos do `large-v3` só são baixados na **primeira transcrição** (import *lazy*), e um
-lote sem áudio nunca os toca.
+lote sem áudio nunca os toca. `librosa`/`soundfile` são a mesma história para o CLAP: o
+wrapper os importa *lazy*, então uma rodada `--arch A` não precisa deles — mas sem eles o
+`--space clap` só quebraria lá na frente, com a GPU já paga (por isso o `run_slice.sh` os
+instala no bootstrap e valida o import antes de indexar).
 
 Cloud SQL Auth Proxy (expõe o banco em `127.0.0.1:5432`, sem abrir IP público):
 
@@ -395,14 +455,22 @@ python -m gcp.slice.embed_job \
     --blob-prefix "bronze/fonte=tse_planos/dt=$DT/" \
     --work-dir /tmp/govexe-bronze \
     --source tse_planos \
-    --device cuda --batch-size 8 --dim 1024 \
+    --space qwen3vl \
+    --device cuda --batch-size 8 \
     --pg-host 127.0.0.1 --pg-port 5432 --pg-db "$DB" --pg-user "$DB_USER"
 ```
 
-Saída esperada: `N itens gravados; total no índice: N`.
+Saída esperada: `espaco qwen3vl: tabela govexe_qwen3vl, checkpoint …, dim 1024` e, no fim,
+`N itens gravados; total no índice: N`.
 
-**Lote misto** (foto + texto + áudio, do JSONL da §5.1) — o mesmo job, mesmo índice,
-mesmo checkpoint; o que muda é só a entrada:
+`--space` é **a** flag que decide a rodada: dela saem tabela, checkpoint, dimensão e as
+modalidades aceitas (tudo de `gcp/slice/spaces.py`). O default é `qwen3vl` — a Abordagem
+A —, então a linha acima é a mesma de sempre. Modalidade fora do espaço é erro antes de
+qualquer GPU: um record `audio_native` em `--space qwen3vl` (ou `doc_image` em
+`--space clap`) para na validação do lote.
+
+**Lote misto** (foto + texto + áudio, do JSONL da §5.1) — o mesmo job, mesmo espaço, mesmo
+checkpoint; o que muda é só a entrada:
 
 ```bash
 python -m gcp.slice.embed_job \
@@ -410,27 +478,38 @@ python -m gcp.slice.embed_job \
     --records-store "$BUCKET" \
     --work-dir /tmp/govexe-bronze \
     --asr-backend faster-whisper --asr-model large-v3 --asr-language pt \
-    --device cuda --batch-size 8 --dim 1024 \
+    --device cuda --batch-size 8 \
     --pg-host 127.0.0.1 --pg-port 5432 --pg-db "$DB" --pg-user "$DB_USER"
 ```
 
 O job separa o lote internamente (`doc_image`/`image` → `embed_images`;
 `text`/`audio_asr` → `embed_texts`), transcreve os áudios antes de embutir (log
-`asr: <arquivo> -> N caracteres`) e grava tudo na mesma tabela, na ordem do lote.
+`asr: <arquivo> -> N caracteres`) e grava tudo na tabela do espaço, na ordem do lote.
 
-> **Migração: já ingeriu com `--dim 2048`?** O default do `--dim` passou de **2048** para
-> **1024** (§4). A dimensão faz parte do *tipo da coluna*, então uma tabela `govexe_pages`
-> criada antes disso continua `VECTOR(2048)` e **recusa** os vetores de 1024 no upsert
-> (`expected 2048 dimensions, not 1024`) — o `CREATE TABLE IF NOT EXISTS` do job não
-> altera tabela existente. Antes de reingerir, derrube a tabela (o `embed_job.py` a recria
-> com a dimensão nova, junto do índice HNSW, no primeiro upsert):
->
-> ```sql
-> DROP TABLE IF EXISTS govexe_pages;    -- leva o índice HNSW junto
-> ```
->
-> Para preservar a ingestão antiga, indexe em outra tabela: passe o mesmo `--table <nome>`
-> ao `embed_job.py` e ao `query.py` (§8).
+**Áudio nativo (arquitetura A+áudio)** — os **mesmos** clipes, agora como forma de onda,
+no segundo espaço. O `item_id` é preservado (é ele que liga o clipe nos dois espaços e o
+que o RRF soma); o que muda é a `modality`, que passa a `audio_native`:
+
+```bash
+# o run_slice.sh reescreve `modality` para audio_native antes desta chamada
+python -m gcp.slice.embed_job \
+    --records audios-native.jsonl \
+    --space clap \
+    --device cuda --batch-size 1 \
+    --pg-host 127.0.0.1 --pg-port 5432 --pg-db "$DB" --pg-user "$DB_USER"
+```
+
+Aqui **não há ASR**: o CLAP embute o binário direto (`benchmark/models/clap_embed.py`,
+que importa `librosa`/`soundfile` de forma *lazy* — instale-os na VM). A tabela é
+`govexe_clap`, com `VECTOR(512)`.
+
+> **A dimensão não é negociável por flag.** Ela é o *tipo da coluna* e vem do espaço
+> (1024 no `qwen3vl`, 512 no `clap`). `--dim` diferente do registro só é aceito com
+> `--local-store` (índice de desenvolvimento) e em backbone Matryoshka — no Cloud SQL o
+> job falha **antes** do DDL, em vez de produzir um upsert que o pgvector recusaria
+> (`expected 1024 dimensions, not …`). Se uma tabela antiga ficou com a dimensão errada, o
+> `CREATE TABLE IF NOT EXISTS` não a altera: derrube-a (`DROP TABLE IF EXISTS
+> govexe_qwen3vl;` leva o índice HNSW junto) e reingira.
 
 ## 8. Consulta cross-modal e prova de idempotência
 
@@ -464,16 +543,44 @@ python -m gcp.slice.query --text "sessao sobre saneamento" --modality audio_asr 
     --pg-host 127.0.0.1 --pg-db "$DB" --pg-user "$DB_USER"
 ```
 
+> A CLI do `query.py` é de **espaço único**: sem `--table` ela consulta a tabela do espaço
+> default (`govexe_qwen3vl`). Quem funde espaços é `search_architecture` (a consulta
+> multi-espaço do mesmo módulo), usada pelo `eval.py` da §8.1.
+
+### 8.1 Avaliação por arquitetura (o CSV comparativo)
+
+```bash
+python -m gcp.slice.eval --arch A       --data-dir data/govexe/ptbr_planos \
+    --out results/comparacao.csv --pg-host 127.0.0.1 --pg-db "$DB" --pg-user "$DB_USER"
+python -m gcp.slice.eval --arch A+audio --data-dir data/govexe/ptbr_planos \
+    --out results/comparacao.csv --pg-host 127.0.0.1 --pg-db "$DB" --pg-user "$DB_USER"
+```
+
+Cada execução escreve **uma linha por (arquitetura, tarefa)** no mesmo CSV (recall@k,
+nDCG@k, MRR e latência média por consulta); a linha da rodada anterior fica. `--table`
+não se aplica aqui (cada espaço tem a sua, pelo registro) e `--local-store` pede um
+**diretório** (`<dir>/<espaço>.json`, um índice por espaço).
+
+Quem decide os espaços da rodada é a dupla **arquitetura × corpus**: só entram na fusão os
+espaços que indexam a modalidade daquele conjunto de avaliação. Num corpus de páginas
+(`doc_image`), o `clap` não indexa nada do corpus e fica de fora — por isso `A` e
+`A+áudio` dão a **mesma** linha na tarefa doc-visual, como o protocolo de avaliação exige.
+Num corpus de clipes, `A` mede a trilha ASR→texto e `A+áudio` funde ASR + CLAP nativo.
+
 **Idempotência** — rode o `embed_job.py` do §7 uma segunda vez, sem mudar nada, e
 compare as contagens antes/depois:
 
 ```sql
 -- gcloud sql connect "$INSTANCE" --user="$DB_USER" --database="$DB"
-SELECT count(*) AS linhas, count(DISTINCT item_id) AS itens FROM govexe_items;
-SELECT modality, count(*) FROM govexe_items GROUP BY modality ORDER BY modality;
+SELECT count(*) AS linhas, count(DISTINCT item_id) AS itens FROM govexe_qwen3vl;
+SELECT modality, count(*) FROM govexe_qwen3vl GROUP BY modality ORDER BY modality;
 SELECT item_id, modality, left(uri, 50) AS uri, left(credit, 30) AS credito,
        left(content_sha256, 12) AS sha, updated_at
-FROM govexe_items ORDER BY item_id LIMIT 10;
+FROM govexe_qwen3vl ORDER BY item_id LIMIT 10;
+
+-- A+áudio: o mesmo clipe nos dois espaços, sob o MESMO item_id (a chave do RRF)
+SELECT modality, count(*) FROM govexe_clap GROUP BY modality;
+SELECT q.item_id FROM govexe_qwen3vl q JOIN govexe_clap c USING (item_id);
 ```
 
 `linhas == itens` e o total **não muda** entre as duas execuções: o upsert é
@@ -497,13 +604,24 @@ gcloud compute instances list
 gcloud sql instances list
 ```
 
+> **Numa rodada orquestrada, isto é automático.** O `gcp/slice/run_slice.sh` apaga VM e
+> instância Cloud SQL num `trap … EXIT` — no sucesso, no erro, no Ctrl-C e na queda do
+> terminal —, traz o CSV **antes** dos deletes e **asserta** no fim que nada sobrou (se
+> sobrou, grita `LEAK` e sai com status 70). Ele é **dono do ciclo de vida** desses dois
+> recursos: não o aponte para uma instância que você queira manter.
+>
+> ```bash
+> bash gcp/slice/run_slice.sh --arch A --dry-run     # imprime a rodada, não toca a nuvem
+> bash gcp/slice/run_slice.sh --arch A+audio 2>&1 | tee logs/run_slice.log
+> ```
+
 ## 10. Onde tirar os prints (prova da entrega)
 
 | # | Print | Onde, no console |
 |---|---|---|
 | 1 | **VM L4 ativa** | Compute Engine → *Instâncias de VM*: `govexe-embed`, `g2-standard-4`, status **RUNNING** (+ o `nvidia-smi` do §7 no terminal) |
 | 2 | **Bronze populado** | Cloud Storage → o bucket → `bronze/fonte=tse_planos/dt=<data>/` com os PNGs |
-| 3 | **Tabela populada** | SQL → a instância → **Cloud SQL Studio** → resultado do `SELECT count(*) …`, do `GROUP BY modality` e das 10 linhas do §8 |
+| 3 | **Tabela populada** | SQL → a instância → **Cloud SQL Studio** → resultado do `SELECT count(*) …`, do `GROUP BY modality` e das 10 linhas do §8 (em `A+áudio`, também o `GROUP BY` de `govexe_clap`) |
 | 4 | **Consulta cross-modal** | terminal da VM com a saída do `query.py` (top-5 com score, `[modalidade]`, crédito e `gs://…`) + a mesma consulta com `--modality` |
 | 5 | **Idempotência** | os dois `SELECT count(*)` (antes/depois da 2ª ingestão) com o mesmo total |
 | 6 | **Teardown** | Compute Engine sem instâncias e SQL apagado/STOPPED (saída do §9) |

@@ -16,6 +16,7 @@ finetune/runs/
 data/govexe/pages/
 data/govexe/ptbr_planos/pages/
 data/govexe/ptbr_planos/pdf_cache/
+data/govexe/audio_eval/audio/
 data/vidore_cache/
 *.parquet
 

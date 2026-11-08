@@ -14,6 +14,14 @@ Como os dois lados saem L2-normalizados, cosseno = produto interno; no Cloud SQL
 ordena e o operador `<=>` do pgvector (`PgVectorStore.search`), e na logica testavel
 (`rank_top_k` / `InMemoryVectorStore`) e um produto interno em memoria -- mesmo ranking.
 
+Acima disso ha a consulta MULTI-ESPACO (`search_architecture`): a arquitetura `A+audio`
+soma ao Qwen3-VL o indice do CLAP (audio nativo), e os dois rankings se fundem por RRF
+(`gcp/slice/fusion.py`) -- posicao, nunca score, porque a similaridade de espacos
+diferentes nao se compara. Por default ela funde TODOS os espacos da arquitetura (a busca
+cross-modal); `only_spaces` restringe a fusao a um subconjunto, que e como a avaliacao
+mede UMA tarefa por vez (`gcp/slice/eval.py`). A CLI abaixo continua sendo a de espaco
+unico.
+
 Uso:
     export PGPASSWORD="$(gcloud secrets versions access latest --secret=govexe-pg-password)"
     python -m gcp.slice.query --text "metas para a saude publica" --k 5
@@ -26,7 +34,10 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from collections.abc import Callable, Iterable
 from pathlib import Path
+
+import numpy as np
 
 # permite tanto `python gcp/slice/query.py` quanto `python -m gcp.slice.query`
 if __package__ in (None, ""):
@@ -47,12 +58,21 @@ from gcp.slice.embed_job import (  # noqa: E402
     open_vector_store,
     rank_top_k,
 )
+from gcp.slice.fusion import rrf_fuse  # noqa: E402
+from gcp.slice.spaces import architecture_spaces  # noqa: E402
 
 log = logging.getLogger(__name__)
 
 # `rank_top_k` (produto interno em memoria) mora no modulo do indice, ao lado dos dois
 # backends; reexportado aqui porque e a logica de ranking que esta CLI exercita.
-__all__ = ["main", "rank_top_k", "search", "store_from_vectors"]
+__all__ = ["MULTI_TOP_K", "main", "rank_top_k", "search", "search_architecture",
+           "store_from_vectors"]
+
+# Profundidade pedida a CADA espaco antes da fusao. Maior que o `TOP_K` da CLI de espaco
+# unico de proposito: o RRF so pode promover um item que apareca na lista de algum espaco,
+# entao um pool raso por espaco joga fora justamente os itens que a fusao existe para
+# resgatar (o bem colocado em dois espacos, nunca no topo de nenhum).
+MULTI_TOP_K = 10
 
 
 def store_from_vectors(prefix: str, source: str = DEFAULT_SOURCE) -> InMemoryVectorStore:
@@ -69,6 +89,62 @@ def search(text: str, store: VectorStore, *, k: int = TOP_K, model_id: str = DEF
     """Embute a consulta e devolve os `k` itens mais proximos (de qualquer modalidade)."""
     q = embed_texts([text], model_id=model_id, device=device, dtype=dtype, dim=dim)[0]
     return store.search(q, k, modality=modality)
+
+
+def search_architecture(arch: str, query_text: str, *, k: int = MULTI_TOP_K,
+                        stores: dict[str, VectorStore],
+                        embedders: dict[str, Callable[[list[str]], np.ndarray]],
+                        only_spaces: Iterable[str] | None = None,
+                        ) -> list[tuple[str, float]]:
+    """Consulta textual nos espacos da arquitetura e funde os rankings por RRF.
+
+    Um espaco por vez: a consulta e embutida pelo embedder de texto DAQUELE espaco (e so
+    assim o vetor cai na geometria certa -- Qwen3-VL e CLAP nem tem a mesma dimensao) e o
+    top-`k` sai do store DAQUELE espaco. O que se funde sao as listas de `item_id`, nunca
+    os scores: entre espacos a escala da similaridade nao se compara (ver `fusion.py`).
+
+    Nao filtra por modalidade de proposito: cada espaco ja indexa so as modalidades que
+    declara (`Space.modalities`), e e a busca cross-modal que se quer aqui -- em `A+audio`
+    o mesmo texto recupera pagina pelo Qwen3-VL e audio NATIVO pelo CLAP.
+
+    `only_spaces` restringe a fusao a um SUBCONJUNTO dos espacos da arquitetura; o default
+    (`None`) funde todos, que e a busca cross-modal da CLI. Quem o usa e a AVALIACAO: uma
+    tarefa doc-visual nao pode fundir o espaco do CLAP, que so indexa clipes de audio e
+    entremearia audio entre as paginas -- faria `A+audio` diferir de `A` numa tarefa em
+    que a spec (secao 5) as declara identicas. Nome fora da arquitetura (ou filtro que nao
+    sobra espaco nenhum) e `ValueError` na hora: avaliar sobre indice nenhum devolveria um
+    zero que parece metrica.
+
+    `stores` e `embedders` sao injetados por `name` de espaco (producao monta a partir de
+    `SPACES`; o teste passa fakes), o que mantem esta funcao sem carregar checkpoint nenhum.
+    Devolve `[(item_id, score_rrf), ...]` com o melhor primeiro -- o score e o do RRF, nao
+    um cosseno, e so faz sentido DENTRO deste ranking.
+    """
+    espacos = architecture_spaces(arch)           # ValueError na hora se `arch` nao existe
+    if only_spaces is not None:
+        pedidos = set(only_spaces)
+        da_arquitetura = {espaco.name for espaco in espacos}
+        if not pedidos <= da_arquitetura:
+            raise ValueError(
+                f"only_spaces={sorted(pedidos)} pede espaco que nao esta na arquitetura "
+                f"{arch!r} (ela tem: {sorted(da_arquitetura)})")
+        espacos = [espaco for espaco in espacos if espaco.name in pedidos]
+        if not espacos:
+            raise ValueError(f"only_spaces vazio para a arquitetura {arch!r}: nao ha "
+                             f"espaco nenhum a consultar")
+
+    rankings: list[list[str]] = []
+    for espaco in espacos:
+        if espaco.name not in stores or espaco.name not in embedders:
+            faltando = "store" if espaco.name not in stores else "embedder"
+            raise KeyError(f"{faltando} ausente para o espaco {espaco.name!r}, exigido pela "
+                           f"arquitetura {arch!r} (tabela {espaco.table})")
+        # `atleast_2d` aceita tanto o (1, dim) usual quanto um (dim,) de embedder simples.
+        q = np.atleast_2d(np.asarray(embedders[espaco.name]([query_text])))[0]
+        hits = stores[espaco.name].search(q, k)
+        rankings.append([hit.item_id for hit in hits])
+        log.debug("espaco %s: %d hits", espaco.name, len(hits))
+    return rrf_fuse(rankings)
 
 
 def main(argv: list[str] | None = None, *, store: VectorStore | None = None) -> int:

@@ -1,8 +1,8 @@
 """Fatia GCP (`gcp/slice/`): coletor Bronze, job de embedding multimodal e consulta top-k.
 
 Tudo offline: o GCS e substituido pelo `LocalObjectStore` (fake de filesystem), o Cloud SQL
-pelo `InMemoryVectorStore`, o Whisper pelo `FakeTranscriber` e o encode do Qwen3-VL e
-monkeypatchado -- nenhum teste toca a nuvem, a rede, GPU ou pesos de modelo.
+pelo `InMemoryVectorStore`, o Whisper pelo `FakeTranscriber` e o encode do Qwen3-VL (e o do
+CLAP) e monkeypatchado -- nenhum teste toca a nuvem, a rede, GPU ou pesos de modelo.
 """
 
 import json
@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from gcp.slice import asr, audio_collector, collector, embed_job, query
+from gcp.slice import asr, audio_collector, collector, embed_job, query, spaces
 
 
 def _pages(tmp_path, n, prefix="BR001"):
@@ -177,8 +177,10 @@ def test_embed_job_main_duas_ingestoes_nao_duplicam(tmp_path, monkeypatch, capsy
 
     monkeypatch.setattr(embed_job, "embed_images", _fake_embed)
     store = embed_job.InMemoryVectorStore()
+    # `--dim 4` = a largura do embedder fake. So passa porque o indice e o fake em memoria
+    # (no Cloud SQL a largura e sempre a que o espaco declara -- ver os testes de --space).
     argv = ["--local-bronze", str(bucket), "--blob-prefix", "bronze/",
-            "--work-dir", str(tmp_path / "work"), "--device", "cpu"]
+            "--work-dir", str(tmp_path / "work"), "--device", "cpu", "--dim", "4"]
 
     assert embed_job.main(argv, store=store) == 0
     assert store.count() == 3
@@ -211,7 +213,8 @@ def test_embed_job_main_reusa_npy_e_manifest(tmp_path, monkeypatch):
 
     monkeypatch.setattr(embed_job, "embed_images", nao_deveria)
     store = embed_job.InMemoryVectorStore()
-    assert embed_job.main(["--vectors", str(base)], store=store) == 0
+    # `--dim 4` = a largura do .npy ja gravado; aceito por ser indice local (em memoria)
+    assert embed_job.main(["--vectors", str(base), "--dim", "4"], store=store) == 0
     assert sorted(store.rows) == ["BR001_p00", "BR001_p01"]
     assert store.rows["BR001_p00"].model_id == "Qwen/X"
 
@@ -865,3 +868,218 @@ def test_record_capturado_e_ingerido_pelo_embed_job_sem_alteracao(tmp_path, monk
     assert linha.credit == "TV Camara" and linha.pointer_uri == URL_CAMARA
     assert asr.FAKE_PREFIX in linha.content_text         # transcrito pelo FakeTranscriber
     np.testing.assert_allclose(linha.embedding, [0, 0, 0, 1])   # embutido por embed_texts
+
+
+# -- embed_job --space: roteamento por espaco vetorial (A e A+audio) -------------------------
+
+
+def _fake_embed_audio(paths, **kw):
+    """CLAP fake: um vetor canonico por arquivo, na dimensao declarada pelo espaco."""
+    return np.eye(len(paths), spaces.SPACES["clap"].dim, dtype="float32")
+
+
+def _nao_deveria(*a, **kw):
+    raise AssertionError("encoder do espaco errado foi chamado")
+
+
+def _audio_native_jsonl(tmp_path, item_id="audio:camara-1"):
+    """JSONL com um record de audio NATIVO (forma de onda, sem ASR) + o arquivo."""
+    audio = tmp_path / "sessao_camara.m4a"
+    audio.write_bytes(b"m4afake")
+    jsonl = tmp_path / "audio_native.jsonl"
+    jsonl.write_text(json.dumps(
+        {"item_id": item_id, "modality": "audio_native", "audio_path": str(audio),
+         "pointer_uri": URL_CAMARA, "credit": "TV Camara", "source": "tv_camara"}),
+        encoding="utf-8")
+    return jsonl, audio
+
+
+def _fake_pg(monkeypatch, resultado=None):
+    """Substitui o `connect` do pgvector por um `PgVectorStore` sobre `_FakeConn`.
+
+    Devolve `(conn, capturado)`: `capturado` guarda os kwargs da conexao -- e assim que o
+    teste ve QUAL tabela o job escolheu, sem Cloud SQL nenhum.
+    """
+    conn = _FakeConn(resultado)
+    capturado: dict = {}
+
+    def fake_connect(**kw):
+        capturado.update(kw)
+        return embed_job.PgVectorStore(conn, table=kw["table"])
+
+    monkeypatch.setattr(embed_job.PgVectorStore, "connect", staticmethod(fake_connect))
+    return conn, capturado
+
+
+def test_prepare_record_audio_native_hasheia_o_binario_e_dispensa_asr(tmp_path):
+    """`audio_native` NAO passa pelo Whisper: o vetor vem da onda, o hash do arquivo."""
+    audio = tmp_path / "sessao.m4a"
+    audio.write_bytes(b"m4afake")
+
+    p = embed_job.prepare_record(
+        {"modality": "audio_native", "audio_path": str(audio),
+         "pointer_uri": URL_CAMARA, "credit": "TV Camara"}, source="tv_camara")
+
+    assert p["modality"] == embed_job.MODALITY_AUDIO_NATIVE
+    assert p["content_text"] is None                     # nao e texto: nao ha transcricao
+    assert p["content_sha256"] == embed_job.content_sha256(audio)
+    assert p["path"] == str(audio) and p["credit"] == "TV Camara"
+
+
+def test_space_clap_roteia_audio_native_para_embed_audio(tmp_path, monkeypatch):
+    """Espaco `clap`: o audio nativo vai por `embed_audio` -- nunca por texto/imagem."""
+    audio = tmp_path / "sessao.m4a"
+    audio.write_bytes(b"m4afake")
+    vistos: dict = {}
+
+    def espia_audio(paths, **kw):
+        vistos["paths"], vistos["kw"] = list(paths), kw
+        return _fake_embed_audio(paths)
+
+    monkeypatch.setattr(embed_job, "embed_audio", espia_audio)
+    monkeypatch.setattr(embed_job, "embed_images", _nao_deveria)
+    monkeypatch.setattr(embed_job, "embed_texts", _nao_deveria)
+
+    rows = embed_job.embed_records(
+        [{"item_id": "audio:camara-1", "modality": "audio_native",
+          "audio_path": str(audio), "pointer_uri": URL_CAMARA, "credit": "TV Camara"}],
+        space="clap", device="cpu", source="tv_camara")
+
+    assert vistos["paths"] == [str(audio)]               # o CAMINHO do binario, nao texto
+    assert vistos["kw"]["model_id"] == spaces.SPACES["clap"].model_id
+    assert [r.modality for r in rows] == [embed_job.MODALITY_AUDIO_NATIVE]
+    assert len(rows[0].embedding) == spaces.SPACES["clap"].dim
+    assert rows[0].model_id == spaces.SPACES["clap"].model_id
+    assert rows[0].content_text is None
+    assert rows[0].pointer_uri == URL_CAMARA and rows[0].credit == "TV Camara"
+
+
+def test_embed_job_main_space_clap_grava_na_tabela_do_registro(tmp_path, monkeypatch):
+    """`--space clap` -> tabela `govexe_clap`, VECTOR(512), item de modalidade nativa."""
+    jsonl, audio = _audio_native_jsonl(tmp_path)
+    monkeypatch.setattr(embed_job, "embed_audio", _fake_embed_audio)
+    monkeypatch.setattr(embed_job, "embed_images", _nao_deveria)
+    monkeypatch.setattr(embed_job, "embed_texts", _nao_deveria)
+    conn, capturado = _fake_pg(monkeypatch)
+
+    assert embed_job.main(["--records", str(jsonl), "--space", "clap",
+                           "--device", "cpu"]) == 0
+
+    assert capturado["table"] == spaces.SPACES["clap"].table == "govexe_clap"
+    ddl = conn.sql[1][0]
+    assert "govexe_clap" in ddl and "VECTOR(512)" in ddl
+    sql, params = conn.sql[4]
+    assert "INSERT INTO govexe_clap" in sql
+    assert params[0][:2] == ("audio:camara-1", embed_job.MODALITY_AUDIO_NATIVE)
+
+
+def test_embed_job_main_space_default_mantem_o_fluxo_qwen3vl(tmp_path, monkeypatch):
+    """Sem `--space`: mesmas 4 modalidades pelo mesmo checkpoint, na tabela do espaco A."""
+    # no caminho pgvector a largura e SEMPRE a do registro: os fakes entregam 1024
+    largura = spaces.SPACES["qwen3vl"].dim
+    monkeypatch.setattr(embed_job, "embed_images",
+                        lambda paths, **kw: np.eye(len(paths), largura, dtype="float32"))
+    monkeypatch.setattr(embed_job, "embed_texts",
+                        lambda textos, **kw: np.eye(len(textos), largura, dtype="float32"))
+    monkeypatch.setattr(embed_job, "embed_audio", _nao_deveria)
+    conn, capturado = _fake_pg(monkeypatch)
+    jsonl = _records_jsonl(tmp_path)
+
+    assert embed_job.main(["--records", str(jsonl), "--asr-backend", "fake",
+                           "--device", "cpu"]) == 0
+
+    assert capturado["table"] == spaces.SPACES["qwen3vl"].table == "govexe_qwen3vl"
+    assert f"VECTOR({largura})" in conn.sql[1][0]        # a tabela nasce com a do registro
+    assert "INSERT INTO govexe_qwen3vl" in conn.sql[4][0]
+    assert {p[1] for p in conn.sql[4][1]} == {"doc_image", "image", "text", "audio_asr"}
+    assert {p[8] for p in conn.sql[4][1]} == {spaces.SPACES["qwen3vl"].model_id}
+
+
+def test_dim_divergente_falha_rapido(tmp_path, monkeypatch):
+    """Embedder devolvendo outra largura nao chega ao upsert: a coluna VECTOR(n) e fixa."""
+    jsonl, _ = _audio_native_jsonl(tmp_path)
+    monkeypatch.setattr(embed_job, "embed_audio",
+                        lambda paths, **kw: np.eye(len(paths), 256, dtype="float32"))
+    store = embed_job.InMemoryVectorStore()
+
+    with pytest.raises(ValueError, match="dim"):
+        embed_job.main(["--records", str(jsonl), "--space", "clap", "--device", "cpu"],
+                       store=store)
+
+    assert store.count() == 0                            # nada gravado com largura errada
+
+
+def test_space_clap_recusa_modalidade_que_nao_indexa(tmp_path):
+    """O espaco do CLAP so aceita `audio_native` -- texto/imagem pertencem ao espaco A."""
+    with pytest.raises(ValueError, match="clap"):
+        embed_job.embed_records([{"modality": "text", "text": "meta de saude",
+                                  "uri": "https://x/1"}], space="clap", device="cpu")
+
+
+def test_space_qwen3vl_recusa_audio_native_antes_de_preparar_o_record(tmp_path):
+    """E a recusa vem ANTES do `prepare_record`: nem o binario precisa existir."""
+    t = asr.FakeTranscriber()
+
+    with pytest.raises(ValueError, match="audio_native"):
+        embed_job.embed_records(
+            [{"item_id": "audio:camara-1", "modality": "audio_native",
+              "audio_path": str(tmp_path / "nem-existe.m4a")}],
+            space="qwen3vl", device="cpu", transcriber=t)
+
+    assert t.calls == []                                 # nada de ASR num lote recusado
+
+
+def test_space_clap_recusa_os_modos_de_entrada_de_pagina(tmp_path, monkeypatch):
+    """`--images-dir`/`--local-bronze` produzem `doc_image`: o espaco do CLAP nao indexa."""
+    pages = _pages(tmp_path, 1)
+    monkeypatch.setattr(embed_job, "embed_images", _nao_deveria)
+    monkeypatch.setattr(embed_job, "embed_audio", _nao_deveria)
+
+    assert embed_job.main(["--images-dir", str(pages), "--space", "clap",
+                           "--device", "cpu"]) == 1
+    assert embed_job.main(["--local-bronze", str(tmp_path / "bucket"), "--space", "clap",
+                           "--work-dir", str(tmp_path / "work"), "--device", "cpu"]) == 1
+
+
+def test_dim_divergente_do_registro_e_recusado_no_caminho_pgvector(tmp_path, monkeypatch):
+    """A tabela do espaco e `VECTOR(SPACES[...].dim)`: `--dim` outro nao cria nada."""
+    jsonl = _records_jsonl(tmp_path)
+    monkeypatch.setattr(embed_job, "embed_images", _nao_deveria)
+    monkeypatch.setattr(embed_job, "embed_texts", _nao_deveria)
+    conn, capturado = _fake_pg(monkeypatch)
+
+    with pytest.raises(ValueError, match="dim"):
+        embed_job.main(["--records", str(jsonl), "--asr-backend", "fake",
+                        "--device", "cpu", "--dim", "4"])
+
+    assert conn.sql == [] and capturado == {}            # nem conectou, nem criou schema
+
+
+def test_dim_divergente_so_e_aceito_no_indice_local(tmp_path, monkeypatch):
+    """O mesmo `--dim 4` passa no indice fake, que nao tem tabela canonica a corromper."""
+    monkeypatch.setattr(embed_job, "embed_images", _fake_embed)
+    monkeypatch.setattr(embed_job, "embed_texts", _fake_embed_texts)
+    store = embed_job.InMemoryVectorStore()
+
+    assert embed_job.main(["--records", str(_records_jsonl(tmp_path)), "--asr-backend",
+                           "fake", "--device", "cpu", "--dim", "4"], store=store) == 0
+    assert {len(r.embedding) for r in store.rows.values()} == {4}
+
+
+def test_dim_divergente_no_clap_e_recusado_ate_no_indice_local(tmp_path, monkeypatch):
+    """CLAP nao e Matryoshka: pedir outra largura nao e override, e vetor que nao chega."""
+    jsonl, _ = _audio_native_jsonl(tmp_path)
+    monkeypatch.setattr(embed_job, "embed_audio", _nao_deveria)
+    store = embed_job.InMemoryVectorStore()
+
+    with pytest.raises(ValueError, match="Matryoshka"):
+        embed_job.main(["--records", str(jsonl), "--space", "clap", "--device", "cpu",
+                        "--dim", "4"], store=store)
+
+    assert store.count() == 0
+
+
+def test_space_desconhecido_falha_com_a_lista_do_que_existe():
+    with pytest.raises(ValueError, match="espaco"):
+        embed_job.get_space("nao-existe")
+    assert embed_job.get_space("clap") is spaces.SPACES["clap"]

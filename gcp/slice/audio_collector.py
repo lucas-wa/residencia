@@ -9,7 +9,7 @@ Cada etapa continua no seu lugar -- este modulo NAO sobe nada e NAO transcreve n
 
     audio_collector.py   URL publica  -> audio local + record JSONL   (maquina local)
     collector.py         record       -> binario no Bronze + record com blob/uri
-    embed_job.py         record       -> ASR (asr.py) -> embed_texts -> govexe_items
+    embed_job.py         record       -> ASR (asr.py) -> embed_texts -> govexe_qwen3vl
 
 O `item_id` sai de `collector.default_item_id("audio_asr", <URL de origem>)`: a identidade
 segue a FONTE, nao o caminho do arquivo baixado nem o objeto no Bronze -- recapturar a
