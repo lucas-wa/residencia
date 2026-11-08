@@ -300,6 +300,73 @@ def test_pages_dir_e_recusado_nas_arquiteturas_pgvector(tmp_path):
                        str(tmp_path / "c.csv"), "--pages-dir", str(tmp_path)])
 
 
+# -- --batch-size: o knob de VRAM da rodada paga -------------------------------------------
+
+
+def _batch_size_recebido(tmp_path, argv_extra, monkeypatch) -> int:
+    """Roda `main()` com `--arch B` e devolve o `batch_size` que chegou ao builder."""
+    dados = _escrever_conjunto(tmp_path, relevante="p00")
+    visto = {}
+
+    def espiao(docs, *, specialist, batch_size, **kwargs):
+        assert specialist.name == "colqwen25_doc"     # o roteamento passou pelo registro
+        visto["batch_size"] = batch_size
+        return lambda texto: list(IDS)
+
+    monkeypatch.setattr("gcp.slice.doc_specialist.build_doc_retriever", espiao)
+    rc = eval_mod.main(["--arch", "B", "--data-dir", str(dados), "--out",
+                        str(tmp_path / "c.csv"), *argv_extra])
+    assert rc == 0
+    return visto["batch_size"]
+
+
+def test_batch_size_da_cli_chega_ao_builder(tmp_path, monkeypatch):
+    """O knob tem de valer na rodada PAGA: nada de aceitar a flag e ignorar."""
+    assert _batch_size_recebido(tmp_path, ["--batch-size", "1"], monkeypatch) == 1
+
+
+def test_batch_size_omitido_cai_no_default_do_modulo_do_ranker(tmp_path, monkeypatch):
+    from gcp.slice.doc_specialist import DEFAULT_BATCH_SIZE
+
+    assert DEFAULT_BATCH_SIZE == 4
+    assert _batch_size_recebido(tmp_path, [], monkeypatch) == DEFAULT_BATCH_SIZE
+
+
+def test_batch_size_chega_ao_colvision_retriever(monkeypatch):
+    """Ponta a ponta do knob: `build_doc_retriever` o repassa ao construtor do wrapper."""
+    import benchmark.models.colvision as colvision_mod
+
+    visto = {}
+
+    class _FakeColVision:
+        def __init__(self, model_id, *, kind, device, dtype, batch_size):
+            visto.update(model_id=model_id, kind=kind, batch_size=batch_size)
+
+    monkeypatch.setattr(colvision_mod, "ColVisionRetriever", _FakeColVision)
+
+    from gcp.slice.doc_specialist import _build_retriever
+
+    _build_retriever(ESPECIALISTA, device="cpu", dtype="float32", batch_size=2)
+
+    assert visto == {"model_id": "vidore/colqwen2.5-v0.2", "kind": "colqwen2.5",
+                     "batch_size": 2}
+
+
+def test_batch_size_e_recusado_nas_arquiteturas_pgvector(tmp_path):
+    """Quem indexa em A e o embed_job: aceitar aqui faria o operador crer que baixou."""
+    dados = _escrever_conjunto(tmp_path, relevante="p00")
+    with pytest.raises(SystemExit):
+        eval_mod.main(["--arch", "A", "--data-dir", str(dados), "--out",
+                       str(tmp_path / "c.csv"), "--batch-size", "2"])
+
+
+def test_batch_size_zero_e_recusado(tmp_path):
+    dados = _escrever_conjunto(tmp_path, relevante="p00")
+    with pytest.raises(SystemExit):
+        eval_mod.main(["--arch", "B", "--data-dir", str(dados), "--out",
+                       str(tmp_path / "c.csv"), "--batch-size", "0"])
+
+
 # -- tarefa x especialista: quem ranqueia o que sai do registro ----------------------------
 
 

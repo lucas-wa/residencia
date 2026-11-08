@@ -38,9 +38,16 @@ import logging
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
-__all__ = ["DocSpecialistRanker", "build_doc_retriever", "resolve_image_path"]
+__all__ = ["DEFAULT_BATCH_SIZE", "DocSpecialistRanker", "build_doc_retriever",
+           "resolve_image_path"]
 
 log = logging.getLogger(__name__)
+
+# Paginas por lote no `encode_corpus`. E o knob de MEMORIA da rodada: o ColQwen2.5 guarda
+# um vetor por token de imagem, entao um lote de paginas grandes e o que estoura os 24 GB
+# da L4 (ja aconteceu na prova #2). 4 e o default do `ColVisionRetriever`; baixar para 2 ou
+# 1 troca tempo por VRAM e nao muda ranking nenhum -- o MaxSim e por item.
+DEFAULT_BATCH_SIZE = 4
 
 # Raiz do repo: o `image_path` do `corpus.jsonl` e relativo a ela.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -128,13 +135,16 @@ def _build_retriever(specialist, *, device: str, dtype: str, batch_size: int):
 
 
 def build_doc_retriever(docs, *, specialist, device: str = "cuda", dtype: str = "bfloat16",
-                        batch_size: int = 4, data_dir: str | Path | None = None,
+                        batch_size: int = DEFAULT_BATCH_SIZE,
+                        data_dir: str | Path | None = None,
                         pages_dir: str | Path | None = None,
                         retriever=None) -> Callable[[str], list[str]]:
     """Embute o corpus com o especialista e devolve o `retrieve(texto) -> [item_id, ...]`.
 
     `docs` sao os `Doc` do `corpus.jsonl` (ou dicts equivalentes com `id`/`image_path`).
-    `retriever` injetado pula a construcao do modelo -- e o que os testes usam.
+    `batch_size` e o knob de VRAM (ver `DEFAULT_BATCH_SIZE`); `retriever` injetado pula a
+    construcao do modelo -- e o que os testes usam, e entao `batch_size` nao se aplica,
+    porque quem o consome e o `ColVisionRetriever` que nao chegou a ser construido.
 
     Corpus vazio, ou pagina do corpus que nao existe em disco, falha AQUI: as duas coisas
     so apareceriam como metrica 0.0 la na frente, e um zero que parece metrica e pior que

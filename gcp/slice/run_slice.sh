@@ -30,6 +30,7 @@
 #        --audio-records data/govexe/audio_eval/records.jsonl \
 #        --audio-dir     data/govexe/audio_eval/audio
 #   bash gcp/slice/run_slice.sh --arch B                # so a VM L4: SEM Cloud SQL
+#   bash gcp/slice/run_slice.sh --arch B --specialist-batch-size 2   # menos VRAM na L4
 #   bash gcp/slice/run_slice.sh --arch A --dry-run      # imprime tudo, nao toca a nuvem
 #
 #   Numa rodada paga, guarde a saida:
@@ -63,6 +64,10 @@
 # eval ranqueia tudo em memoria. O teardown fica MAIS simples, nao mais fraco: `SQL_TOCADA`
 # continua 0, entao nem o delete nem a conferencia final procuram uma instancia Cloud SQL
 # que nunca existiu (procurar renderia um falso LEAK). A VM segue com a garantia de sempre.
+#
+# O lote do ColQwen2.5 e `--specialist-batch-size` (env `SPECIALIST_BATCH_SIZE`, default 4):
+# o knob de VRAM da rodada, distinto do BATCH_SIZE da indexacao, que B nem faz. Se a L4
+# estourar memoria, baixe para 2 ou 1 -- custa tempo e nao muda ranking.
 # =====================================================================================
 
 set -euo pipefail
@@ -103,6 +108,11 @@ MIXED_RECORDS="${MIXED_RECORDS:-data/govexe/mixed_records.bronze.jsonl}"
 AUDIO_RECORDS="${AUDIO_RECORDS:-data/govexe/audio_eval/records.jsonl}"
 AUDIO_DIR="${AUDIO_DIR:-data/govexe/audio_eval/audio}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
+# Lote do ranqueador late-interaction (arquitetura sem pgvector). Separado do BATCH_SIZE
+# acima de proposito: aquele e da INDEXACAO (embed_job), este e do `encode_corpus` do
+# ColQwen2.5, que guarda um vetor por token de imagem e e o que ja estourou os 24 GB da L4
+# na prova #2. Baixar para 2 ou 1 troca tempo por VRAM e nao muda ranking.
+SPECIALIST_BATCH_SIZE="${SPECIALIST_BATCH_SIZE:-4}"
 
 # Conjuntos de avaliacao (um `eval.py` por conjunto; o CSV acumula as linhas).
 EVAL_DIRS="${EVAL_DIRS:-data/govexe/ptbr_planos}"
@@ -124,7 +134,7 @@ RESULTADOS_COLETADOS=0
 # Flags
 # -------------------------------------------------------------------------------------
 uso() {
-    sed -n '2,66p' "$0"
+    sed -n '2,71p' "$0"
     exit "${1:-0}"
 }
 
@@ -138,6 +148,7 @@ while [ $# -gt 0 ]; do
         --audio-records)  AUDIO_RECORDS="$2"; shift 2 ;;
         --audio-dir)      AUDIO_DIR="$2"; shift 2 ;;
         --eval-dirs)      EVAL_DIRS="$2"; shift 2 ;;
+        --specialist-batch-size) SPECIALIST_BATCH_SIZE="$2"; shift 2 ;;
         --out)            OUT_CSV="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=1; shift ;;
         -h|--help)        uso 0 ;;
@@ -397,6 +408,7 @@ INSTANCE_CONN='$PROJECT_ID:$REGION:$INSTANCE'
 SOURCE='$SOURCE'
 DT='$DT'
 BATCH_SIZE='$BATCH_SIZE'
+SPECIALIST_BATCH_SIZE='$SPECIALIST_BATCH_SIZE'
 MIXED_RECORDS='$MIXED_RECORDS'
 AUDIO_RECORDS='$AUDIO_RECORDS'
 EVAL_DIRS='$EVAL_DIRS'
@@ -751,7 +763,7 @@ eval)
         PG=()
         echo "--- $ARCH nao usa pgvector: sem proxy e sem credenciais de banco ---"
         baixar_paginas_do_bronze
-        EXTRA=(--pages-dir "$PAGES_VM_DIR")
+        EXTRA=(--pages-dir "$PAGES_VM_DIR" --batch-size "$SPECIALIST_BATCH_SIZE")
     fi
 
     for DIR_AVAL in $EVAL_DIRS; do

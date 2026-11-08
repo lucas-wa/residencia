@@ -37,8 +37,9 @@ Uso:
     python -m gcp.slice.eval --arch A+audio --data-dir data/govexe/planos --out "$CSV"
 
     # B nao usa Cloud SQL: nem PGPASSWORD, nem proxy. So a GPU e as paginas.
+    # `--batch-size` e o knob de VRAM: baixe se a L4 estourar memoria.
     python -m gcp.slice.eval --arch B --data-dir data/govexe/ptbr_planos \
-        --pages-dir ~/govexe-pages --out "$CSV"
+        --pages-dir ~/govexe-pages --batch-size 2 --out "$CSV"
 
 A segunda rodada ACRESCENTA a sua linha ao mesmo CSV (a anterior fica), que e como a
 comparacao entre arquiteturas se forma.
@@ -380,16 +381,22 @@ def _retrieve_late_interaction(arch: str, docs, a: argparse.Namespace, *, tarefa
     modulo (e os seus testes) livres de torch. `retriever` injetado e o que permite ao
     teste exercitar o roteamento com um duble.
     """
-    from gcp.slice.doc_specialist import build_doc_retriever
+    from gcp.slice.doc_specialist import DEFAULT_BATCH_SIZE, build_doc_retriever
 
     especialista = specialist_for_corpus(arch, docs, tarefa=tarefa)
+    # `--batch-size` nao dado (`None`) cai no default do modulo do ranker -- a fonte unica
+    # desse numero e ele, nao esta funcao.
+    batch_size = getattr(a, "batch_size", None) or DEFAULT_BATCH_SIZE
+    log.info("%s: ranqueador late-interaction (batch_size=%d)", arch, batch_size)
     return build_doc_retriever(docs, specialist=especialista, device=a.device,
-                               dtype=a.dtype, data_dir=a.data_dir,
+                               dtype=a.dtype, batch_size=batch_size,
+                               data_dir=a.data_dir,
                                pages_dir=getattr(a, "pages_dir", None),
                                retriever=retriever)
 
 
 def main(argv: list[str] | None = None, *, retriever=None) -> int:
+    from gcp.slice.doc_specialist import DEFAULT_BATCH_SIZE
     from gcp.slice.embed_job import add_pg_arguments
     from gcp.slice.query import MULTI_TOP_K, search_architecture
     from gcp.slice.spaces import ARCHITECTURES, uses_pgvector
@@ -411,6 +418,11 @@ def main(argv: list[str] | None = None, *, retriever=None) -> int:
                     help="diretorio com as paginas do corpus (so para arquitetura sem "
                          "pgvector): na VM elas vem do Bronze, e nao do repo, que as "
                          "exclui do tarball por tamanho")
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help=f"paginas por lote ao embutir o corpus (so para arquitetura sem "
+                         f"pgvector; default: {DEFAULT_BATCH_SIZE}). E o knob de VRAM da "
+                         f"rodada: baixe para 2 ou 1 se a L4 estourar memoria -- custa "
+                         f"tempo e nao muda ranking")
     ap.add_argument("--k-values", type=int, nargs="+", default=list(DEFAULT_K_VALUES),
                     help="cortes das metricas (default: %(default)s)")
     ap.add_argument("--device", default="cuda")
@@ -428,9 +440,18 @@ def main(argv: list[str] | None = None, *, retriever=None) -> int:
     if a.local_store is True:
         ap.error("--local-store aqui pede um DIRETORIO (um indice por espaco, "
                  "<dir>/<espaco>.json), e nao um arquivo so")
+    # Duas flags do caminho late-interaction. RECUSADAS (e nao ignoradas) na arquitetura
+    # pgvector, pelo mesmo motivo de `--table` logo acima: aceitar a flag e nao usa-la faz
+    # quem baixou o batch para fugir de um OOM acreditar que baixou, e so descobrir o
+    # contrario quando a rodada paga cair de novo.
     if a.pages_dir and uses_pgvector(a.arch):
         ap.error(f"--pages-dir nao se aplica a {a.arch}: ela ranqueia pelo indice "
                  "pgvector, cujos binarios ja estao no Bronze")
+    if a.batch_size is not None and uses_pgvector(a.arch):
+        ap.error(f"--batch-size nao se aplica a {a.arch}: aqui ele e knob do indice, e "
+                 "quem indexa e o embed_job (gcp/slice/embed_job.py --batch-size)")
+    if a.batch_size is not None and a.batch_size < 1:
+        ap.error(f"--batch-size tem de ser >= 1 (recebido: {a.batch_size})")
 
     from benchmark.common.datasets import load_local
     queries, docs, qrels = load_local(a.data_dir)
