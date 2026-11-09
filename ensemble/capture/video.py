@@ -25,10 +25,13 @@ def record_from_session(
     transcriber: Callable[[str], str],
     start: float | None = None,
     end: float | None = None,
+    media_path: str | None = None,
+    keyframe_fn: Callable[[float], str | None] | None = None,
 ) -> PointerRecord | None:
     """Record 'video' com descritor = ASR da fala; pointer = url#t=<start> (segundos).
 
-    Sessao sem fala (ASR vazio) -> None (pulada).
+    Sessao sem fala (ASR vazio) -> None (pulada). Com `media_path`, o arquivo retido vai em
+    meta["path"]; `keyframe_fn(start)` devolve o caminho do keyframe -> meta["a_repr"].
     """
     try:
         desc = asr_descriptor(audio_path, transcriber=transcriber)
@@ -39,6 +42,12 @@ def record_from_session(
     meta: dict = {"title": info.get("title", ""), "channel": info.get("channel", ""), "start": t0}
     if end is not None:
         meta["end"] = int(end)
+    if media_path:
+        meta["path"] = str(media_path)
+    if keyframe_fn is not None:
+        kf = keyframe_fn(float(start or 0))
+        if kf:
+            meta["a_repr"] = str(kf)
     rec = PointerRecord(
         id="video-" + hashlib.sha1(f"{url}#t={t0}".encode("utf-8")).hexdigest()[:12],
         modality="video",
@@ -69,7 +78,10 @@ def group_segments(segments: list[dict], window: float = 90.0) -> list[dict]:
     return out
 
 
-def records_from_segments(info: dict, segments: list[dict]) -> list[PointerRecord]:
+def records_from_segments(
+    info: dict, segments: list[dict], *, media_path: str | None = None,
+    keyframe_fn: Callable[[float], str | None] | None = None,
+) -> list[PointerRecord]:
     """Um record 'video' por janela, com pointer = url#t=<start real>. Janelas sem texto sao puladas."""
     out: list[PointerRecord] = []
     for seg in segments:
@@ -77,10 +89,23 @@ def records_from_segments(info: dict, segments: list[dict]) -> list[PointerRecor
         rec = record_from_session(
             info, info["webpage_url"], transcriber=lambda _p, t=text: t,
             start=seg["start"], end=seg.get("end"),
+            media_path=media_path, keyframe_fn=keyframe_fn,
         )
         if rec is not None:
             out.append(rec)
     return out
+
+
+def _ffmpeg_keyframe(media: str, t: float, destino: Path) -> str | None:
+    """Extrai 1 frame em `t` segundos com ffmpeg; None se falhar."""
+    import subprocess
+
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", media, "-frames:v", "1", str(destino)],
+        capture_output=True,
+    )
+    return str(destino) if r.returncode == 0 and destino.exists() else None
 
 
 def fetch_sessions(
@@ -99,7 +124,7 @@ def fetch_sessions(
     dest.mkdir(parents=True, exist_ok=True)
     model = _whisper_model()
     opts = {
-        "format": "bestaudio/best",
+        "format": "best[height<=480]/best",  # retem video (nao so audio)
         "outtmpl": str(dest / "%(id)s.%(ext)s"),
         "quiet": True,
         "noplaylist": True,
@@ -121,7 +146,11 @@ def fetch_sessions(
                     path = ydl.prepare_filename(info)
                     raw, _ = model.transcribe(path, language="pt")
                     segs = [{"start": s.start, "end": s.end, "text": s.text} for s in raw]
-                    recs = records_from_segments(info, group_segments(segs, window))
+                    recs = records_from_segments(
+                        info, group_segments(segs, window), media_path=path,
+                        keyframe_fn=lambda t, p=path, v=vid: _ffmpeg_keyframe(
+                            p, t, dest / "keyframes" / f"{v}_{int(t)}.jpg"),
+                    )
                 except Exception as exc:
                     log.warning("sessao %s pulada: %s", vid, exc)
                     continue

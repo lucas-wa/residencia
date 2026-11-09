@@ -26,7 +26,7 @@ def record_from_clip(
         descriptor=desc,
         pointer_uri=url,
         source="radio",
-        meta={"clip": str(clip_path)},
+        meta={"clip": str(clip_path), "path": str(clip_path), "a_repr": desc},
     )
     validate_record(rec)
     return rec
