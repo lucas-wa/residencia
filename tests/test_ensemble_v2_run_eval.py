@@ -23,8 +23,15 @@ from ensemble.eval.run_eval import (
 from ensemble.records import PointerRecord, save_records
 
 METRIC_KEYS = [
-    "recall@1", "nDCG@1", "recall@5", "nDCG@5",
+    "n_queries", "recall@1", "nDCG@1", "recall@5", "nDCG@5",
     "recall@10", "nDCG@10", "MRR", "latencia",
+]
+
+# Header REAL de results/comparacao.csv (literal independente para o teste conferir).
+COMPARACAO_HEADER = [
+    "arquitetura", "tarefa", "n_queries",
+    "recall@1", "ndcg@1", "recall@5", "ndcg@5", "recall@10", "ndcg@10",
+    "mrr", "latencia_s",
 ]
 
 
@@ -139,11 +146,15 @@ def test_metricas_por_eixo_e_conjunto():
     rows = evaluate(corpus, queries, qrels, specialists=specs,
                     retriever_a=retriever_a, retriever_b=retriever_b)
     a = {r["eixo"]: r for r in rows if r["sistema"] == "A"}
+    e = {r["eixo"]: r for r in rows if r["sistema"] == "ensemble"}
 
     l3 = 1.0 / math.log2(3)   # ganho descontado na posicao 2 (indice 1)
     l5 = 1.0 / math.log2(5)   # ganho descontado na posicao 4 (indice 3)
 
-    # documento: q1 doc=[d2,d1] rel={d1} (d1 no rank2); q2 doc=[d2,d1] rel={d2} (perfeito)
+    # --- sistema A (ranking global filtrado por eixo), media so sobre queries julgadas ---
+    # documento (julgadas q1,q2): q1 doc=[d2,d1] rel={d1} (d1 no rank2); q2 doc=[d2,d1]
+    # rel={d2} (perfeito).
+    assert a["documento"]["n_queries"] == 2
     assert a["documento"]["recall@1"] == pytest.approx(0.5)
     assert a["documento"]["nDCG@1"] == pytest.approx(0.5)
     assert a["documento"]["recall@5"] == pytest.approx(1.0)
@@ -152,19 +163,22 @@ def test_metricas_por_eixo_e_conjunto():
     assert a["documento"]["nDCG@10"] == pytest.approx((l3 + 1.0) / 2)
     assert a["documento"]["MRR"] == pytest.approx(0.75)
 
-    # imagem: q1 perfeito (i1 topo), q2 sem relevante-imagem -> 0 -> media 0.5
+    # imagem: so q1 e julgada (q2 nao tem relevante-imagem) e e perfeita -> media 1.0, n=1
+    assert a["imagem"]["n_queries"] == 1
     for m in ("recall@1", "nDCG@1", "recall@5", "nDCG@5", "recall@10", "nDCG@10", "MRR"):
-        assert a["imagem"][m] == pytest.approx(0.5), f"imagem/{m}"
-    # audio: q1 sem relevante-audio -> 0, q2 perfeito -> media 0.5
+        assert a["imagem"][m] == pytest.approx(1.0), f"imagem/{m}"
+    # audio: so q2 e julgada e e perfeita -> media 1.0, n=1
+    assert a["audio"]["n_queries"] == 1
     for m in ("recall@1", "nDCG@1", "recall@5", "nDCG@5", "recall@10", "nDCG@10", "MRR"):
-        assert a["audio"][m] == pytest.approx(0.5), f"audio/{m}"
-    # texto e video: nenhuma query tem relevante nesses eixos -> 0.0
+        assert a["audio"][m] == pytest.approx(1.0), f"audio/{m}"
+    # texto e video: nenhuma query julgada nesses eixos -> celula n/a (None), nao 0.0
     for eixo in ("texto", "video"):
-        for m in ("recall@1", "nDCG@1", "recall@5", "nDCG@5", "recall@10", "nDCG@10", "MRR"):
-            assert a[eixo][m] == pytest.approx(0.0), f"{eixo}/{m}"
+        for m in METRIC_KEYS:
+            assert a[eixo][m] is None, f"A/{eixo}/{m} deveria ser None (nao julgado)"
 
-    # conjunto: q1 rel={d1,i1} (i1 topo, d1 no indice3); q2 rel={d2,a1} (perfeito nos 2)
-    assert "conjunto" in a
+    # conjunto (julgadas q1,q2): q1 rel={d1,i1} (i1 topo, d1 no indice3); q2 rel={d2,a1}
+    # (perfeito nos 2).
+    assert a["conjunto"]["n_queries"] == 2
     assert a["conjunto"]["recall@1"] == pytest.approx(0.5)
     assert a["conjunto"]["nDCG@1"] == pytest.approx(1.0)
     assert a["conjunto"]["recall@5"] == pytest.approx(1.0)
@@ -173,6 +187,29 @@ def test_metricas_por_eixo_e_conjunto():
     assert a["conjunto"]["recall@10"] == pytest.approx(1.0)
     assert a["conjunto"]["nDCG@10"] == pytest.approx((ndcg5_q1 + 1.0) / 2)
     assert a["conjunto"]["MRR"] == pytest.approx(1.0)
+
+    # --- ensemble (RRF das 5 listas), calculado a mao no corpus pequeno ---
+    # listas disjuntas por modalidade: os rank-1 empatam em 1/61 e desempatam pela ordem
+    # de insercao (ordem AXES, depois rank). Para qa a lista fundida completa e:
+    assert [i for i, _ in ensemble_search(specs, "qa", 7)] == \
+        ["d1", "i1", "a1", "t1", "v1", "d2", "i2"]
+    # per-eixo = a fundida RESTRITA aos ids do eixo; documento -> [d1,d2] (d1 topo, perfeito
+    # nas duas queries julgadas); conjunto = a ordem fundida inteira.
+    assert e["documento"]["n_queries"] == 2
+    assert e["documento"]["recall@1"] == pytest.approx(1.0)
+    assert e["documento"]["nDCG@5"] == pytest.approx(1.0)
+    assert e["documento"]["MRR"] == pytest.approx(1.0)
+    assert e["imagem"]["n_queries"] == 1 and e["imagem"]["recall@1"] == pytest.approx(1.0)
+    assert e["audio"]["n_queries"] == 1 and e["audio"]["recall@1"] == pytest.approx(1.0)
+    assert e["texto"]["recall@1"] is None and e["video"]["recall@1"] is None
+    # conjunto ensemble: qa full=[d1,i1,...] rel={d1,i1}; qb full=[d2,i1,a1,...] rel={d2,a1}
+    # (a1 no indice2 -> ganho 1/log2(4)=1/2).
+    ndcg5_qb = 1.5 / (1.0 + l3)
+    assert e["conjunto"]["n_queries"] == 2
+    assert e["conjunto"]["recall@1"] == pytest.approx(0.5)
+    assert e["conjunto"]["nDCG@1"] == pytest.approx(1.0)
+    assert e["conjunto"]["nDCG@5"] == pytest.approx((1.0 + ndcg5_qb) / 2)
+    assert e["conjunto"]["MRR"] == pytest.approx(1.0)
 
     # existe linha conjunto para todos os sistemas
     for sistema in ("ensemble", "A", "B"):
@@ -257,7 +294,11 @@ def test_main_grava_csv(tmp_path):
     assert rc == 0
     assert out_path.is_file()
     linhas = out_path.read_text(encoding="utf-8").splitlines()
-    assert linhas[0].split(",") == CSV_HEADER
+    # o cabecalho escrito bate com o header REAL de results/comparacao.csv (literal
+    # independente), inclusive a coluna n_queries como 3a.
+    assert linhas[0].split(",") == COMPARACAO_HEADER
+    assert CSV_HEADER == COMPARACAO_HEADER
+    assert linhas[0].split(",")[2] == "n_queries"
     # 3 sistemas x (5 eixos + conjunto) = 18 linhas de dados + cabecalho
     assert len(linhas) == 1 + 18
     corpo = "\n".join(linhas[1:])

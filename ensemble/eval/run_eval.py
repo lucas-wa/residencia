@@ -15,8 +15,11 @@ a spec (`fusao/multimodal.md` secao 4.6):
 
 Relevancia binaria e topical: uma query pode ser relevante a varios itens/eixos. A unidade
 e pagina(doc)/janela(video)/arquivo(resto) -- os `item_id` JA sao unidades, entao o RRF e as
-metricas deduplicam a unidade sem traducao. As metricas sao a media **sobre todas as
-queries**; uma query sem relevante naquele eixo contribui 0.0 (metricas da Task 1).
+metricas deduplicam a unidade sem traducao. As metricas sao a media **sobre as queries
+julgadas** (padrao IR): por eixo, so entram as queries cujo conjunto-relevante RESTRITO
+aquele eixo e nao-vazio; no `conjunto`, as queries com qualquer relevante. Eixo sem nenhuma
+query julgada -> a celula (sistema, eixo) e **n/a** (`None`), distinguindo "nao avaliado" de
+"avaliado e falhou". `n_queries` reporta quantas queries julgadas sustentam cada media.
 
 `evaluate` e puro e injetavel (dubles nos testes). `main` monta os sistemas reais via o
 registry de embedders da Task 6 (`EMBEDDER_BUILDERS`) + o ranker ColQwen2.5 do eixo
@@ -37,7 +40,7 @@ from ensemble.eval.qrels import load_qrels, load_queries, validate_qrels
 from ensemble.eval.rrf import rrf_fuse
 from ensemble.records import PointerRecord, load_records
 
-__all__ = ["AXES", "CONJUNTO", "SYSTEMS", "CSV_HEADER", "RRF_K",
+__all__ = ["AXES", "CONJUNTO", "SYSTEMS", "B_AXES", "CSV_HEADER", "RRF_K",
            "ensemble_search", "evaluate", "write_csv", "main"]
 
 log = logging.getLogger(__name__)
@@ -52,21 +55,22 @@ RRF_K = 60  # k do Reciprocal Rank Fusion (spec: RRF uniforme, k=60).
 _METRICS: tuple[str, ...] = (
     "recall@1", "nDCG@1", "recall@5", "nDCG@5", "recall@10", "nDCG@10", "MRR",
 )
-# B e n/a (None) nestes eixos: nao indexa esses itens.
-_B_NA_AXES = ("imagem", "audio", "texto", "video")
+# B (ColQwen2.5) so indexa/pontua estes eixos; nos demais as metricas sao n/a (None).
+# Fonte unica da regra "B so documento": o laco e o filtro de linha derivam daqui.
+B_AXES: tuple[str, ...] = ("documento",)
+_B_NA_AXES: tuple[str, ...] = tuple(a for a in AXES if a not in B_AXES)
 
 # Cabecalho do CSV, espelhando `results/comparacao.csv` (sistema->arquitetura,
-# eixo->tarefa, e os nomes de metrica em minusculas do v1). `evaluate` nao produz
-# `n_queries` (media sobre todas as queries -> constante = len(queries)), entao essa
-# coluna do v1 fica de fora.
+# eixo->tarefa, `n_queries` = queries julgadas da media, e os nomes de metrica em
+# minusculas do v1).
 CSV_HEADER: list[str] = [
-    "arquitetura", "tarefa",
+    "arquitetura", "tarefa", "n_queries",
     "recall@1", "ndcg@1", "recall@5", "ndcg@5", "recall@10", "ndcg@10",
     "mrr", "latencia_s",
 ]
 # row-key -> coluna do CSV, na ordem de CSV_HEADER.
 _ROW_TO_CSV: list[tuple[str, str]] = [
-    ("sistema", "arquitetura"), ("eixo", "tarefa"),
+    ("sistema", "arquitetura"), ("eixo", "tarefa"), ("n_queries", "n_queries"),
     ("recall@1", "recall@1"), ("nDCG@1", "ndcg@1"),
     ("recall@5", "recall@5"), ("nDCG@5", "ndcg@5"),
     ("recall@10", "recall@10"), ("nDCG@10", "ndcg@10"),
@@ -117,12 +121,14 @@ def evaluate(corpus: list[PointerRecord], queries: dict[str, str],
     k_search = max(len(corpus), 1)
     n = len(queries)
 
-    # somatorios[(sistema, eixo)][metrica]; latencia por sistema (independe do eixo).
+    # somatorios[(sistema, eixo)][metrica]; latencia por sistema (independe do eixo);
+    # `julgadas[eixo]` = queries com relevante naquele eixo (denominador da media IR).
     somas: dict[tuple[str, str], dict[str, float]] = {
         (s, axis): {m: 0.0 for m in _METRICS}
         for s in SYSTEMS for axis in (*AXES, CONJUNTO)
     }
     lat: dict[str, float] = {s: 0.0 for s in SYSTEMS}
+    julgadas: dict[str, int] = {axis: 0 for axis in (*AXES, CONJUNTO)}
 
     for qid, qtext in queries.items():
         rel_all = set(qrels.get(qid, ()))
@@ -144,23 +150,30 @@ def evaluate(corpus: list[PointerRecord], queries: dict[str, str],
         rankings = {"ensemble": fused_ids, "A": a_ids, "B": b_ids}
         for axis in AXES:
             rel = rel_axis[axis]
+            if not rel:          # query nao-julgada neste eixo: nao conta na media
+                continue
+            julgadas[axis] += 1
             for sistema in ("ensemble", "A"):
                 sub = [i for i in rankings[sistema] if modality_by_id.get(i) == axis]
                 _accum(somas[(sistema, axis)], _metrics(sub, rel))
-            if axis == "documento":  # B so pontua documento; demais eixos ficam n/a
+            if axis in B_AXES:   # B so pontua os eixos que indexa (documento)
                 sub = [i for i in b_ids if modality_by_id.get(i) == axis]
-                _accum(somas[("B", "documento")], _metrics(sub, rel))
+                _accum(somas[("B", axis)], _metrics(sub, rel))
 
-        for sistema in SYSTEMS:
-            _accum(somas[(sistema, CONJUNTO)], _metrics(rankings[sistema], rel_all))
+        if rel_all:
+            julgadas[CONJUNTO] += 1
+            for sistema in SYSTEMS:
+                _accum(somas[(sistema, CONJUNTO)], _metrics(rankings[sistema], rel_all))
 
     rows: list[dict] = []
     for sistema in SYSTEMS:
         for axis in (*AXES, CONJUNTO):
-            if sistema == "B" and axis in _B_NA_AXES:
+            jc = julgadas[axis]
+            if (sistema == "B" and axis in _B_NA_AXES) or jc == 0:
                 rows.append(_na_row(sistema, axis))
             else:
-                rows.append(_avg_row(sistema, axis, somas[(sistema, axis)], lat[sistema], n))
+                rows.append(_avg_row(sistema, axis, somas[(sistema, axis)],
+                                     lat[sistema], jc, n))
     return rows
 
 
@@ -170,16 +183,18 @@ def _accum(dst: dict[str, float], src: dict[str, float]) -> None:
 
 
 def _avg_row(sistema: str, eixo: str, somas: dict[str, float], lat: float,
-             n: int) -> dict:
-    row: dict = {"sistema": sistema, "eixo": eixo}
+             jc: int, n: int) -> dict:
+    # metricas: media sobre as `jc` queries julgadas; latencia: media por query do
+    # sistema (sobre todas as `n` queries -- e propriedade do sistema, nao do eixo).
+    row: dict = {"sistema": sistema, "eixo": eixo, "n_queries": jc}
     for m in _METRICS:
-        row[m] = somas[m] / n if n else 0.0
+        row[m] = somas[m] / jc
     row["latencia"] = lat / n if n else 0.0
     return row
 
 
 def _na_row(sistema: str, eixo: str) -> dict:
-    row: dict = {"sistema": sistema, "eixo": eixo}
+    row: dict = {"sistema": sistema, "eixo": eixo, "n_queries": None}
     for m in _METRICS:
         row[m] = None
     row["latencia"] = None
