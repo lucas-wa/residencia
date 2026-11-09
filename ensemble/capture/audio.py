@@ -32,10 +32,14 @@ def record_from_clip(
     return rec
 
 
-def _whisper_transcriber(model_size: str = "large-v3") -> Callable[[str], str]:
+def _whisper_model(model_size: str = "large-v3"):
     from faster_whisper import WhisperModel
 
-    model = WhisperModel(model_size)
+    return WhisperModel(model_size)
+
+
+def _whisper_transcriber(model_size: str = "large-v3") -> Callable[[str], str]:
+    model = _whisper_model(model_size)
 
     def transcribe(path: str) -> str:
         segments, _ = model.transcribe(path, language="pt")
