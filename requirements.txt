@@ -5,6 +5,7 @@
 numpy
 pandas
 pyyaml
+beautifulsoup4
 tqdm
 
 # Model wrappers.

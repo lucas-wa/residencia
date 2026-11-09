@@ -177,5 +177,6 @@ pyyaml
 tqdm
 
 pypdfium2>=4.30
+beautifulsoup4>=4.12
 pillow
 numpy
