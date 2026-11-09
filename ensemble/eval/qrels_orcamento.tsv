@@ -1,0 +1,7 @@
+# PROPOSTA — preencher com item_ids reais após o corpus (gated, revisão do Lucas)
+# Formato TREC: qid 0 item_id rel. Os item_ids abaixo são PLACEHOLDERS ilustrativos.
+q01 0 PLACEHOLDER_item_001 1
+q01 0 PLACEHOLDER_item_002 1
+q02 0 PLACEHOLDER_item_003 1
+q03 0 PLACEHOLDER_item_004 1
+q04 0 PLACEHOLDER_item_005 1

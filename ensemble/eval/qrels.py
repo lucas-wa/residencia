@@ -20,11 +20,12 @@ def load_queries(path) -> dict[str, str]:
 def load_qrels(path) -> dict[str, set[str]]:
     """Le formato TREC `qid 0 item_id rel` (rel em {0,1}); so rel=1 entra no set.
 
+    Linhas em branco e comentarios (`#`) sao ignorados.
     Query sem nenhum rel=1 aparece como chave com set vazio.
     """
     qrels: dict[str, set[str]] = {}
     for line in Path(path).read_text(encoding="utf-8").splitlines():
-        if not line.strip():
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
         parts = line.split()
         if len(parts) != 4:

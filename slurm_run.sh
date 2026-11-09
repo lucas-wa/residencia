@@ -144,8 +144,8 @@ ENSEMBLE_RECORDS="${ENSEMBLE_RECORDS:-data/govexe/ensemble_orcamento/records.jso
 # pela propria captura da stage; queries/qrels sao os julgamentos do conjunto Orcamento.
 # Parametrizados por env como o ENSEMBLE_RECORDS acima.
 ENSEMBLE_V2_CORPUS="${ENSEMBLE_V2_CORPUS:-data/govexe/ensemble_orcamento/records.jsonl}"
-ENSEMBLE_V2_QUERIES="${ENSEMBLE_V2_QUERIES:-data/govexe/ensemble_orcamento/queries.txt}"
-ENSEMBLE_V2_QRELS="${ENSEMBLE_V2_QRELS:-data/govexe/ensemble_orcamento/qrels.tsv}"
+ENSEMBLE_V2_QUERIES="${ENSEMBLE_V2_QUERIES:-ensemble/eval/queries_orcamento_v2.txt}"
+ENSEMBLE_V2_QRELS="${ENSEMBLE_V2_QRELS:-ensemble/eval/qrels_orcamento.tsv}"
 
 case "$STAGE" in
     preflight|build|vidore|govexe|ensemble|ensemble_v2|all) ;;
@@ -502,8 +502,8 @@ srun singularity exec \
             #    RRF e grava o CSV comparativo por (sistema, eixo) + o log da execucao.
             python3 -m ensemble.eval.run_eval \
                 --corpus "${ENSEMBLE_V2_CORPUS:-data/govexe/ensemble_orcamento/records.jsonl}" \
-                --queries "${ENSEMBLE_V2_QUERIES:-data/govexe/ensemble_orcamento/queries.txt}" \
-                --qrels "${ENSEMBLE_V2_QRELS:-data/govexe/ensemble_orcamento/qrels.tsv}" \
+                --queries "${ENSEMBLE_V2_QUERIES:-ensemble/eval/queries_orcamento_v2.txt}" \
+                --qrels "${ENSEMBLE_V2_QRELS:-ensemble/eval/qrels_orcamento.tsv}" \
                 --out results/comparacao_v2.csv \
                 --log logs/ensemble_v2.txt
         }
