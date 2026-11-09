@@ -29,6 +29,8 @@
 #   bash gcp/slice/run_slice.sh --arch A+audio \
 #        --audio-records data/govexe/audio_eval/records.jsonl \
 #        --audio-dir     data/govexe/audio_eval/audio
+#   bash gcp/slice/run_slice.sh --arch B                # so a VM L4: SEM Cloud SQL
+#   bash gcp/slice/run_slice.sh --arch B --specialist-batch-size 2   # menos VRAM na L4
 #   bash gcp/slice/run_slice.sh --arch A --dry-run      # imprime tudo, nao toca a nuvem
 #
 #   Numa rodada paga, guarde a saida:
@@ -51,6 +53,21 @@
 #
 #   A         -> qwen3vl              (pagina, foto, texto e audio-via-ASR num indice so)
 #   A+audio   -> qwen3vl + clap       (o segundo indexa a forma de onda NATIVA)
+#   B         -> (nenhum espaco)      ensemble de especialistas: o eixo documento e o
+#                                     ColQwen2.5 late-interaction (MaxSim em memoria)
+#
+# ARQUITETURA SEM pgvector (hoje so `B`)
+#
+# B nao tem espaco pgvector: multi-vetor nao cabe numa coluna `vector(n)` ranqueada por
+# cosseno (ver gcp/slice/spaces.py). Entao a rodada de B PULA a etapa [1/7] (Cloud SQL) e
+# a etapa [6/7] (indexacao) -- sobem so a VM L4 e as 93 paginas baixadas do Bronze, e o
+# eval ranqueia tudo em memoria. O teardown fica MAIS simples, nao mais fraco: `SQL_TOCADA`
+# continua 0, entao nem o delete nem a conferencia final procuram uma instancia Cloud SQL
+# que nunca existiu (procurar renderia um falso LEAK). A VM segue com a garantia de sempre.
+#
+# O lote do ColQwen2.5 e `--specialist-batch-size` (env `SPECIALIST_BATCH_SIZE`, default 4):
+# o knob de VRAM da rodada, distinto do BATCH_SIZE da indexacao, que B nem faz. Se a L4
+# estourar memoria, baixe para 2 ou 1 -- custa tempo e nao muda ranking.
 # =====================================================================================
 
 set -euo pipefail
@@ -91,6 +108,11 @@ MIXED_RECORDS="${MIXED_RECORDS:-data/govexe/mixed_records.bronze.jsonl}"
 AUDIO_RECORDS="${AUDIO_RECORDS:-data/govexe/audio_eval/records.jsonl}"
 AUDIO_DIR="${AUDIO_DIR:-data/govexe/audio_eval/audio}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
+# Lote do ranqueador late-interaction (arquitetura sem pgvector). Separado do BATCH_SIZE
+# acima de proposito: aquele e da INDEXACAO (embed_job), este e do `encode_corpus` do
+# ColQwen2.5, que guarda um vetor por token de imagem e e o que ja estourou os 24 GB da L4
+# na prova #2. Baixar para 2 ou 1 troca tempo por VRAM e nao muda ranking.
+SPECIALIST_BATCH_SIZE="${SPECIALIST_BATCH_SIZE:-4}"
 
 # Conjuntos de avaliacao (um `eval.py` por conjunto; o CSV acumula as linhas).
 EVAL_DIRS="${EVAL_DIRS:-data/govexe/ptbr_planos}"
@@ -112,7 +134,7 @@ RESULTADOS_COLETADOS=0
 # Flags
 # -------------------------------------------------------------------------------------
 uso() {
-    sed -n '2,54p' "$0"
+    sed -n '2,71p' "$0"
     exit "${1:-0}"
 }
 
@@ -126,6 +148,7 @@ while [ $# -gt 0 ]; do
         --audio-records)  AUDIO_RECORDS="$2"; shift 2 ;;
         --audio-dir)      AUDIO_DIR="$2"; shift 2 ;;
         --eval-dirs)      EVAL_DIRS="$2"; shift 2 ;;
+        --specialist-batch-size) SPECIALIST_BATCH_SIZE="$2"; shift 2 ;;
         --out)            OUT_CSV="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=1; shift ;;
         -h|--help)        uso 0 ;;
@@ -137,10 +160,17 @@ done
 # fonte de verdade e o registro Python; para a copia nao divergir em silencio, a VM
 # confere as duas listas antes de indexar (fase `index`, no script remoto).
 case "$ARCH" in
-    A)        SPACES="qwen3vl" ;;
-    A+audio)  SPACES="qwen3vl clap" ;;
-    *) echo "ERRO: arquitetura desconhecida: '$ARCH' (use A ou A+audio)" >&2; exit 2 ;;
+    A)        SPACES="qwen3vl";      SPECIALISTS="" ;;
+    A+audio)  SPACES="qwen3vl clap"; SPECIALISTS="" ;;
+    # B: nenhum espaco pgvector (a string vazia e a declaracao disso, nao um esquecimento)
+    # e um especialista late-interaction no eixo documento.
+    B)        SPACES="";             SPECIALISTS="colqwen25_doc" ;;
+    *) echo "ERRO: arquitetura desconhecida: '$ARCH' (use A, A+audio ou B)" >&2; exit 2 ;;
 esac
+
+# Deriva uma vez o que roteia a rodada inteira: com espaco pgvector ha Cloud SQL, proxy e
+# indexacao; sem ele, nada disso existe.
+if [ -n "$SPACES" ]; then USA_PGVECTOR=1; else USA_PGVECTOR=0; fi
 
 # -------------------------------------------------------------------------------------
 # Primitivas de execucao
@@ -368,6 +398,8 @@ gerar_scripts_remotos() {
 # Gerado por gcp/slice/run_slice.sh -- configuracao da rodada.
 ARCH='$ARCH'
 SPACES='$SPACES'
+SPECIALISTS='$SPECIALISTS'
+USA_PGVECTOR='$USA_PGVECTOR'
 BUCKET='$BUCKET'
 DB='$DB'
 DB_USER='$DB_USER'
@@ -376,6 +408,7 @@ INSTANCE_CONN='$PROJECT_ID:$REGION:$INSTANCE'
 SOURCE='$SOURCE'
 DT='$DT'
 BATCH_SIZE='$BATCH_SIZE'
+SPECIALIST_BATCH_SIZE='$SPECIALIST_BATCH_SIZE'
 MIXED_RECORDS='$MIXED_RECORDS'
 AUDIO_RECORDS='$AUDIO_RECORDS'
 EVAL_DIRS='$EVAL_DIRS'
@@ -393,6 +426,11 @@ echo "=== [vm $(hostname)] fase=$FASE ${2:-} $(date) ==="
 
 REPO_DIR="$HOME/residencia"
 AUDIO_VM_DIR="$HOME/govexe-audio"
+# Paginas do Bronze para a arquitetura SEM pgvector: o tarball do repo exclui
+# `data/govexe/ptbr_planos/pages` (tamanho), entao o eixo documento as busca no Bronze --
+# o MESMO objeto que a arquitetura A indexa, e com o nome de arquivo preservado, que e o
+# que faz o basename casar com o `item_id` do corpus/qrels.
+PAGES_VM_DIR="$HOME/govexe-pages"
 PROXY_BIN="$HOME/cloud-sql-proxy"
 PROXY_VER="v2.14.1"
 
@@ -482,12 +520,35 @@ print(f"records preparados: {n} -> {destino} (modalidade={modalidade or 'inalter
 PY
 }
 
+# Paginas do Bronze para o ranqueador em memoria (arquitetura sem pgvector). Reusa o
+# `download_pages` do embed_job -- o mesmo download que a arquitetura A faz antes de
+# indexar; a unica diferenca e o destino, que aqui e um diretorio e nao uma tabela.
+baixar_paginas_do_bronze() {
+    mkdir -p "$PAGES_VM_DIR"
+    python3 - "$BUCKET" "bronze/fonte=$SOURCE/dt=$DT/" "$PAGES_VM_DIR" <<'PY'
+import sys
+from gcp.slice.collector import store_from_location
+from gcp.slice.embed_job import download_pages
+bucket, prefixo, destino = sys.argv[1:4]
+paths, _ = download_pages(store_from_location(bucket), prefixo, destino)
+if not paths:
+    raise SystemExit(f"ERRO: nenhuma pagina em {bucket}/{prefixo} -- sem corpus para o "
+                     f"eixo documento (confira --dt)")
+print(f"paginas do Bronze: {len(paths)} -> {destino}")
+PY
+}
+
 case "$FASE" in
 
 # =====================================================================================
 bootstrap)
 # =====================================================================================
-    if [ ! -d "$REPO_DIR" ]; then
+    # Guard por SENTINELA DE CODIGO, e nao por `[ -d "$REPO_DIR" ]`: a etapa [4/7] pode
+    # PRE-CRIAR `~/residencia` ao subir o `results/comparacao.csv` anterior -- e ai o teste
+    # de diretorio daria falso e o tarball nunca seria extraido (codigo e
+    # requirements-slurm.txt ausentes, bootstrap morrendo no sha256sum). Extrair por cima
+    # e seguro: o tarball exclui `results/`, entao o CSV recem-enviado fica intacto.
+    if [ ! -f "$REPO_DIR/requirements-slurm.txt" ]; then
         mkdir -p "$REPO_DIR"
         tar xzf "$HOME/repo.tgz" -C "$REPO_DIR"
     fi
@@ -501,6 +562,15 @@ bootstrap)
     if ! command -v ffmpeg >/dev/null 2>&1; then
         echo "--- instalando ffmpeg ---"
         sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+    fi
+
+    # python3.10-venv: a imagem DLVM atual tambem nao traz, e sem ele o `python3 -m venv`
+    # abaixo morre em "ensurepip is not available" e cai no fallback do python do sistema.
+    # Passo PROPRIO (e nao junto do ffmpeg) para nao ser pulado quando o ffmpeg ja existe.
+    if ! dpkg -s python3.10-venv >/dev/null 2>&1; then
+        echo "--- instalando python3.10-venv ---"
+        sudo apt-get update -qq && sudo apt-get install -y -qq python3.10-venv \
+            || echo "--- python3.10-venv falhou; o venv pode cair no fallback ---"
     fi
 
     # venv --system-site-packages: ENXERGA o torch/CUDA da imagem (reinstalar torch por
@@ -593,6 +663,20 @@ print("clap_embed ok")
 PY
             ;;
     esac
+    # Idem para o especialista late-interaction: resolver a classe do colpali-engine aqui
+    # custa segundos e evita descobrir um `ColQwen2_5` ausente depois da GPU ja estar paga.
+    if [ -n "$SPECIALISTS" ]; then
+        python3 - "$SPECIALISTS" <<'PY'
+import sys
+from gcp.slice.doc_specialist import build_doc_retriever    # noqa: F401
+from gcp.slice.spaces import SPECIALISTS
+from benchmark.models.colvision import resolve_classes
+for nome in sys.argv[1].split():
+    esp = SPECIALISTS[nome]
+    modelo, proc = resolve_classes(esp.kind)
+    print(f"{nome}: {esp.model_id} -> {modelo.__name__}/{proc.__name__}")
+PY
+    fi
     echo "=== bootstrap concluido $(date) ==="
     ;;
 
@@ -683,8 +767,18 @@ PY
 eval)
 # =====================================================================================
     ambiente
-    proxy
-    credenciais
+    # Sem espaco pgvector nao ha Cloud SQL nesta rodada: nada de proxy nem de senha. O que
+    # o ranqueador em memoria precisa sao as paginas, e elas vem do Bronze.
+    EXTRA=()
+    if [ "$USA_PGVECTOR" = "1" ]; then
+        proxy
+        credenciais
+    else
+        PG=()
+        echo "--- $ARCH nao usa pgvector: sem proxy e sem credenciais de banco ---"
+        baixar_paginas_do_bronze
+        EXTRA=(--pages-dir "$PAGES_VM_DIR" --batch-size "$SPECIALIST_BATCH_SIZE")
+    fi
 
     for DIR_AVAL in $EVAL_DIRS; do
         if [ ! -d "$REPO_DIR/$DIR_AVAL" ]; then
@@ -696,11 +790,16 @@ eval)
             --arch "$ARCH" \
             --data-dir "$REPO_DIR/$DIR_AVAL" \
             --out "$REPO_DIR/$OUT_CSV" \
-            --device cuda "${PG[@]}"
+            --device cuda "${EXTRA[@]}" "${PG[@]}"
     done
 
     echo "=== [eval] CSV comparativo ==="
     cat "$REPO_DIR/$OUT_CSV" || true
+
+    if [ "$USA_PGVECTOR" != "1" ]; then
+        echo "=== eval concluida $(date) ==="
+        exit 0
+    fi
 
     echo "=== [eval] prova cross-modal + contagem por modalidade ==="
     python3 -m gcp.slice.query --text "metas para a saude publica" --k 5 "${PG[@]}" || true
@@ -854,7 +953,9 @@ enviar_repo() {
     # Os binarios de audio nao cabem no repo: vao a parte, para o diretorio que o script
     # remoto usa ao reescrever `audio_path`. Vao num tar unico (em vez de `--recurse`)
     # pela mesma limitacao do pscp, e sao desempacotados na VM.
-    if [ -d "$REPO_DIR/$AUDIO_DIR" ]; then
+    if [ "$USA_PGVECTOR" != "1" ]; then
+        echo "--- $ARCH nao avalia audio: nada de binarios de audio a enviar ---"
+    elif [ -d "$REPO_DIR/$AUDIO_DIR" ]; then
         run tar czf "$TMP_DIR/audio.tgz" -C "$REPO_DIR/$AUDIO_DIR" .
         run gcloud compute scp "$TMP_DIR/audio.tgz" "$VM:govexe-audio.tgz" \
             --zone="$ZONE" --project="$PROJECT_ID" --quiet
@@ -890,7 +991,7 @@ coletar_resultados() {
 # -------------------------------------------------------------------------------------
 # Preflight (local, antes de criar qualquer recurso pago)
 # -------------------------------------------------------------------------------------
-etapa "rodada: arquitetura $ARCH | espacos: $SPACES | dry-run: $DRY_RUN"
+etapa "rodada: arquitetura $ARCH | espacos: ${SPACES:-<nenhum>} | especialistas: ${SPECIALISTS:-<nenhum>} | dry-run: $DRY_RUN"
 echo "    projeto=$PROJECT_ID  regiao=$REGION  instancia=$INSTANCE  vm=$VM"
 echo "    bucket=$BUCKET  fonte=$SOURCE  dt=$DT  csv=$OUT_CSV"
 
@@ -919,7 +1020,13 @@ exige_relativo --out "$OUT_CSV"
 #
 # Gate humano: enquanto o mini-set nao for capturado e julgado, o diretorio nao existe e a
 # rodada mede so a tarefa doc-visual -- aviso, nao erro.
-if [ -d "$REPO_DIR/$EVAL_AUDIO_DIR" ]; then
+#
+# Arquitetura sem pgvector fica de fora disto: o unico braco de B hoje e o eixo DOCUMENTO
+# (`doc_image`), e o registro nao lhe da especialista algum para audio -- anexar o conjunto
+# de audio so derrubaria a rodada no `specialist_for_corpus`.
+if [ "$USA_PGVECTOR" != "1" ]; then
+    echo "--- $ARCH: eixo documento apenas; o conjunto de audio fica fora da rodada ---"
+elif [ -d "$REPO_DIR/$EVAL_AUDIO_DIR" ]; then
     EVAL_DIRS="$EVAL_DIRS $EVAL_AUDIO_DIR"
 else
     echo "--- aviso: sem $EVAL_AUDIO_DIR: a rodada mede so a tarefa doc-visual ---"
@@ -956,7 +1063,12 @@ trap 'echo ""; echo "--- terminado (SIGTERM) ---" >&2; exit 143' TERM
 trap 'echo ""; echo "--- terminal caiu (SIGHUP) ---" >&2; exit 129' HUP
 
 gancho_de_falha provision
-provisionar_sql
+if [ "$USA_PGVECTOR" = "1" ]; then
+    provisionar_sql
+else
+    etapa "[1/7] Cloud SQL -- PULADO (a arquitetura $ARCH nao tem espaco pgvector)"
+    echo "--- nenhuma instancia sera criada: SQL_TOCADA fica 0 e o teardown nem a procura ---"
+fi
 provisionar_vm
 esperar_ssh
 enviar_repo
@@ -965,11 +1077,16 @@ etapa "[5/7] bootstrap da VM (venv, deps, torchaudio, librosa/soundfile)"
 gancho_de_falha bootstrap
 remoto "bash ~/slice_remote.sh bootstrap"
 
-for espaco in $SPACES; do
-    etapa "[6/7] indexando o espaco $espaco (arquitetura $ARCH)"
-    gancho_de_falha index
-    remoto "bash ~/slice_remote.sh index $espaco"
-done
+if [ -z "$SPACES" ]; then
+    etapa "[6/7] indexacao pgvector -- PULADA (a arquitetura $ARCH nao tem espaco)"
+    echo "--- o especialista ($SPECIALISTS) embute o corpus na propria avaliacao ---"
+else
+    for espaco in $SPACES; do
+        etapa "[6/7] indexando o espaco $espaco (arquitetura $ARCH)"
+        gancho_de_falha index
+        remoto "bash ~/slice_remote.sh index $espaco"
+    done
+fi
 
 etapa "[7/7] avaliacao (eval.py) -> $OUT_CSV"
 gancho_de_falha eval

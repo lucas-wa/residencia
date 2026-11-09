@@ -11,6 +11,13 @@ consulta multi-espaco de producao e a um duble no teste. Em producao quem o mont
 `main()` abaixo, adaptando `search_architecture` (que devolve `[(item_id, score_rrf), ...]`)
 para a lista de ids que as metricas esperam.
 
+E e esse desacoplamento que deixa a arquitetura `B` entrar sem mexer no caminho pgvector:
+B nao tem espaco pgvector nenhum (`spaces.uses_pgvector("B") is False`) -- o eixo documento
+ranqueia as paginas por ColQwen2.5 + MaxSim em memoria (`gcp/slice/doc_specialist.py`) e
+entrega o MESMO `retrieve(texto) -> ids`. `main()` so escolhe qual montar; daqui para baixo
+as metricas, a latencia e a linha do CSV sao as mesmas, que e o que torna `B,ptbr_planos,...`
+comparavel DIRETO com `A,ptbr_planos,...`.
+
 Cada execucao mede UMA tarefa, e e o CORPUS que diz qual: paginas (`doc_image`) ou clipes
 de audio. So os espacos que indexam a modalidade daquele corpus entram na fusao
 (`spaces_for_corpus` -> `search_architecture(only_spaces=...)`) -- na tarefa doc-visual o
@@ -28,6 +35,11 @@ Uso:
     CSV=results/comparacao.csv
     python -m gcp.slice.eval --arch A       --data-dir data/govexe/planos --out "$CSV"
     python -m gcp.slice.eval --arch A+audio --data-dir data/govexe/planos --out "$CSV"
+
+    # B nao usa Cloud SQL: nem PGPASSWORD, nem proxy. So a GPU e as paginas.
+    # `--batch-size` e o knob de VRAM: baixe se a L4 estourar memoria.
+    python -m gcp.slice.eval --arch B --data-dir data/govexe/ptbr_planos \
+        --pages-dir ~/govexe-pages --batch-size 2 --out "$CSV"
 
 A segunda rodada ACRESCENTA a sua linha ao mesmo CSV (a anterior fica), que e como a
 comparacao entre arquiteturas se forma.
@@ -48,12 +60,16 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from benchmark.common.metrics import aggregate, mrr, ndcg_at_k, recall_at_k  # noqa: E402
-from gcp.slice.spaces import SPACES, spaces_for_modalities  # noqa: E402
+from gcp.slice.spaces import (  # noqa: E402
+    SPACES,
+    spaces_for_modalities,
+    specialists_for_modalities,
+)
 
 log = logging.getLogger(__name__)
 
 __all__ = ["DEFAULT_K_VALUES", "corpus_modalities", "evaluate_architecture", "main",
-           "spaces_for_corpus", "write_comparison_csv"]
+           "specialist_for_corpus", "spaces_for_corpus", "write_comparison_csv"]
 
 DEFAULT_K_VALUES = (1, 5, 10)
 
@@ -196,6 +212,39 @@ def spaces_for_corpus(arch: str, docs, *, tarefa: str = "") -> set[str] | None:
     return nomes
 
 
+def specialist_for_corpus(arch: str, docs, *, tarefa: str = ""):
+    """O `Specialist` (late-interaction) de `arch` que ranqueia ESTE corpus.
+
+    Gemeo de `spaces_for_corpus` para o caminho sem pgvector. Mesma regra: quem diz quem
+    ranqueia o que e o registro (`spaces.specialists_for_modalities`), nunca uma lista
+    escrita aqui -- um corpus de audio simplesmente nao casa com o eixo documento de `B`,
+    e isso tem de parar a rodada em vez de virar 0.0 em tudo.
+
+    Devolve UM especialista. `B` hoje e o primeiro braco do ensemble; quando um segundo
+    braco entrar, os rankings se fundem por RRF (como ja acontece entre espacos) e e aqui
+    que a fusao vai morar -- ate la, dois especialistas para a mesma tarefa falham, em
+    vez de um deles ser escolhido em silencio.
+    """
+    alvo = corpus_modalities(docs)
+    rotulo = f" ({tarefa})" if tarefa else ""
+    if not alvo:
+        raise ValueError(f"nao deu para inferir a modalidade do corpus{rotulo}: o "
+                         f"especialista de {arch!r} ranqueia por modalidade declarada")
+    candidatos = specialists_for_modalities(arch, alvo)
+    if not candidatos:
+        raise ValueError(
+            f"a arquitetura {arch!r} nao ranqueia nada do corpus{rotulo} "
+            f"(modalidades: {', '.join(sorted(alvo))}): nao ha o que avaliar")
+    if len(candidatos) > 1:
+        raise ValueError(
+            f"{len(candidatos)} especialistas de {arch!r} ranqueiam o corpus{rotulo} "
+            f"({', '.join(e.name for e in candidatos)}): a fusao entre bracos do ensemble "
+            f"ainda nao esta implementada")
+    log.info("corpus%s: modalidades %s -> especialista: %s", rotulo,
+             ", ".join(sorted(alvo)), candidatos[0].name)
+    return candidatos[0]
+
+
 def evaluate_architecture(arch: str, queries: list[dict], qrels,
                           retrieve: Callable[[str], list[str]], *,
                           k_values: Iterable[int] = DEFAULT_K_VALUES) -> dict:
@@ -324,10 +373,33 @@ def _linhas_anteriores(path: Path, arch: str, tarefa: str) -> list[dict]:
                 if (r.get("arquitetura"), r.get("tarefa")) != (arch, tarefa)]
 
 
-def main(argv: list[str] | None = None) -> int:
+def _retrieve_late_interaction(arch: str, docs, a: argparse.Namespace, *, tarefa: str,
+                               retriever=None) -> Callable[[str], list[str]]:
+    """O `retrieve` de uma arquitetura SEM pgvector (hoje: `B`, eixo documento).
+
+    Import tardio de `doc_specialist` pelo mesmo motivo de `_text_embedder`: manter este
+    modulo (e os seus testes) livres de torch. `retriever` injetado e o que permite ao
+    teste exercitar o roteamento com um duble.
+    """
+    from gcp.slice.doc_specialist import DEFAULT_BATCH_SIZE, build_doc_retriever
+
+    especialista = specialist_for_corpus(arch, docs, tarefa=tarefa)
+    # `--batch-size` nao dado (`None`) cai no default do modulo do ranker -- a fonte unica
+    # desse numero e ele, nao esta funcao.
+    batch_size = getattr(a, "batch_size", None) or DEFAULT_BATCH_SIZE
+    log.info("%s: ranqueador late-interaction (batch_size=%d)", arch, batch_size)
+    return build_doc_retriever(docs, specialist=especialista, device=a.device,
+                               dtype=a.dtype, batch_size=batch_size,
+                               data_dir=a.data_dir,
+                               pages_dir=getattr(a, "pages_dir", None),
+                               retriever=retriever)
+
+
+def main(argv: list[str] | None = None, *, retriever=None) -> int:
+    from gcp.slice.doc_specialist import DEFAULT_BATCH_SIZE
     from gcp.slice.embed_job import add_pg_arguments
     from gcp.slice.query import MULTI_TOP_K, search_architecture
-    from gcp.slice.spaces import ARCHITECTURES
+    from gcp.slice.spaces import ARCHITECTURES, uses_pgvector
 
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -340,7 +412,17 @@ def main(argv: list[str] | None = None) -> int:
                     help="nome da tarefa na linha do CSV (default: o nome de --data-dir)")
     ap.add_argument("--k", type=int, default=MULTI_TOP_K,
                     help=f"profundidade pedida a cada espaco antes do RRF (default: "
-                         f"{MULTI_TOP_K})")
+                         f"{MULTI_TOP_K}); nao se aplica a arquitetura sem pgvector, que "
+                         f"ranqueia o corpus inteiro em memoria")
+    ap.add_argument("--pages-dir", default=None,
+                    help="diretorio com as paginas do corpus (so para arquitetura sem "
+                         "pgvector): na VM elas vem do Bronze, e nao do repo, que as "
+                         "exclui do tarball por tamanho")
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help=f"paginas por lote ao embutir o corpus (so para arquitetura sem "
+                         f"pgvector; default: {DEFAULT_BATCH_SIZE}). E o knob de VRAM da "
+                         f"rodada: baixe para 2 ou 1 se a L4 estourar memoria -- custa "
+                         f"tempo e nao muda ranking")
     ap.add_argument("--k-values", type=int, nargs="+", default=list(DEFAULT_K_VALUES),
                     help="cortes das metricas (default: %(default)s)")
     ap.add_argument("--device", default="cuda")
@@ -358,23 +440,42 @@ def main(argv: list[str] | None = None) -> int:
     if a.local_store is True:
         ap.error("--local-store aqui pede um DIRETORIO (um indice por espaco, "
                  "<dir>/<espaco>.json), e nao um arquivo so")
+    # Duas flags do caminho late-interaction. RECUSADAS (e nao ignoradas) na arquitetura
+    # pgvector, pelo mesmo motivo de `--table` logo acima: aceitar a flag e nao usa-la faz
+    # quem baixou o batch para fugir de um OOM acreditar que baixou, e so descobrir o
+    # contrario quando a rodada paga cair de novo.
+    if a.pages_dir and uses_pgvector(a.arch):
+        ap.error(f"--pages-dir nao se aplica a {a.arch}: ela ranqueia pelo indice "
+                 "pgvector, cujos binarios ja estao no Bronze")
+    if a.batch_size is not None and uses_pgvector(a.arch):
+        ap.error(f"--batch-size nao se aplica a {a.arch}: aqui ele e knob do indice, e "
+                 "quem indexa e o embed_job (gcp/slice/embed_job.py --batch-size)")
+    if a.batch_size is not None and a.batch_size < 1:
+        ap.error(f"--batch-size tem de ser >= 1 (recebido: {a.batch_size})")
 
     from benchmark.common.datasets import load_local
     queries, docs, qrels = load_local(a.data_dir)
     tarefa = a.tarefa or Path(a.data_dir).name
 
-    # A tarefa manda nos espacos: so os que indexam a modalidade DESTE corpus entram na
-    # fusao. E o que mantem `A` e `A+audio` identicas na tarefa doc-visual (spec secao 5)
-    # -- fundir o CLAP ali entremearia clipes de audio entre as paginas julgadas.
-    espacos_da_tarefa = spaces_for_corpus(a.arch, docs, tarefa=tarefa)
-    stores, embedders = _stores_e_embedders(a.arch, a, apenas=espacos_da_tarefa)
+    # O ROTEAMENTO da avaliacao, e a unica bifurcacao entre as arquiteturas: quem tem
+    # espaco pgvector consulta o Cloud SQL e funde por RRF; quem nao tem (`B`) ranqueia
+    # por late interaction em memoria. Quem decide e o registro, nao o nome da arquitetura.
+    if uses_pgvector(a.arch):
+        # A tarefa manda nos espacos: so os que indexam a modalidade DESTE corpus entram na
+        # fusao. E o que mantem `A` e `A+audio` identicas na tarefa doc-visual (spec secao 5)
+        # -- fundir o CLAP ali entremearia clipes de audio entre as paginas julgadas.
+        espacos_da_tarefa = spaces_for_corpus(a.arch, docs, tarefa=tarefa)
+        stores, embedders = _stores_e_embedders(a.arch, a, apenas=espacos_da_tarefa)
 
-    # `search_architecture` devolve [(item_id, score_rrf), ...]; as metricas querem so os ids
-    # (e na ordem). Nao se corta em `k` aqui: cada metrica trunca no seu proprio corte.
-    def retrieve(texto: str) -> list[str]:
-        return [item_id for item_id, _ in search_architecture(
-            a.arch, texto, k=a.k, stores=stores, embedders=embedders,
-            only_spaces=espacos_da_tarefa)]
+        # `search_architecture` devolve [(item_id, score_rrf), ...]; as metricas querem so
+        # os ids (e na ordem). Nao se corta em `k` aqui: cada metrica trunca no seu corte.
+        def retrieve(texto: str) -> list[str]:
+            return [item_id for item_id, _ in search_architecture(
+                a.arch, texto, k=a.k, stores=stores, embedders=embedders,
+                only_spaces=espacos_da_tarefa)]
+    else:
+        retrieve = _retrieve_late_interaction(a.arch, docs, a, tarefa=tarefa,
+                                              retriever=retriever)
 
     metricas = evaluate_architecture(a.arch, queries, qrels, retrieve,
                                      k_values=tuple(a.k_values))

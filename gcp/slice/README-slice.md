@@ -17,6 +17,15 @@ própria** —, e uma **arquitetura** é a lista de espaços que ela consulta:
 |---|---|---|
 | `A` | `qwen3vl` | `govexe_qwen3vl` |
 | `A+áudio` | `qwen3vl` + `clap` | `govexe_qwen3vl` + `govexe_clap` |
+| `B` | — (nenhum) | — (nenhuma) |
+
+`B` é o **ensemble de especialistas** de `fusao/multimodal.md` §3, e o seu primeiro braço é
+o **eixo documento**: ColQwen2.5 *late interaction*. Ele não cabe num espaço: emite um vetor
+por **token** e pontua por **MaxSim**, enquanto um espaço é "1 vetor denso por item, cosseno,
+1 tabela pgvector". Por isso `B` tem a lista de espaços **vazia** e vive num segundo registro
+(`SPECIALISTS`, no mesmo `spaces.py`), e a sua rodada **dispensa Cloud SQL inteiro** — as 93
+páginas são ranqueadas em memória (`gcp/slice/doc_specialist.py`). `spaces.uses_pgvector(arch)`
+é o que roteia tanto o `eval.py` quanto o `run_slice.sh`.
 
 O registro declarativo (fonte única de verdade de tabela, checkpoint, dimensão e
 modalidades de cada espaço) é `gcp/slice/spaces.py`; `embed_job --space` e a consulta
@@ -554,6 +563,11 @@ python -m gcp.slice.eval --arch A       --data-dir data/govexe/ptbr_planos \
     --out results/comparacao.csv --pg-host 127.0.0.1 --pg-db "$DB" --pg-user "$DB_USER"
 python -m gcp.slice.eval --arch A+audio --data-dir data/govexe/ptbr_planos \
     --out results/comparacao.csv --pg-host 127.0.0.1 --pg-db "$DB" --pg-user "$DB_USER"
+
+# B: sem pgvector, sem proxy, sem PGPASSWORD. `--pages-dir` aponta para onde as páginas
+# do Bronze foram baixadas (o tarball do repo as exclui por tamanho).
+python -m gcp.slice.eval --arch B --data-dir data/govexe/ptbr_planos \
+    --out results/comparacao.csv --pages-dir ~/govexe-pages
 ```
 
 Cada execução escreve **uma linha por (arquitetura, tarefa)** no mesmo CSV (recall@k,
@@ -566,6 +580,12 @@ espaços que indexam a modalidade daquele conjunto de avaliação. Num corpus de
 (`doc_image`), o `clap` não indexa nada do corpus e fica de fora — por isso `A` e
 `A+áudio` dão a **mesma** linha na tarefa doc-visual, como o protocolo de avaliação exige.
 Num corpus de clipes, `A` mede a trilha ASR→texto e `A+áudio` funde ASR + CLAP nativo.
+
+A mesma regra vale para `B`, pelo outro registro (`specialists_for_modalities`): o eixo
+documento só declara `doc_image`, então `B` avalia a tarefa doc-visual e **recusa** um
+corpus de áudio em vez de devolver 0.0 em tudo. Os ids do ranking de `B` são os `Doc.id`
+do `corpus.jsonl` — os mesmos do `qrels.tsv` —, e é isso que torna a linha
+`B,ptbr_planos,…` comparável **direto** com a linha `A,ptbr_planos,…`.
 
 **Idempotência** — rode o `embed_job.py` do §7 uma segunda vez, sem mudar nada, e
 compare as contagens antes/depois:

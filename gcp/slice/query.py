@@ -121,6 +121,13 @@ def search_architecture(arch: str, query_text: str, *, k: int = MULTI_TOP_K,
     um cosseno, e so faz sentido DENTRO deste ranking.
     """
     espacos = architecture_spaces(arch)           # ValueError na hora se `arch` nao existe
+    if not espacos:
+        # Arquitetura sem espaco pgvector (ex.: `B`, que ranqueia por late interaction em
+        # memoria). Sem esta guarda a fusao de zero rankings devolveria `[]` -- uma lista
+        # vazia que parece "nao achei nada" e na verdade e "voce chamou o caminho errado".
+        raise ValueError(f"a arquitetura {arch!r} nao tem espaco pgvector: ela nao se "
+                         f"consulta por aqui (veja spaces.uses_pgvector / "
+                         f"spaces.architecture_specialists)")
     if only_spaces is not None:
         pedidos = set(only_spaces)
         da_arquitetura = {espaco.name for espaco in espacos}
