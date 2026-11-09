@@ -8,8 +8,8 @@ para o arquivo de consultas (uma por linha) e o `--out` para o `.txt` em `logs/`
 O embedder e o MESMO BGE-M3 denso usado no indice textual unico (`fusao/ensemble.md`):
 ele e construido por IMPORT TARDIO em `_build_embedder` -- como o
 `doc_specialist._build_retriever` faz com o ColVision -- para que importar/testar este
-modulo numa maquina sem GPU nao arraste FlagEmbedding/torch nem baixe checkpoint. Nos
-testes o `embedder` e injetado por um duble, entao `_build_embedder` nunca roda.
+modulo numa maquina sem GPU nao arraste sentence-transformers/torch nem baixe checkpoint.
+Nos testes o `embedder` e injetado por um duble, entao `_build_embedder` nunca roda.
 
 Uso (no container do cluster, via slurm_run.sh):
     python -m ensemble.run_ensemble \
@@ -50,23 +50,25 @@ def _load_queries(path: str | Path) -> list[str]:
 def _build_embedder() -> Embedder:
     """Constroi o embedder denso BGE-M3 -- import TARDIO, como `doc_specialist`.
 
-    O `from FlagEmbedding import BGEM3FlagModel` arrasta torch/FlagEmbedding e, na
-    primeira chamada, baixa o checkpoint do Hub. Mante-lo AQUI DENTRO e o que permite
-    importar (e testar) este modulo numa maquina sem GPU, com o embedder injetado por um
-    duble. So roda de verdade no cluster, dentro do `main`, quando nenhum duble foi dado.
+    O `from sentence_transformers import SentenceTransformer` arrasta torch e, na primeira
+    chamada, baixa o checkpoint do Hub. Mante-lo AQUI DENTRO e o que permite importar (e
+    testar) este modulo numa maquina sem GPU, com o embedder injetado por um duble. So
+    roda de verdade no cluster, dentro do `main`, quando nenhum duble foi dado.
 
-    Devolve `encode(list[str]) -> np.ndarray [n, d]` com os vetores densos; a
-    normalizacao L2 e o cosine ficam no `ensemble.index` (nao aqui).
+    sentence-transformers (nao FlagEmbedding) porque ja e dep do `requirements-slurm.txt`:
+    o v1 do ensemble e denso+cosine, entao o vetor denso do `SentenceTransformer` basta.
+    Devolve `encode(list[str]) -> np.ndarray [n, d]` com os vetores densos; a normalizacao
+    L2 e o cosine ficam no `ensemble.index` (por isso `normalize_embeddings=False` aqui).
     """
-    from FlagEmbedding import BGEM3FlagModel
+    from sentence_transformers import SentenceTransformer
 
-    log.info("carregando embedder denso %s (use_fp16=True)", _BGE_M3_MODEL)
-    model = BGEM3FlagModel(_BGE_M3_MODEL, use_fp16=True)
+    log.info("carregando embedder denso %s (device=cuda, fp16)", _BGE_M3_MODEL)
+    model = SentenceTransformer(_BGE_M3_MODEL, device="cuda")
+    model.half()
 
     def encode(texts: list[str]) -> np.ndarray:
-        out = model.encode(texts, return_dense=True, return_sparse=False,
-                           return_colbert_vecs=False)
-        return np.asarray(out["dense_vecs"], dtype=np.float32)
+        out = model.encode(texts, convert_to_numpy=True, normalize_embeddings=False)
+        return np.asarray(out, dtype=np.float32)
 
     return encode
 
