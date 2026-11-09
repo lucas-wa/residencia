@@ -14,8 +14,18 @@ def _bow(texts: list[str]) -> np.ndarray:
     )
 
 
-def _rec(id_: str, modality: str, descriptor: str, path: str | None = None) -> PointerRecord:
-    meta = {"path": path} if path else {}
+def _rec(
+    id_: str,
+    modality: str,
+    descriptor: str,
+    path: str | None = None,
+    a_repr: str | None = None,
+) -> PointerRecord:
+    meta: dict = {}
+    if path:
+        meta["path"] = path
+    if a_repr:
+        meta["a_repr"] = a_repr
     return PointerRecord(
         id=id_, modality=modality, descriptor=descriptor,
         pointer_uri=f"file://{id_}", source="t", meta=meta,
@@ -69,3 +79,51 @@ def test_dense_embed_items_chamado_uma_vez():
     sp.search("saúde", 2)
     assert len(calls) == 1
     assert calls[0] == ["orçamento", "saúde"]
+
+
+def test_dense_video_usa_keyframe_por_janela():
+    # Duas janelas do MESMO video (mesmo meta["path"]) com keyframes distintos em a_repr.
+    # O especialista de video deve embutir o keyframe de cada janela, nao o path comum,
+    # senao as duas janelas colapsam na mesma representacao.
+    calls = []
+
+    def spy(texts):
+        calls.append(list(texts))
+        return _bow(texts)
+
+    recs = [
+        _rec("v1", "video", "x", path="video.mp4", a_repr="orçamento saúde"),
+        _rec("v2", "video", "x", path="video.mp4", a_repr="estrada praia"),
+    ]
+    sp = DenseSpecialist("video", recs, embed_items=spy, embed_query=_bow)
+    # embed_items recebeu os dois keyframes distintos, nao "video.mp4" duas vezes.
+    assert calls == [["orçamento saúde", "estrada praia"]]
+    res = sp.search("orçamento saúde", 2)
+    assert res[0][0] == "v1"
+    scores = {i: s for i, s in res}
+    assert scores["v1"] != scores["v2"]  # nao colapsam
+
+
+def test_dense_video_sem_a_repr_cai_para_path_e_avisa(caplog):
+    import logging
+
+    rec = _rec("v1", "video", "x", path="orçamento saúde")  # sem a_repr
+    with caplog.at_level(logging.WARNING):
+        sp = DenseSpecialist("video", [rec], embed_items=_bow, embed_query=_bow)
+    res = sp.search("orçamento saúde", 1)
+    assert res[0][0] == "v1"
+    assert any("v1" in r.message for r in caplog.records)
+
+
+def test_dense_embed_items_contagem_de_linhas_diverge_falha():
+    # embed_items que devolve menos linhas que ids -> ValueError claro.
+    def bad(texts):
+        return _bow(texts)[:1]
+
+    recs = [_rec("t1", "texto", "orçamento"), _rec("t2", "texto", "saúde")]
+    try:
+        DenseSpecialist("texto", recs, embed_items=bad, embed_query=_bow)
+    except ValueError as e:
+        assert "1" in str(e) and "2" in str(e)
+    else:
+        raise AssertionError("esperava ValueError por divergencia de contagem")

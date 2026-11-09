@@ -68,11 +68,17 @@ def build_audio_embedder() -> EmbedderPair:
 
 
 def build_video_embedder() -> EmbedderPair:
-    """WeMM-Embedding-2B: items = caminhos de video/keyframes, query = texto.
+    """WeMM-Embedding-2B: items = KEYFRAME POR JANELA (imagem), query = texto.
 
-    API NAO VERIFICADA: o WeMM-Embedding carrega via `trust_remote_code` e expoe
-    `encode`/`get_text_embedding`-style no remote code; confirmar no cluster. Aqui usa
-    `AutoModel` + `encode_video`/`encode_text` conforme o card do checkpoint.
+    O eixo de video rankeia janelas; o artefato discriminativo por janela e o
+    keyframe (`meta["a_repr"]`), nao o video inteiro (`meta["path"]`, igual para
+    todas as janelas). Logo `embed_items` embute a IMAGEM do keyframe de cada
+    janela -- WeMM-Embedding e multimodal e trata imagens -- e NAO roda
+    `encode_video` sobre o arquivo de video compartilhado.
+
+    API NAO VERIFICADA: o WeMM-Embedding carrega via `trust_remote_code`; os nomes
+    `encode_image`/`encode_text` sao best-effort, a confirmar no cluster. O que ESTE
+    builder garante e que os itens sao os keyframes por janela, nao o video comum.
     """
     from transformers import AutoModel
 
@@ -80,7 +86,7 @@ def build_video_embedder() -> EmbedderPair:
     model = AutoModel.from_pretrained(VIDEO_MODEL, trust_remote_code=True).to("cuda").eval()
 
     def embed_items(paths: list[str]) -> np.ndarray:
-        return _f32(np.stack([np.asarray(model.encode_video(p).detach().float().cpu()) for p in paths]))
+        return _f32(np.stack([np.asarray(model.encode_image(p).detach().float().cpu()) for p in paths]))
 
     def embed_query(texts: list[str]) -> np.ndarray:
         return _f32(np.stack([np.asarray(model.encode_text(t).detach().float().cpu()) for t in texts]))

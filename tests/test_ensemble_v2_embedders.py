@@ -13,6 +13,8 @@ def test_modulo_importa_sem_baixar_modelo():
     assert emb.TEXT_MODEL == "BAAI/bge-m3"
     assert emb.IMAGE_MODEL == "google/siglip2-so400m-patch14-384"
     assert emb.AUDIO_MODEL == "laion/larger_clap_general"
+    assert emb.VIDEO_MODEL == "WeMM-Embedding-2B"
+    assert emb.UNIFIED_A_MODEL == "Qwen/Qwen3-VL-Embedding-2B"
 
 
 def test_registry_cobre_os_5_builders():
