@@ -62,7 +62,7 @@ def test_main_grava_output(tmp_path):
     # as tags de modalidade da demo aparecem no output anotado
     assert "[DOCUMENTO]" in conteudo
     assert "Consulta: orçamento saúde" in conteudo
-    assert "Modalidades ausentes:" in conteudo
+    assert "Modalidades ausentes (corpus):" in conteudo
 
 
 def test_main_records_inexistente_retorna_erro(tmp_path, capsys):

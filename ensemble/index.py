@@ -22,6 +22,11 @@ class EnsembleIndex:
     records: list[PointerRecord]
     matrix: np.ndarray  # [n, d], linhas L2-normalizadas
 
+    @property
+    def modalidades(self) -> set[str]:
+        """Conjunto de modalidades presentes no corpus (nível de corpus, não por query)."""
+        return {r.modality for r in self.records}
+
     def search(
         self, query: str, k: int = 10, *, embedder: Embedder
     ) -> list[tuple[PointerRecord, float]]:
