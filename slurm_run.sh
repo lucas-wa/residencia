@@ -13,6 +13,9 @@
 #              (mesmo trio)
 #   ensemble-> preflight + demo cross-modal do ensemble (indice textual   [precisa GPU]
 #              unico BGE-M3): ranking anotado por modalidade em logs/
+#   ensemble_v2-> preflight + captura (internet) + eval nativo: os 5       [precisa GPU]
+#              especialistas nativos fundidos por RRF vs. baselines A/B ->
+#              results/comparacao_v2.csv + logs/ensemble_v2.txt
 #   all     -> preflight + build + vidore + govexe (default)
 #
 # -------------------------------------------------------------------------------------
@@ -50,6 +53,14 @@
 #   STAGE=ensemble sbatch --gres=gpu:h100:1 slurm_run.sh
 #   ENSEMBLE_RECORDS=/work/ufg/residencia/data/govexe/ensemble_orcamento/records.jsonl \
 #       STAGE=ensemble sbatch --gres=gpu:h100:1 slurm_run.sh
+#
+#   # 3c) ensemble v2 NATIVO (GPU): captura o corpus Orcamento (internet; o no tem saida)
+#   #     retendo os binarios no bind /work, depois avalia os 5 especialistas nativos
+#   #     fundidos por RRF vs. os baselines A/B -> results/comparacao_v2.csv +
+#   #     logs/ensemble_v2.txt. Corpus/queries/qrels sao parametrizaveis por env:
+#   STAGE=ensemble_v2 sbatch --gres=gpu:h100:1 slurm_run.sh
+#   ENSEMBLE_V2_CORPUS=/work/ufg/residencia/data/govexe/ensemble_orcamento/records.jsonl \
+#       STAGE=ensemble_v2 sbatch --gres=gpu:h100:1 slurm_run.sh
 #
 #   # tudo de uma vez (build + vidore + govexe), GPU:
 #   sbatch slurm_run.sh
@@ -129,9 +140,16 @@ GOVEXE_CONFIGS="${GOVEXE_CONFIGS:-benchmark/configs/govexe_colembed8b.yaml bench
 # o insumo como o GOVEXE_CONFIGS faz com os configs; aponte para outro conjunto por env.
 ENSEMBLE_RECORDS="${ENSEMBLE_RECORDS:-data/govexe/ensemble_orcamento/records.jsonl}"
 
+# Insumos da STAGE=ensemble_v2 (caminhos DENTRO do bind /work). O corpus e (re)construido
+# pela propria captura da stage; queries/qrels sao os julgamentos do conjunto Orcamento.
+# Parametrizados por env como o ENSEMBLE_RECORDS acima.
+ENSEMBLE_V2_CORPUS="${ENSEMBLE_V2_CORPUS:-data/govexe/ensemble_orcamento/records.jsonl}"
+ENSEMBLE_V2_QUERIES="${ENSEMBLE_V2_QUERIES:-data/govexe/ensemble_orcamento/queries.txt}"
+ENSEMBLE_V2_QRELS="${ENSEMBLE_V2_QRELS:-data/govexe/ensemble_orcamento/qrels.tsv}"
+
 case "$STAGE" in
-    preflight|build|vidore|govexe|ensemble|all) ;;
-    *) echo "STAGE invalido: '$STAGE' (use preflight|build|vidore|govexe|ensemble|all)" >&2; exit 2 ;;
+    preflight|build|vidore|govexe|ensemble|ensemble_v2|all) ;;
+    *) echo "STAGE invalido: '$STAGE' (use preflight|build|vidore|govexe|ensemble|ensemble_v2|all)" >&2; exit 2 ;;
 esac
 
 mkdir -p logs
@@ -144,6 +162,7 @@ echo "    CONTAINER_IMAGE=$CONTAINER_IMAGE  HF_CACHE_DIR=$HF_CACHE_DIR"
 echo "    VIDORE_CONFIGS=$VIDORE_CONFIGS"
 echo "    GOVEXE_CONFIGS=$GOVEXE_CONFIGS"
 echo "    ENSEMBLE_RECORDS=$ENSEMBLE_RECORDS"
+echo "    ENSEMBLE_V2_CORPUS=$ENSEMBLE_V2_CORPUS  ENSEMBLE_V2_QUERIES=$ENSEMBLE_V2_QUERIES  ENSEMBLE_V2_QRELS=$ENSEMBLE_V2_QRELS"
 
 # -------------------------------------------------------------------------------------
 # Propagacao das variaveis para DENTRO do container.
@@ -166,6 +185,9 @@ export SINGULARITYENV_PARQUET="$PARQUET"
 export SINGULARITYENV_VIDORE_CONFIGS="$VIDORE_CONFIGS"
 export SINGULARITYENV_GOVEXE_CONFIGS="$GOVEXE_CONFIGS"
 export SINGULARITYENV_ENSEMBLE_RECORDS="$ENSEMBLE_RECORDS"
+export SINGULARITYENV_ENSEMBLE_V2_CORPUS="$ENSEMBLE_V2_CORPUS"
+export SINGULARITYENV_ENSEMBLE_V2_QUERIES="$ENSEMBLE_V2_QUERIES"
+export SINGULARITYENV_ENSEMBLE_V2_QRELS="$ENSEMBLE_V2_QRELS"
 
 export APPTAINERENV_RESIDENCIA_DIR="$RESIDENCIA_DIR"
 export APPTAINERENV_STAGE="$STAGE"
@@ -178,6 +200,9 @@ export APPTAINERENV_PARQUET="$PARQUET"
 export APPTAINERENV_VIDORE_CONFIGS="$VIDORE_CONFIGS"
 export APPTAINERENV_GOVEXE_CONFIGS="$GOVEXE_CONFIGS"
 export APPTAINERENV_ENSEMBLE_RECORDS="$ENSEMBLE_RECORDS"
+export APPTAINERENV_ENSEMBLE_V2_CORPUS="$ENSEMBLE_V2_CORPUS"
+export APPTAINERENV_ENSEMBLE_V2_QUERIES="$ENSEMBLE_V2_QUERIES"
+export APPTAINERENV_ENSEMBLE_V2_QRELS="$ENSEMBLE_V2_QRELS"
 
 srun singularity exec \
     --nv \
@@ -465,6 +490,24 @@ srun singularity exec \
                 --out logs/ensemble_demo.txt
         }
 
+        run_ensemble_v2() {
+            echo "=== [ensemble_v2] captura (internet) + eval nativo RRF vs. A/B (GPU) ==="
+            # 1) captura: (re)constroi o corpus Orcamento baixando os binarios de cada eixo
+            #    e RETENDO-OS no bind /work (ao lado do records.jsonl). Precisa de internet
+            #    -- o no do cluster tem saida. ENSEMBLE_V2_CORPUS parametriza o destino.
+            python3 -m ensemble.build_corpus \
+                "${ENSEMBLE_V2_CORPUS:-data/govexe/ensemble_orcamento/records.jsonl}"
+            # 2) eval: monta os 5 especialistas nativos + retriever A + B (import tardio ->
+            #    os modelos/checkpoints carregam AQUI, por isso precisa de GPU), funde por
+            #    RRF e grava o CSV comparativo por (sistema, eixo) + o log da execucao.
+            python3 -m ensemble.eval.run_eval \
+                --corpus "${ENSEMBLE_V2_CORPUS:-data/govexe/ensemble_orcamento/records.jsonl}" \
+                --queries "${ENSEMBLE_V2_QUERIES:-data/govexe/ensemble_orcamento/queries.txt}" \
+                --qrels "${ENSEMBLE_V2_QRELS:-data/govexe/ensemble_orcamento/qrels.tsv}" \
+                --out results/comparacao_v2.csv \
+                --log logs/ensemble_v2.txt
+        }
+
         select_gpu
 
         case "$STAGE" in
@@ -473,6 +516,7 @@ srun singularity exec \
             vidore)    run_preflight; run_vidore ;;
             govexe)    run_preflight; run_govexe ;;
             ensemble)  run_preflight; run_ensemble ;;
+            ensemble_v2) run_preflight; run_ensemble_v2 ;;
             all)       run_preflight; run_build; run_vidore; run_govexe ;;
         esac
 
