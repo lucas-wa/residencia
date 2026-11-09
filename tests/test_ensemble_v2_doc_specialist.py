@@ -1,5 +1,6 @@
 """DocSpecialist: adapter do ranker late-interaction (ColQwen2.5 MaxSim) ao protocolo."""
 import numpy as np
+import pytest
 
 from ensemble.native.doc import DocSpecialist
 from ensemble.native.specialist import Specialist
@@ -38,8 +39,18 @@ def _rec(id_, modality, path=None):
                          pointer_uri=f"gs://b/{id_}", source="t", meta=meta)
 
 
-def test_doc_ranqueia_paginas():
-    recs = [_rec(f"p0{i}", "documento", f"pages/p0{i}.png") for i in range(3)]
+def _paginas(tmp_path, ids):
+    d = tmp_path / "pages"
+    d.mkdir(exist_ok=True)
+    out = []
+    for i in ids:
+        (d / f"{i}.png").write_bytes(b"")
+        out.append(_rec(i, "documento", str(d / f"{i}.png")))
+    return out
+
+
+def test_doc_ranqueia_paginas(tmp_path):
+    recs = _paginas(tmp_path, ["p00", "p01", "p02"])
     fake = FakeColRetriever({"saude": ["p02", "p00", "p01"]})
     spec = DocSpecialist(recs, ranker=fake)
 
@@ -47,15 +58,32 @@ def test_doc_ranqueia_paginas():
     res = spec.search("saude", 2)
     assert [i for i, _ in res] == ["p02", "p00"]
     assert res[0][1] > res[1][1]
-    assert fake.corpus_paths == ["pages/p00.png", "pages/p01.png", "pages/p02.png"]
+    assert fake.corpus_paths == [r.meta["path"] for r in recs]
 
 
-def test_doc_ignora_nao_documento():
-    recs = [_rec("p00", "documento", "pages/p00.png"), _rec("img1", "imagem", "x.png"),
-            _rec("t1", "texto"), _rec("p01", "documento")]
+def test_doc_ignora_nao_documento(tmp_path):
+    recs = _paginas(tmp_path, ["p00", "p01"]) + [_rec("img1", "imagem", "x.png"),
+                                                  _rec("t1", "texto")]
     fake = FakeColRetriever({"q": ["p01", "p00"]})
     spec = DocSpecialist(recs, ranker=fake)
 
     assert [i for i, _ in spec.search("q", 10)] == ["p01", "p00"]
     assert len(fake.corpus_paths) == 2
-    assert fake.corpus_paths[1] == "gs://b/p01"   # sem meta["path"]: cai no pointer_uri
+
+
+def test_doc_resolve_caminho_windows_via_pages_dir(tmp_path):
+    bronze = tmp_path / "bronze"
+    bronze.mkdir()
+    (bronze / "p00.png").write_bytes(b"")
+    rec = _rec("p00", "documento", r"data\govexe\pages\p00.png")
+    fake = FakeColRetriever({"q": ["p00"]})
+
+    DocSpecialist([rec], ranker=fake, pages_dir=bronze)
+
+    assert fake.corpus_paths == [str(bronze / "p00.png")]
+
+
+def test_doc_sem_arquivo_local_falha_claro():
+    rec = _rec("p01", "documento")   # so pointer_uri gs://: ColQwen nao abre
+    with pytest.raises(ValueError, match="p01"):
+        DocSpecialist([rec], ranker=FakeColRetriever({}))

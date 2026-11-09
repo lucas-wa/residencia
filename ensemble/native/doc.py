@@ -12,15 +12,28 @@ from ensemble.records import PointerRecord
 MODALITY = "documento"
 
 
-def _page_image(record: PointerRecord) -> str:
-    """Imagem da pagina: meta["path"] se houver, senao o pointer_uri."""
-    return record.meta.get("path") or record.pointer_uri
+def _page_image(record: PointerRecord, *, pages_dir=None, data_dir=None) -> str:
+    """Caminho LOCAL da pagina: meta["path"] (ou pointer_uri) via `resolve_image_path`.
+
+    Falha com erro claro se nao houver arquivo local (ex.: pointer_uri `gs://`): o
+    ColQwen nao abre URI remota.
+    """
+    from gcp.slice.doc_specialist import resolve_image_path  # import tardio: sem torch
+
+    bruto = record.meta.get("path") or record.pointer_uri
+    try:
+        return str(resolve_image_path(bruto, pages_dir=pages_dir, data_dir=data_dir))
+    except FileNotFoundError as e:
+        raise ValueError(f"pagina {record.id!r} sem arquivo local resolvivel "
+                         f"(meta['path'] ou pointer_uri local); passe pages_dir/data_dir: "
+                         f"{e}") from e
 
 
 class DocSpecialist:
     modality = MODALITY
 
-    def __init__(self, records: list[PointerRecord], *, ranker) -> None:
+    def __init__(self, records: list[PointerRecord], *, ranker, pages_dir=None,
+                 data_dir=None) -> None:
         from benchmark.common.types import Doc
 
         pages = [r for r in records if r.modality == MODALITY]
@@ -28,7 +41,9 @@ class DocSpecialist:
         self._ranker = ranker
         if pages:
             self._doc_mv = list(ranker.encode_corpus(
-                [Doc(id=r.id, image_path=_page_image(r)) for r in pages]))
+                [Doc(id=r.id, image_path=_page_image(r, pages_dir=pages_dir,
+                                                    data_dir=data_dir))
+                 for r in pages]))
             if len(self._doc_mv) != len(self._ids):
                 raise ValueError(f"{len(self._ids)} paginas para {len(self._doc_mv)} embeddings")
         else:
