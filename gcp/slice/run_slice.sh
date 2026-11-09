@@ -543,7 +543,12 @@ case "$FASE" in
 # =====================================================================================
 bootstrap)
 # =====================================================================================
-    if [ ! -d "$REPO_DIR" ]; then
+    # Guard por SENTINELA DE CODIGO, e nao por `[ -d "$REPO_DIR" ]`: a etapa [4/7] pode
+    # PRE-CRIAR `~/residencia` ao subir o `results/comparacao.csv` anterior -- e ai o teste
+    # de diretorio daria falso e o tarball nunca seria extraido (codigo e
+    # requirements-slurm.txt ausentes, bootstrap morrendo no sha256sum). Extrair por cima
+    # e seguro: o tarball exclui `results/`, entao o CSV recem-enviado fica intacto.
+    if [ ! -f "$REPO_DIR/requirements-slurm.txt" ]; then
         mkdir -p "$REPO_DIR"
         tar xzf "$HOME/repo.tgz" -C "$REPO_DIR"
     fi
@@ -557,6 +562,15 @@ bootstrap)
     if ! command -v ffmpeg >/dev/null 2>&1; then
         echo "--- instalando ffmpeg ---"
         sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+    fi
+
+    # python3.10-venv: a imagem DLVM atual tambem nao traz, e sem ele o `python3 -m venv`
+    # abaixo morre em "ensurepip is not available" e cai no fallback do python do sistema.
+    # Passo PROPRIO (e nao junto do ffmpeg) para nao ser pulado quando o ffmpeg ja existe.
+    if ! dpkg -s python3.10-venv >/dev/null 2>&1; then
+        echo "--- instalando python3.10-venv ---"
+        sudo apt-get update -qq && sudo apt-get install -y -qq python3.10-venv \
+            || echo "--- python3.10-venv falhou; o venv pode cair no fallback ---"
     fi
 
     # venv --system-site-packages: ENXERGA o torch/CUDA da imagem (reinstalar torch por
