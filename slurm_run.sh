@@ -11,6 +11,8 @@
 #              (ColEmbed V2 8B + Qwen3-VL-Embedding 8B + ColQwen2.5)
 #   govexe  -> preflight + avalia o conjunto pt-BR ja construido         [precisa GPU]
 #              (mesmo trio)
+#   ensemble-> preflight + demo cross-modal do ensemble (indice textual   [precisa GPU]
+#              unico BGE-M3): ranking anotado por modalidade em logs/
 #   all     -> preflight + build + vidore + govexe (default)
 #
 # -------------------------------------------------------------------------------------
@@ -42,6 +44,12 @@
 #
 #   # 3) pt-BR GovExe (GPU), depois que o build terminou:
 #   STAGE=govexe sbatch slurm_run.sh
+#
+#   # 3b) demo cross-modal do ensemble (GPU, para o BGE-M3); grava o ranking anotado em
+#   #     logs/ensemble_demo.txt. Os records vem de ENSEMBLE_RECORDS (default abaixo):
+#   STAGE=ensemble sbatch --gres=gpu:h100:1 slurm_run.sh
+#   ENSEMBLE_RECORDS=/work/ufg/residencia/data/govexe/ensemble_orcamento/records.jsonl \
+#       STAGE=ensemble sbatch --gres=gpu:h100:1 slurm_run.sh
 #
 #   # tudo de uma vez (build + vidore + govexe), GPU:
 #   sbatch slurm_run.sh
@@ -117,9 +125,13 @@ PARQUET="${PARQUET:-}"
 VIDORE_CONFIGS="${VIDORE_CONFIGS:-benchmark/configs/v3_colpali.yaml benchmark/configs/v3_colqwen2.yaml benchmark/configs/v3_colembed8b.yaml benchmark/configs/v3_jinav4.yaml benchmark/configs/v3_colqwen25.yaml}"
 GOVEXE_CONFIGS="${GOVEXE_CONFIGS:-benchmark/configs/govexe_colembed8b.yaml benchmark/configs/govexe_qwen3vl8b.yaml benchmark/configs/govexe_colqwen25.yaml}"
 
+# records.jsonl consumido pela STAGE=ensemble (caminho DENTRO do bind /work). Parametriza
+# o insumo como o GOVEXE_CONFIGS faz com os configs; aponte para outro conjunto por env.
+ENSEMBLE_RECORDS="${ENSEMBLE_RECORDS:-data/govexe/ensemble_orcamento/records.jsonl}"
+
 case "$STAGE" in
-    preflight|build|vidore|govexe|all) ;;
-    *) echo "STAGE invalido: '$STAGE' (use preflight|build|vidore|govexe|all)" >&2; exit 2 ;;
+    preflight|build|vidore|govexe|ensemble|all) ;;
+    *) echo "STAGE invalido: '$STAGE' (use preflight|build|vidore|govexe|ensemble|all)" >&2; exit 2 ;;
 esac
 
 mkdir -p logs
@@ -131,6 +143,7 @@ echo "    PARQUET=${PARQUET:-<Hub (privado)>}"
 echo "    CONTAINER_IMAGE=$CONTAINER_IMAGE  HF_CACHE_DIR=$HF_CACHE_DIR"
 echo "    VIDORE_CONFIGS=$VIDORE_CONFIGS"
 echo "    GOVEXE_CONFIGS=$GOVEXE_CONFIGS"
+echo "    ENSEMBLE_RECORDS=$ENSEMBLE_RECORDS"
 
 # -------------------------------------------------------------------------------------
 # Propagacao das variaveis para DENTRO do container.
@@ -152,6 +165,7 @@ export SINGULARITYENV_GPU_AUTOSELECT="$GPU_AUTOSELECT"
 export SINGULARITYENV_PARQUET="$PARQUET"
 export SINGULARITYENV_VIDORE_CONFIGS="$VIDORE_CONFIGS"
 export SINGULARITYENV_GOVEXE_CONFIGS="$GOVEXE_CONFIGS"
+export SINGULARITYENV_ENSEMBLE_RECORDS="$ENSEMBLE_RECORDS"
 
 export APPTAINERENV_RESIDENCIA_DIR="$RESIDENCIA_DIR"
 export APPTAINERENV_STAGE="$STAGE"
@@ -163,6 +177,7 @@ export APPTAINERENV_GPU_AUTOSELECT="$GPU_AUTOSELECT"
 export APPTAINERENV_PARQUET="$PARQUET"
 export APPTAINERENV_VIDORE_CONFIGS="$VIDORE_CONFIGS"
 export APPTAINERENV_GOVEXE_CONFIGS="$GOVEXE_CONFIGS"
+export APPTAINERENV_ENSEMBLE_RECORDS="$ENSEMBLE_RECORDS"
 
 srun singularity exec \
     --nv \
@@ -439,6 +454,17 @@ srun singularity exec \
             done
         }
 
+        run_ensemble() {
+            echo "=== [ensemble] demo cross-modal (indice textual unico BGE-M3, GPU) ==="
+            # records.jsonl parametrizado por ENSEMBLE_RECORDS (como o govexe parametriza
+            # os configs); queries fixas do conjunto orcamento; saida anotada em logs/.
+            # O embedder BGE-M3 so e construido aqui (import tardio) -> precisa de GPU.
+            python3 -m ensemble.run_ensemble \
+                --records "${ENSEMBLE_RECORDS:-data/govexe/ensemble_orcamento/records.jsonl}" \
+                --queries ensemble/queries_orcamento.txt \
+                --out logs/ensemble_demo.txt
+        }
+
         select_gpu
 
         case "$STAGE" in
@@ -446,6 +472,7 @@ srun singularity exec \
             build)     run_build ;;
             vidore)    run_preflight; run_vidore ;;
             govexe)    run_preflight; run_govexe ;;
+            ensemble)  run_preflight; run_ensemble ;;
             all)       run_preflight; run_build; run_vidore; run_govexe ;;
         esac
 
