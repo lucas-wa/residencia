@@ -143,3 +143,31 @@ def test_destaques_por_modalidade_surfaceia_melhor_de_cada():
     out = format_cli(res)
     for m in ("TEXTO", "DOCUMENTO", "AUDIO", "IMAGEM", "VIDEO"):
         assert f"[{m}]" in out
+
+
+def test_destaques_fora_do_topk_marcam_ponteiro_indisponivel():
+    # resolvidos deve cobrir a uniao (top-k U destaques): um ponteiro morto numa
+    # modalidade empurrada para fora do top-k ainda precisa da marca de indisponivel.
+    index = build_index(_corpus_vies_textual(), embedder=text_biased_embedder)
+    (res,) = run_demo(
+        index,
+        ["orçamento"],
+        embedder=text_biased_embedder,
+        k=2,
+        resolver=lambda u: False,
+    )
+
+    fora_do_topk = {"a1", "i1", "v1"}  # audio/imagem/video nao entram no top-k (k=2)
+    assert fora_do_topk & {r.id for r, _ in res.hits} == set()
+    # mas aparecem nos destaques e devem estar resolvidos como indisponiveis
+    destaques_ids = {r.id for r, _ in res.destaques_por_modalidade}
+    assert fora_do_topk <= destaques_ids
+    for rec, _ in res.destaques_por_modalidade:
+        if rec.id in fora_do_topk:
+            assert res.resolvidos[rec.pointer_uri] is False
+
+    # cada destaque fora do top-k aparece marcado como indisponivel no output
+    out = format_cli(res)
+    for linha in out.splitlines():
+        if any(f"gs://b/{i}" in linha for i in fora_do_topk):
+            assert "[ponteiro indisponível]" in linha

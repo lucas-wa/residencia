@@ -53,8 +53,13 @@ def run_demo(
         # rankeia o corpus inteiro p/ extrair o melhor de cada modalidade (intercalado)
         ranking_total = index.search(q, len(index.records), embedder=embedder)
         destaques = _destaques_por_modalidade(ranking_total)
+        # resolve todo uri que format_cli pode imprimir (top-k U destaques), senao um
+        # ponteiro morto numa modalidade fora do top-k ficaria sem marca de indisponivel
         resolvidos = (
-            {r.pointer_uri: bool(resolver(r.pointer_uri)) for r, _ in hits}
+            {
+                r.pointer_uri: bool(resolver(r.pointer_uri))
+                for r, _ in (*hits, *destaques)
+            }
             if resolver is not None
             else {}
         )
