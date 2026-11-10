@@ -25,7 +25,9 @@ DESTINO_PADRAO = "data/govexe/ensemble_orcamento/records.jsonl"
 #   imagem    -> listing da Agencia Camara, crawleado por fetch_gallery ate as paginas de
 #                artigo (a galeria semantica nao existe; o <figure><figcaption> esta la)
 #   audio     -> feeds podcast do Radio Senado, com <enclosure> (lido por fetch_clips)
-#   video     -> canal oficial @canalgov
+#   video     -> Portal Multimidia do Senado (TV Senado): /multimidia/eventos/{a}/{m}/{d}
+#                lista os eventos, /multimidia/data/{id} traz os MP4 diretos (sem login/
+#                token, amigavel a datacenter -- o YouTube bloqueia yt-dlp em IP de nuvem)
 FONTES_PADRAO: dict[str, list[str] | str] = {
     "texto": [
         "https://www.camara.leg.br/noticias/rss/ultimas-noticias",
@@ -40,7 +42,7 @@ FONTES_PADRAO: dict[str, list[str] | str] = {
         "https://www12.senado.leg.br/radio/1/voz-do-brasil/podcast.xml",
     ],
     "video": [
-        "https://www.youtube.com/@canalgov",
+        "https://www12.senado.leg.br",
     ],
 }
 
