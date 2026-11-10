@@ -23,7 +23,7 @@ EmbedderPair = tuple[Embed, Embed]
 TEXT_MODEL = "BAAI/bge-m3"
 IMAGE_MODEL = "google/siglip2-so400m-patch14-384"
 AUDIO_MODEL = "laion/larger_clap_general"
-VIDEO_MODEL = "WeMM-Embedding-2B"  # Tencent WeMM (id de Hub a confirmar no cluster)
+VIDEO_MODEL = "tencent/WeMM-Embedding-2B"
 UNIFIED_A_MODEL = "Qwen/Qwen3-VL-Embedding-2B"
 
 
@@ -76,20 +76,22 @@ def build_video_embedder() -> EmbedderPair:
     janela -- WeMM-Embedding e multimodal e trata imagens -- e NAO roda
     `encode_video` sobre o arquivo de video compartilhado.
 
-    API NAO VERIFICADA: o WeMM-Embedding carrega via `trust_remote_code`; os nomes
-    `encode_image`/`encode_text` sao best-effort, a confirmar no cluster. O que ESTE
-    builder garante e que os itens sao os keyframes por janela, nao o video comum.
+    API do model card: carrega por `SentenceTransformer(..., trust_remote_code=True)` e
+    expoe o par assimetrico `encode_document` / `encode_query`. O lado documento recebe
+    uma lista de DICTS (`{"image": <caminho>}`) -- e assim que o WeMM declara a
+    modalidade de cada item; o lado query recebe texto cru. Saida: [n, 2048] ja
+    L2-normalizada.
     """
-    from transformers import AutoModel
+    from sentence_transformers import SentenceTransformer
 
     log.info("carregando %s", VIDEO_MODEL)
-    model = AutoModel.from_pretrained(VIDEO_MODEL, trust_remote_code=True).to("cuda").eval()
+    model = SentenceTransformer(VIDEO_MODEL, trust_remote_code=True, device="cuda")
 
     def embed_items(paths: list[str]) -> np.ndarray:
-        return _f32(np.stack([np.asarray(model.encode_image(p).detach().float().cpu()) for p in paths]))
+        return _f32(model.encode_document([{"image": p} for p in paths]))
 
     def embed_query(texts: list[str]) -> np.ndarray:
-        return _f32(np.stack([np.asarray(model.encode_text(t).detach().float().cpu()) for t in texts]))
+        return _f32(model.encode_query(list(texts)))
 
     return embed_items, embed_query
 
