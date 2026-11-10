@@ -1,7 +1,7 @@
 """Monta o corpus de demonstracao (tema Orcamento, ~20 itens por eixo) em JSONL.
 
-Passo de dados: chama os 5 `fetch_*` (rede). Os valores de FONTES_PADRAO sao
-PLACEHOLDERS a confirmar com o Lucas antes do run real.
+Passo de dados: chama os 5 `fetch_*` (rede). Os valores de FONTES_PADRAO sao fontes
+REAIS, confirmadas (formato e alcancabilidade) antes do run.
 """
 from __future__ import annotations
 
@@ -18,13 +18,30 @@ from ensemble.records import PointerRecord, save_records, validate_record
 
 DESTINO_PADRAO = "data/govexe/ensemble_orcamento/records.jsonl"
 
-# TODO(confirmar com Lucas): fontes reais de cada eixo.
+# Fontes reais de cada eixo (NAO sao mais placeholders): formato e alcancabilidade
+# conferidos por curl.
+#   texto     -> RSS da Camara + do Senado, com <item><link> (lido por fetch_budget_articles)
+#   documento -> PDF real do PLOA 2026 (Volume I), %PDF-1.6
+#   imagem    -> listing da Agencia Camara, crawleado por fetch_gallery ate as paginas de
+#                artigo (a galeria semantica nao existe; o <figure><figcaption> esta la)
+#   audio     -> feeds podcast do Radio Senado, com <enclosure> (lido por fetch_clips)
+#   video     -> canal oficial @canalgov
 FONTES_PADRAO: dict[str, list[str] | str] = {
-    "texto": [],       # feeds RSS de noticias (Agencia Camara/Senado/EBC)
-    "documento": "",   # URL do PDF (LOA + relatorio da CMO)
-    "imagem": [],      # paginas de galeria (Camara/EBC/Senado)
-    "audio": [],       # feeds RSS com <enclosure> (Radioagencia)
-    "video": [],       # handles de canais oficiais (ex. Canal Gov)
+    "texto": [
+        "https://www.camara.leg.br/noticias/rss/ultimas-noticias",
+        "https://www12.senado.leg.br/noticias/rss",
+    ],
+    "documento": "https://www.congressonacional.leg.br/documents/150599582/152777548/Volume+I+-+PLOA2026.pdf/27b3dd01-42d6-4e0a-aff7-0f2cba33b67b",
+    "imagem": [
+        "https://www.camara.leg.br/noticias/ultimas",
+    ],
+    "audio": [
+        "https://www12.senado.leg.br/radio/1/boletim.leg/podcast.xml",
+        "https://www12.senado.leg.br/radio/1/voz-do-brasil/podcast.xml",
+    ],
+    "video": [
+        "https://www.youtube.com/@canalgov",
+    ],
 }
 
 
