@@ -25,13 +25,14 @@ def _corpo_html(raw_html: str) -> tuple[str, str]:
 
 def parse_article(raw_html: str, url: str) -> PointerRecord:
     corpo, titulo = _corpo_html(raw_html)
+    descriptor = text_descriptor(corpo, html=True)
     rec = PointerRecord(
         id="texto-" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:12],
         modality="texto",
-        descriptor=text_descriptor(corpo, html=True),
+        descriptor=descriptor,
         pointer_uri=url,
         source="noticia",
-        meta={"title": titulo},
+        meta={"title": titulo, "a_repr": descriptor},
     )
     validate_record(rec)
     return rec

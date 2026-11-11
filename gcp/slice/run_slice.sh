@@ -33,6 +33,16 @@
 #   bash gcp/slice/run_slice.sh --arch B --specialist-batch-size 2   # menos VRAM na L4
 #   bash gcp/slice/run_slice.sh --arch A --dry-run      # imprime tudo, nao toca a nuvem
 #
+#   # ensemble v2 nativo (5 especialistas -> RRF), em DUAS rodadas pagas separadas pelo
+#   # gate humano dos qrels -- a semantica e a do ENSEMBLE_V2_PHASE do slurm_run.sh:
+#   bash gcp/slice/run_slice.sh --arch ensemble --phase capture
+#       -> captura o corpus Orcamento na VM e TRAZ records.jsonl + binarios para o repo
+#          local ANTES do teardown; revise ensemble/eval/qrels_orcamento.tsv em cima dos
+#          item_ids capturados (recapturar muda os ids e invalida o gabarito)
+#   bash gcp/slice/run_slice.sh --arch ensemble --phase eval
+#       -> SOBE o corpus congelado + binarios + queries + qrels, avalia e traz o CSV
+#   bash gcp/slice/run_slice.sh --arch ensemble --phase all   # as duas na MESMA VM
+#
 #   Numa rodada paga, guarde a saida:
 #       bash gcp/slice/run_slice.sh --arch A+audio 2>&1 | tee logs/run_slice.log
 #
@@ -42,7 +52,7 @@
 #   SLICE_FAIL_AT=index bash gcp/slice/run_slice.sh --dry-run --arch A+audio
 #       -> a etapa de indexacao falha DE PROPOSITO e a saida mostra o teardown rodando
 #          assim mesmo. `SLICE_FAIL_AT` existe so para provar o trap (etapas: provision,
-#          bootstrap, index, eval); nao tem uso em producao.
+#          bootstrap, index, capture, eval); nao tem uso em producao.
 #
 #   Em `--dry-run`, precondicao de AMBIENTE que falta (gcloud fora do PATH, mini-set de
 #   audio ainda nao capturado) vira AVISO e a rodada segue: a verificacao do script nao
@@ -55,13 +65,30 @@
 #   A+audio   -> qwen3vl + clap       (o segundo indexa a forma de onda NATIVA)
 #   B         -> (nenhum espaco)      ensemble de especialistas: o eixo documento e o
 #                                     ColQwen2.5 late-interaction (MaxSim em memoria)
+#   ensemble  -> (nenhum espaco)      ensemble v2 NATIVO: 5 especialistas (texto BGE-M3,
+#                                     imagem SigLIP2, audio CLAP, video SigLIP2, documento
+#                                     ColQwen2.5) fundidos por RRF e comparados com os
+#                                     baselines A (Qwen3-VL) e B (so documento). Os
+#                                     modelos carregam UM EIXO POR VEZ -- cabe na L4 --
+#                                     e os indices sao em memoria (`ensemble/`, nao
+#                                     `gcp/slice/eval.py`).
 #
-# ARQUITETURA SEM pgvector (hoje so `B`)
+# FASES DO ensemble (`--phase`, espelha ENSEMBLE_V2_PHASE do slurm_run.sh)
+#
+# Recapturar o corpus muda os `item_id` (hash da URL) e invalida o gabarito, entao captura
+# e avaliacao sao DUAS rodadas pagas com um gate humano no meio. A persistencia entre elas
+# e o proprio repo local: a fase `capture` TRAZ `records.jsonl` + os binarios por tar antes
+# do teardown, e a fase `eval` os SOBE de volta (nao ha GCS no meio -- e ida-e-volta por
+# scp, com os mesmos helpers do mini-set de audio). `all` roda as duas na mesma VM.
+#
+# ARQUITETURA SEM pgvector (`B` e `ensemble`)
 #
 # B nao tem espaco pgvector: multi-vetor nao cabe numa coluna `vector(n)` ranqueada por
 # cosseno (ver gcp/slice/spaces.py). Entao a rodada de B PULA a etapa [1/7] (Cloud SQL) e
 # a etapa [6/7] (indexacao) -- sobem so a VM L4 e as 93 paginas baixadas do Bronze, e o
-# eval ranqueia tudo em memoria. O teardown fica MAIS simples, nao mais fraco: `SQL_TOCADA`
+# eval ranqueia tudo em memoria. O `ensemble` segue a MESMA rota (indices em memoria, RRF
+# sobre as ordens), so que o corpus e o do ensemble v2 e a etapa [6/7] vira a CAPTURA.
+# O teardown fica MAIS simples, nao mais fraco: `SQL_TOCADA`
 # continua 0, entao nem o delete nem a conferencia final procuram uma instancia Cloud SQL
 # que nunca existiu (procurar renderia um falso LEAK). A VM segue com a garantia de sempre.
 #
@@ -100,6 +127,10 @@ BOOT_DISK_SIZE="${BOOT_DISK_SIZE:-200GB}"
 # Imagem Deep Learning usada na rodada que funcionou (torch 2.9 + CUDA 12.9 + driver 580).
 IMAGE_FAMILY="${IMAGE_FAMILY:-pytorch-2-9-cu129-ubuntu-2204-nvidia-580}"
 IMAGE_PROJECT="${IMAGE_PROJECT:-deeplearning-platform-release}"
+# Modelo de provisionamento da VM: STANDARD (on-demand, o de sempre) ou SPOT. O spot puxa
+# de OUTRO pool de capacidade, entao e a saida quando a L4 on-demand esta em stockout em
+# todas as zonas da lista -- ao custo de poder ser preemptada no meio da rodada.
+PROVISIONING_MODEL="${PROVISIONING_MODEL:-STANDARD}"
 
 # Insumos da indexacao.
 SOURCE="${SOURCE:-tse_planos}"              # particao `fonte=` do Bronze
@@ -117,9 +148,32 @@ SPECIALIST_BATCH_SIZE="${SPECIALIST_BATCH_SIZE:-4}"
 # Conjuntos de avaliacao (um `eval.py` por conjunto; o CSV acumula as linhas).
 EVAL_DIRS="${EVAL_DIRS:-data/govexe/ptbr_planos}"
 EVAL_AUDIO_DIR="${EVAL_AUDIO_DIR:-data/govexe/audio_eval}"
-OUT_CSV="${OUT_CSV:-results/comparacao.csv}"
+# CSV de saida. O default DEPENDE da arquitetura (o ensemble v2 escreve o seu proprio
+# comparativo, `results/comparacao_v2.csv`), entao ele e resolvido no `case "$ARCH"`
+# abaixo -- aqui so se respeita o que vier do ambiente ou de `--out`.
+OUT_CSV="${OUT_CSV:-}"
+
+# Insumos da arquitetura `ensemble` (todos relativos a raiz do repo, como os demais: eles
+# viajam no scp e sao relidos na VM como "$REPO_DIR/<caminho>"). Espelham as ENSEMBLE_V2_*
+# do slurm_run.sh. O `bin/` guarda os binarios retidos pela captura (um subdiretorio por
+# eixo) -- e o que `build_corpus` referencia em `meta["path"]`.
+ENSEMBLE_CORPUS="${ENSEMBLE_CORPUS:-data/govexe/ensemble_orcamento/records.jsonl}"
+ENSEMBLE_BIN_DIR="${ENSEMBLE_BIN_DIR:-data/govexe/ensemble_orcamento/bin}"
+ENSEMBLE_QUERIES="${ENSEMBLE_QUERIES:-ensemble/eval/queries_orcamento_v2.txt}"
+ENSEMBLE_QRELS="${ENSEMBLE_QRELS:-ensemble/eval/qrels_orcamento.tsv}"
+ENSEMBLE_OUT_CSV="${ENSEMBLE_OUT_CSV:-results/comparacao_v2.csv}"
+ENSEMBLE_LOG="${ENSEMBLE_LOG:-logs/ensemble_v2.txt}"
+# Rankings por query (por eixo antes do RRF, fundido, A e B): artefato que sustenta o
+# sweep de fusao OFFLINE (k do RRF, pesos por eixo) sem re-rodar GPU. Saida secundaria --
+# tanto a gravacao na VM quanto o resgate sao best-effort.
+ENSEMBLE_RANKINGS="${ENSEMBLE_RANKINGS:-results/rankings_v2.json}"
+# Teto PROPRIO do scp dos binarios do corpus: o tar do `bin/` leva os videos das janelas e
+# nao cabe nos 120s do resgate do CSV. So o tar usa este teto; o CSV segue no RESGATE_TIMEOUT.
+ENSEMBLE_RESGATE_TIMEOUT="${ENSEMBLE_RESGATE_TIMEOUT:-900}"
 
 ARCH="${ARCH:-A}"
+# Fase da arquitetura `ensemble` (sem efeito nas demais): capture | eval | all.
+PHASE="${PHASE:-all}"
 DRY_RUN=0
 
 # -------------------------------------------------------------------------------------
@@ -134,13 +188,14 @@ RESULTADOS_COLETADOS=0
 # Flags
 # -------------------------------------------------------------------------------------
 uso() {
-    sed -n '2,71p' "$0"
+    sed -n '2,97p' "$0"
     exit "${1:-0}"
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --arch)           ARCH="$2"; shift 2 ;;
+        --phase)          PHASE="$2"; shift 2 ;;
         --zones)          ZONES="$2"; shift 2 ;;
         --project)        PROJECT_ID="$2"; shift 2 ;;
         --bucket)         BUCKET="$2"; shift 2 ;;
@@ -159,14 +214,43 @@ done
 # A lista de espacos de cada arquitetura esta aqui em bash E em `gcp/slice/spaces.py`. A
 # fonte de verdade e o registro Python; para a copia nao divergir em silencio, a VM
 # confere as duas listas antes de indexar (fase `index`, no script remoto).
+USA_ENSEMBLE=0          # 1 so na arquitetura `ensemble` (ensemble v2 nativo, 5 eixos)
 case "$ARCH" in
     A)        SPACES="qwen3vl";      SPECIALISTS="" ;;
     A+audio)  SPACES="qwen3vl clap"; SPECIALISTS="" ;;
     # B: nenhum espaco pgvector (a string vazia e a declaracao disso, nao um esquecimento)
     # e um especialista late-interaction no eixo documento.
     B)        SPACES="";             SPECIALISTS="colqwen25_doc" ;;
-    *) echo "ERRO: arquitetura desconhecida: '$ARCH' (use A, A+audio ou B)" >&2; exit 2 ;;
+    # ensemble: tambem sem espaco pgvector, e SEM especialista do registro
+    # `gcp/slice/spaces.py` -- os 5 eixos sao os builders de `ensemble/native/embedders.py`
+    # e quem os monta e `ensemble/eval/run_eval.py`, nao `gcp/slice/eval.py`. Por isso o
+    # marcador e uma variavel PROPRIA e nao um nome enfiado em SPECIALISTS: aquele nome
+    # seria procurado no registro e a rodada morreria com a GPU ja paga.
+    ensemble) SPACES="";             SPECIALISTS="";  USA_ENSEMBLE=1
+              : "${OUT_CSV:=$ENSEMBLE_OUT_CSV}" ;;
+    *) echo "ERRO: arquitetura desconhecida: '$ARCH' (use A, A+audio, B ou ensemble)" >&2
+       exit 2 ;;
 esac
+: "${OUT_CSV:=results/comparacao.csv}"
+
+# `--phase` so existe para o ensemble (as demais arquiteturas nao tem o que separar), mas
+# o VALOR e validado sempre: um `--phase captura` silenciosamente ignorado custaria uma
+# rodada paga inteira.
+case "$PHASE" in
+    capture|eval|all) ;;
+    *) echo "ERRO: fase desconhecida: '$PHASE' (use capture, eval ou all)" >&2; exit 2 ;;
+esac
+
+# Mesmo raciocinio da fase: um PROVISIONING_MODEL escrito errado (spot, Spot, PREEMPTIBLE)
+# cairia em silencio no caminho on-demand -- que e justamente o que esta em stockout.
+case "$PROVISIONING_MODEL" in
+    STANDARD|SPOT) ;;
+    *) echo "ERRO: PROVISIONING_MODEL invalido: '$PROVISIONING_MODEL' (use STANDARD ou SPOT)" >&2
+       exit 2 ;;
+esac
+if [ "$USA_ENSEMBLE" != "1" ] && [ "$PHASE" != "all" ]; then
+    echo "--- aviso: --phase $PHASE nao tem efeito em --arch $ARCH (so em --arch ensemble) ---" >&2
+fi
 
 # Deriva uma vez o que roteia a rodada inteira: com espaco pgvector ha Cloud SQL, proxy e
 # indexacao; sem ele, nada disso existe.
@@ -397,9 +481,17 @@ gerar_scripts_remotos() {
     cat > "$TMP_DIR/slice_env.sh" <<ENV
 # Gerado por gcp/slice/run_slice.sh -- configuracao da rodada.
 ARCH='$ARCH'
+PHASE='$PHASE'
 SPACES='$SPACES'
 SPECIALISTS='$SPECIALISTS'
 USA_PGVECTOR='$USA_PGVECTOR'
+USA_ENSEMBLE='$USA_ENSEMBLE'
+ENSEMBLE_CORPUS='$ENSEMBLE_CORPUS'
+ENSEMBLE_BIN_DIR='$ENSEMBLE_BIN_DIR'
+ENSEMBLE_QUERIES='$ENSEMBLE_QUERIES'
+ENSEMBLE_QRELS='$ENSEMBLE_QRELS'
+ENSEMBLE_LOG='$ENSEMBLE_LOG'
+ENSEMBLE_RANKINGS='$ENSEMBLE_RANKINGS'
 BUCKET='$BUCKET'
 DB='$DB'
 DB_USER='$DB_USER'
@@ -419,7 +511,7 @@ ENV
 #!/usr/bin/env bash
 # Gerado por gcp/slice/run_slice.sh -- roda DENTRO da VM L4. Fase em $1.
 set -euo pipefail
-FASE="${1:?uso: slice_remote.sh <bootstrap|index|eval> [arg]}"
+FASE="${1:?uso: slice_remote.sh <bootstrap|index|capture|eval> [arg]}"
 # shellcheck disable=SC1091
 source "$HOME/slice_env.sh"
 echo "=== [vm $(hostname)] fase=$FASE ${2:-} $(date) ==="
@@ -677,7 +769,50 @@ for nome in sys.argv[1].split():
     print(f"{nome}: {esp.model_id} -> {modelo.__name__}/{proc.__name__}")
 PY
     fi
+    # Idem para o ensemble v2: as deps dele ja vem do requirements-slurm.txt
+    # (sentence-transformers, colpali-engine, qwen-vl-utils, pypdfium2, librosa,
+    # soundfile, faster-whisper, beautifulsoup4, pillow, transformers) mais o yt-dlp dos
+    # adaptadores desta fatia e o ffmpeg do apt -- nada de pip extra. O que falta e
+    # CONFERIR a fiacao antes da GPU estar paga: um `import yt_dlp` ausente ou uma classe
+    # ColQwen2_5 irresoluvel descobertos no meio da captura custariam a rodada inteira.
+    if [ "${USA_ENSEMBLE:-0}" = "1" ]; then
+        python3 - <<'PY'
+import bs4, librosa, pypdfium2, sentence_transformers, soundfile, yt_dlp   # noqa: F401
+from PIL import Image                                                      # noqa: F401
+from faster_whisper import WhisperModel                                    # noqa: F401
+print("sentence-transformers", sentence_transformers.__version__,
+      "| yt-dlp", yt_dlp.version.__version__)
+from ensemble.build_corpus import build_corpus           # noqa: F401  (captura, rede)
+from ensemble.eval.run_eval import DOC_KIND, DOC_MODEL, main   # noqa: F401
+from ensemble.native.embedders import EMBEDDER_BUILDERS
+print("eixos do ensemble:", sorted(EMBEDDER_BUILDERS))
+from benchmark.models.colvision import resolve_classes
+modelo, proc = resolve_classes(DOC_KIND)
+print(f"documento: {DOC_MODEL} -> {modelo.__name__}/{proc.__name__}")
+PY
+        command -v ffmpeg >/dev/null 2>&1 \
+            || { echo "ERRO: ffmpeg ausente -- a captura de video/audio nao roda" >&2; exit 1; }
+    fi
     echo "=== bootstrap concluido $(date) ==="
+    ;;
+
+# =====================================================================================
+capture)
+# =====================================================================================
+    # Captura do corpus Orcamento (5 eixos, PRECISA DE INTERNET -- a VM tem saida). O
+    # destino e RELATIVO ao repo na VM de proposito: `build_corpus` grava
+    # `meta["path"]` com o caminho que recebeu, e um caminho relativo continua valido
+    # depois do round-trip para o repo local e de volta (um absoluto `/home/<user>/...`
+    # nao continuaria). `ambiente` faz o cd para $REPO_DIR antes.
+    #
+    # ATENCAO: recapturar muda os item_ids (hash da URL) e INVALIDA os qrels -- e por
+    # isso que esta fase e separada da avaliacao.
+    ambiente
+    echo "=== [capture] corpus do ensemble v2 -> $ENSEMBLE_CORPUS (bin: $ENSEMBLE_BIN_DIR) ==="
+    python3 -m ensemble.build_corpus "$ENSEMBLE_CORPUS"
+    wc -l "$ENSEMBLE_CORPUS"
+    du -sh "$ENSEMBLE_BIN_DIR" || true
+    echo "=== captura concluida $(date) ==="
     ;;
 
 # =====================================================================================
@@ -767,6 +902,29 @@ PY
 eval)
 # =====================================================================================
     ambiente
+
+    # O ensemble v2 tem driver PROPRIO (`ensemble/eval/run_eval.py`): ele monta os 5
+    # especialistas nativos + A + B por import tardio, carregando UM EIXO POR VEZ, funde
+    # por RRF e grava o comparativo por (sistema, eixo). Nao passa por `gcp.slice.eval`
+    # nem pelas paginas do Bronze -- o corpus inteiro (records + binarios) ja esta no
+    # repo da VM, posto la pela fase `capture` ou pelo upload da rodada de eval.
+    if [ "${USA_ENSEMBLE:-0}" = "1" ]; then
+        echo "=== [eval] ensemble v2 (5 especialistas -> RRF) vs. baselines A e B ==="
+        mkdir -p "$(dirname "$OUT_CSV")" "$(dirname "$ENSEMBLE_LOG")"
+        python3 -m ensemble.eval.run_eval \
+            --corpus "$ENSEMBLE_CORPUS" \
+            --queries "$ENSEMBLE_QUERIES" \
+            --qrels "$ENSEMBLE_QRELS" \
+            --out "$OUT_CSV" \
+            --rankings-out "$ENSEMBLE_RANKINGS" \
+            --audio-mode asr \
+            --log "$ENSEMBLE_LOG"
+        echo "=== [eval] CSV comparativo ==="
+        cat "$OUT_CSV" || true
+        echo "=== eval concluida $(date) ==="
+        exit 0
+    fi
+
     # Sem espaco pgvector nao ha Cloud SQL nesta rodada: nada de proxy nem de senha. O que
     # o ranqueador em memoria precisa sao as paginas, e elas vem do Bronze.
     EXTRA=()
@@ -881,6 +1039,16 @@ provisionar_sql() {
 provisionar_vm() {
     etapa "[2/7] VM L4 ($MACHINE_TYPE + $ACCELERATOR) com fallback de zona"
     echo "--- zonas na ordem: $ZONES ---"
+    # Flags do spot, montadas a parte para que o caminho STANDARD fique com o create
+    # EXATAMENTE como sempre foi (array vazio -> expansao vazia). O
+    # `--instance-termination-action=DELETE` e o que importa para o teardown: numa
+    # preempcao a VM se APAGA em vez de ficar STOPPED cobrando disco -- e o trap de saida
+    # ainda tenta o delete depois, que vira no-op.
+    local spot_flags=()
+    if [ "$PROVISIONING_MODEL" = "SPOT" ]; then
+        echo "--- provisionamento SPOT (sujeito a preempcao) ---"
+        spot_flags=(--provisioning-model=SPOT --instance-termination-action=DELETE)
+    fi
     local zona
     for zona in $ZONES; do
         echo "--- tentando $zona ---"
@@ -891,6 +1059,7 @@ provisionar_vm() {
                 --machine-type="$MACHINE_TYPE" \
                 --accelerator="type=$ACCELERATOR,count=1" \
                 --maintenance-policy=TERMINATE \
+                ${spot_flags[@]+"${spot_flags[@]}"} \
                 --image-family="$IMAGE_FAMILY" \
                 --image-project="$IMAGE_PROJECT" \
                 --boot-disk-size="$BOOT_DISK_SIZE" \
@@ -931,12 +1100,19 @@ enviar_repo() {
     etapa "[4/7] enviando repo, scripts e audio para a VM"
     # Arvore de trabalho (e nao `git archive`): o mini-set de audio costuma ainda estar
     # sem commit quando a rodada acontece.
+    #
+    # O corpus do ensemble (`data/govexe/ensemble_orcamento`) fica FORA do tarball pelo
+    # mesmo motivo das paginas do ptbr_planos -- tamanho (ele carrega os videos das
+    # janelas) -- e por um motivo a mais: o bootstrap EXTRAI o tarball por cima de
+    # `~/residencia`, entao um corpus dentro dele sobrescreveria o que a rodada acabou de
+    # subir. Quem o leva e `enviar_insumos_do_ensemble`, DEPOIS do bootstrap.
     run tar czf "$TMP_DIR/repo.tgz" -C "$REPO_DIR" \
         --exclude=.git --exclude='.venv*' --exclude=__pycache__ \
         --exclude=.pytest_cache --exclude=.ruff_cache --exclude=.benchmarks \
         --exclude=results --exclude=logs --exclude=.cache \
         --exclude='data/govexe/ptbr_planos/pages' \
         --exclude='data/govexe/ptbr_planos/pdf_cache' \
+        --exclude="$(dirname "$ENSEMBLE_CORPUS")" \
         --exclude=data/vidore_cache .
 
     # No Windows o `gcloud compute scp` delega ao `pscp.exe`, que NAO aceita `~` como
@@ -973,9 +1149,74 @@ enviar_repo() {
     fi
 }
 
+# Insumos da arquitetura `ensemble`. Roda DEPOIS do bootstrap de proposito: o bootstrap
+# extrai `repo.tgz` por cima de `~/residencia`, entao qualquer upload feito antes dele
+# seria sobrescrito pelo tarball (a mesma armadilha que o guard por sentinela do bootstrap
+# documenta). Os mecanismos sao os do mini-set de audio: arquivo-a-arquivo com destino
+# RELATIVO (limitacao do pscp no Windows) e diretorio via tar + untar na VM.
+enviar_insumos_do_ensemble() {
+    if [ "$PHASE" = "eval" ]; then
+        etapa "[5b/7] enviando os insumos do ensemble (queries, qrels, corpus + binarios)"
+    else
+        etapa "[5b/7] enviando os insumos do ensemble (queries e qrels)"
+    fi
+
+    # Queries e qrels sao pequenos e viajam SEMPRE: eles sao o gate humano da rodada, e a
+    # versao que vale e a do repo local (editada a mao depois da fase `capture`).
+    remoto "mkdir -p ~/residencia/$(dirname "$ENSEMBLE_QUERIES") ~/residencia/$(dirname "$ENSEMBLE_QRELS")"
+    run gcloud compute scp "$REPO_DIR/$ENSEMBLE_QUERIES" "$VM:residencia/$ENSEMBLE_QUERIES" \
+        --zone="$ZONE" --project="$PROJECT_ID" --quiet
+    run gcloud compute scp "$REPO_DIR/$ENSEMBLE_QRELS" "$VM:residencia/$ENSEMBLE_QRELS" \
+        --zone="$ZONE" --project="$PROJECT_ID" --quiet
+
+    # O corpus so sobe quando a VM NAO vai captura-lo (fase `eval`): em `capture` e `all`
+    # ele nasce na propria VM e subir um corpus velho so apagaria o novo.
+    if [ "$PHASE" != "eval" ]; then
+        echo "--- fase $PHASE: o corpus nasce na VM; nada de records/binarios a enviar ---"
+        return 0
+    fi
+    remoto "mkdir -p ~/residencia/$(dirname "$ENSEMBLE_CORPUS")"
+    run gcloud compute scp "$REPO_DIR/$ENSEMBLE_CORPUS" "$VM:residencia/$ENSEMBLE_CORPUS" \
+        --zone="$ZONE" --project="$PROJECT_ID" --quiet
+    run tar czf "$TMP_DIR/ensemble_bin.tgz" -C "$REPO_DIR/$ENSEMBLE_BIN_DIR" .
+    run gcloud compute scp "$TMP_DIR/ensemble_bin.tgz" "$VM:ensemble_bin.tgz" \
+        --zone="$ZONE" --project="$PROJECT_ID" --quiet
+    remoto "mkdir -p ~/residencia/$ENSEMBLE_BIN_DIR && tar xzf ~/ensemble_bin.tgz -C ~/residencia/$ENSEMBLE_BIN_DIR"
+}
+
+# Volta do corpus capturado para o repo LOCAL -- a persistencia entre as duas rodadas
+# pagas. Tem de rodar ANTES do teardown (a VM leva o corpus junto), e por isso tambem e
+# chamada do resgate do teardown. Os binarios voltam num tar unico pela mesma limitacao
+# do pscp da ida, com teto PROPRIO (eles sao grandes; o do CSV nao serve).
+coletar_corpus_do_ensemble() {
+    echo "--- trazendo o corpus capturado ($ENSEMBLE_CORPUS + $ENSEMBLE_BIN_DIR) ---"
+    run mkdir -p "$REPO_DIR/$(dirname "$ENSEMBLE_CORPUS")" || true
+    com_timeout "$RESGATE_TIMEOUT" \
+        gcloud compute scp "$VM:residencia/$ENSEMBLE_CORPUS" "$REPO_DIR/$ENSEMBLE_CORPUS" \
+            --zone="$ZONE" --project="$PROJECT_ID" --quiet || return 1
+    remoto "tar czf ~/ensemble_bin.tgz -C ~/residencia/$ENSEMBLE_BIN_DIR ." || return 1
+    com_timeout "$ENSEMBLE_RESGATE_TIMEOUT" \
+        gcloud compute scp "$VM:ensemble_bin.tgz" "$TMP_DIR/ensemble_bin_volta.tgz" \
+            --zone="$ZONE" --project="$PROJECT_ID" --quiet || return 1
+    run mkdir -p "$REPO_DIR/$ENSEMBLE_BIN_DIR" || true
+    run tar xzf "$TMP_DIR/ensemble_bin_volta.tgz" -C "$REPO_DIR/$ENSEMBLE_BIN_DIR" || return 1
+    RESULTADOS_COLETADOS=1
+    return 0
+}
+
 # Chamada no fluxo normal E dentro do teardown; por isso todo scp tem teto de tempo (um
 # scp travado numa VM meio-bootada nao pode adiar a limpeza).
 coletar_resultados() {
+    # Na arquitetura `ensemble` o que tem de sobreviver depende da FASE: em `capture` o
+    # resultado e o proprio corpus (nao existe CSV), em `all` sao os dois, em `eval` so o
+    # CSV. Despachar aqui dentro mantem o resgate do teardown correto sem duplica-lo.
+    if [ "${USA_ENSEMBLE:-0}" = "1" ]; then
+        case "$PHASE" in
+            capture) coletar_corpus_do_ensemble; return $? ;;
+            all)     coletar_corpus_do_ensemble \
+                        || echo "--- aviso: o corpus capturado nao voltou ---" >&2 ;;
+        esac
+    fi
     echo "--- trazendo $OUT_CSV e os logs da VM (teto: ${RESGATE_TIMEOUT}s por arquivo) ---"
     run mkdir -p "$REPO_DIR/$(dirname "$OUT_CSV")" "$REPO_DIR/logs" || true
     com_timeout "$RESGATE_TIMEOUT" \
@@ -984,6 +1225,18 @@ coletar_resultados() {
     com_timeout "$RESGATE_TIMEOUT" \
         gcloud compute scp "$VM:proxy.log" "$REPO_DIR/logs/proxy-$VM.log" \
             --zone="$ZONE" --project="$PROJECT_ID" --quiet || true
+    if [ "${USA_ENSEMBLE:-0}" = "1" ]; then
+        com_timeout "$RESGATE_TIMEOUT" \
+            gcloud compute scp "$VM:residencia/$ENSEMBLE_LOG" "$REPO_DIR/$ENSEMBLE_LOG" \
+                --zone="$ZONE" --project="$PROJECT_ID" --quiet || true
+        # Rankings por query (re-fusao offline): saida secundaria -- se nao existir (fase
+        # capture, eval que nem chegou la) o scp falha e a coleta segue.
+        run mkdir -p "$REPO_DIR/$(dirname "$ENSEMBLE_RANKINGS")" || true
+        com_timeout "$RESGATE_TIMEOUT" \
+            gcloud compute scp "$VM:residencia/$ENSEMBLE_RANKINGS" \
+                "$REPO_DIR/$ENSEMBLE_RANKINGS" \
+                --zone="$ZONE" --project="$PROJECT_ID" --quiet || true
+    fi
     RESULTADOS_COLETADOS=1
     return 0
 }
@@ -993,7 +1246,12 @@ coletar_resultados() {
 # -------------------------------------------------------------------------------------
 etapa "rodada: arquitetura $ARCH | espacos: ${SPACES:-<nenhum>} | especialistas: ${SPECIALISTS:-<nenhum>} | dry-run: $DRY_RUN"
 echo "    projeto=$PROJECT_ID  regiao=$REGION  instancia=$INSTANCE  vm=$VM"
+echo "    provisioning=$PROVISIONING_MODEL"
 echo "    bucket=$BUCKET  fonte=$SOURCE  dt=$DT  csv=$OUT_CSV"
+if [ "$USA_ENSEMBLE" = "1" ]; then
+    echo "    fase=$PHASE  corpus=$ENSEMBLE_CORPUS  bin=$ENSEMBLE_BIN_DIR"
+    echo "    queries=$ENSEMBLE_QUERIES  qrels=$ENSEMBLE_QRELS  log=$ENSEMBLE_LOG"
+fi
 
 if ! command -v gcloud >/dev/null 2>&1; then
     precondicao_ausente "gcloud nao esta no PATH"
@@ -1012,6 +1270,12 @@ exige_relativo() {
 exige_relativo --audio-records "$AUDIO_RECORDS"
 exige_relativo --audio-dir "$AUDIO_DIR"
 exige_relativo --out "$OUT_CSV"
+exige_relativo ENSEMBLE_CORPUS "$ENSEMBLE_CORPUS"
+exige_relativo ENSEMBLE_BIN_DIR "$ENSEMBLE_BIN_DIR"
+exige_relativo ENSEMBLE_QUERIES "$ENSEMBLE_QUERIES"
+exige_relativo ENSEMBLE_QRELS "$ENSEMBLE_QRELS"
+exige_relativo ENSEMBLE_LOG "$ENSEMBLE_LOG"
+exige_relativo ENSEMBLE_RANKINGS "$ENSEMBLE_RANKINGS"
 
 # O conjunto de avaliacao de audio entra em QUALQUER arquitetura, nao so nas que tem CLAP:
 # o espaco qwen3vl ja indexa os mesmos clipes como `audio_asr` (Whisper -> texto), e e essa
@@ -1024,7 +1288,9 @@ exige_relativo --out "$OUT_CSV"
 # Arquitetura sem pgvector fica de fora disto: o unico braco de B hoje e o eixo DOCUMENTO
 # (`doc_image`), e o registro nao lhe da especialista algum para audio -- anexar o conjunto
 # de audio so derrubaria a rodada no `specialist_for_corpus`.
-if [ "$USA_PGVECTOR" != "1" ]; then
+if [ "$USA_ENSEMBLE" = "1" ]; then
+    echo "--- $ARCH: o corpus e o do ensemble v2 (5 eixos); EVAL_DIRS nao se aplica ---"
+elif [ "$USA_PGVECTOR" != "1" ]; then
     echo "--- $ARCH: eixo documento apenas; o conjunto de audio fica fora da rodada ---"
 elif [ -d "$REPO_DIR/$EVAL_AUDIO_DIR" ]; then
     EVAL_DIRS="$EVAL_DIRS $EVAL_AUDIO_DIR"
@@ -1046,7 +1312,31 @@ case " $SPACES " in
         fi
         ;;
 esac
-echo "    conjuntos de avaliacao: $EVAL_DIRS"
+
+# Precondicoes do ensemble -- TODAS antes de provisionar: descobrir um qrels ausente com
+# a L4 de pe seria pagar GPU para falhar (e os valores aqui sao de arquivo local, entao a
+# checagem e gratuita). Em `--dry-run` viram aviso, como as demais precondicoes.
+if [ "$USA_ENSEMBLE" = "1" ]; then
+    if [ "$PHASE" != "capture" ]; then
+        [ -f "$REPO_DIR/$ENSEMBLE_QUERIES" ] || precondicao_ausente \
+            "a fase $PHASE avalia, mas nao existe $ENSEMBLE_QUERIES (queries do conjunto)."
+        [ -f "$REPO_DIR/$ENSEMBLE_QRELS" ] || precondicao_ausente \
+            "a fase $PHASE avalia, mas nao existe $ENSEMBLE_QRELS (gabarito revisado)."
+    fi
+    if [ "$PHASE" = "eval" ]; then
+        # A fase `eval` NAO captura: o corpus tem de vir congelado da rodada `capture`.
+        [ -f "$REPO_DIR/$ENSEMBLE_CORPUS" ] || precondicao_ausente \
+            "--phase eval consome o corpus ja congelado, mas nao existe" \
+            "$ENSEMBLE_CORPUS. Rode antes: bash gcp/slice/run_slice.sh --arch ensemble" \
+            "--phase capture (ela traz records.jsonl + binarios para ca)."
+        [ -d "$REPO_DIR/$ENSEMBLE_BIN_DIR" ] || precondicao_ausente \
+            "--phase eval precisa dos binarios do corpus, mas nao existe" \
+            "$ENSEMBLE_BIN_DIR. Rode antes: bash gcp/slice/run_slice.sh --arch ensemble" \
+            "--phase capture."
+    fi
+else
+    echo "    conjuntos de avaliacao: $EVAL_DIRS"
+fi
 
 gerar_scripts_remotos
 
@@ -1077,23 +1367,49 @@ etapa "[5/7] bootstrap da VM (venv, deps, torchaudio, librosa/soundfile)"
 gancho_de_falha bootstrap
 remoto "bash ~/slice_remote.sh bootstrap"
 
-if [ -z "$SPACES" ]; then
-    etapa "[6/7] indexacao pgvector -- PULADA (a arquitetura $ARCH nao tem espaco)"
-    echo "--- o especialista ($SPECIALISTS) embute o corpus na propria avaliacao ---"
+if [ "$USA_ENSEMBLE" = "1" ]; then
+    # Ensemble v2: a etapa [6/7] nao e indexacao pgvector, e a CAPTURA do corpus (rede), e
+    # a [7/7] e o driver proprio do ensemble. `--phase` liga/desliga cada uma; o teardown
+    # por trap segue valendo nas tres fases.
+    enviar_insumos_do_ensemble
+
+    if [ "$PHASE" = "eval" ]; then
+        etapa "[6/7] captura -- PULADA (--phase eval consome o corpus ja congelado)"
+        echo "--- recapturar mudaria os item_ids e invalidaria o gabarito ---"
+    else
+        etapa "[6/7] captura do corpus do ensemble na VM (rede: RSS, PDF, yt-dlp, podcasts)"
+        gancho_de_falha capture
+        remoto "bash ~/slice_remote.sh capture"
+    fi
+
+    if [ "$PHASE" = "capture" ]; then
+        etapa "[7/7] avaliacao -- PULADA (--phase capture apenas congela o corpus)"
+        echo "--- proximo passo: revisar $ENSEMBLE_QRELS com os item_ids capturados e"
+        echo "    rodar de novo com --phase eval ---"
+    else
+        etapa "[7/7] avaliacao do ensemble v2 (5 especialistas -> RRF) -> $OUT_CSV"
+        gancho_de_falha eval
+        remoto "bash ~/slice_remote.sh eval"
+    fi
 else
-    for espaco in $SPACES; do
-        etapa "[6/7] indexando o espaco $espaco (arquitetura $ARCH)"
-        gancho_de_falha index
-        remoto "bash ~/slice_remote.sh index $espaco"
-    done
+    if [ -z "$SPACES" ]; then
+        etapa "[6/7] indexacao pgvector -- PULADA (a arquitetura $ARCH nao tem espaco)"
+        echo "--- o especialista ($SPECIALISTS) embute o corpus na propria avaliacao ---"
+    else
+        for espaco in $SPACES; do
+            etapa "[6/7] indexando o espaco $espaco (arquitetura $ARCH)"
+            gancho_de_falha index
+            remoto "bash ~/slice_remote.sh index $espaco"
+        done
+    fi
+
+    etapa "[7/7] avaliacao (eval.py) -> $OUT_CSV"
+    gancho_de_falha eval
+    remoto "bash ~/slice_remote.sh eval"
 fi
 
-etapa "[7/7] avaliacao (eval.py) -> $OUT_CSV"
-gancho_de_falha eval
-remoto "bash ~/slice_remote.sh eval"
-
 etapa "resultados"
-coletar_resultados || echo "aviso: nao foi possivel trazer o CSV (o teardown tentara de novo)"
+coletar_resultados || echo "aviso: nao foi possivel trazer os resultados (o teardown tentara de novo)"
 
 etapa "rodada da arquitetura $ARCH concluida -- o teardown vem a seguir"
 exit 0

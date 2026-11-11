@@ -1,0 +1,24 @@
+q01	orçamento da saúde
+q02	emendas parlamentares
+q03	despesas com educação
+q04	relator do orçamento
+q05	lei orçamentária anual
+q06	contingenciamento de gastos
+q07	comissão mista de orçamento
+q08	investimentos em infraestrutura
+q09	orçamento da segurança pública
+q10	despesas com previdência social
+q11	diretrizes orçamentárias para o próximo exercício
+q12	crédito suplementar e remanejamento de recursos
+q13	superávit primário e meta fiscal
+q14	repasses da União para estados e municípios
+q15	projeto de lei orçamentária votação no plenário
+q16	audiência pública sobre o orçamento
+q17	prédio do Congresso Nacional em Brasília
+q18	reunião da Comissão Mista de Orçamento no plenário
+q19	notas de dinheiro e calculadora do orçamento
+q20	navio de cruzeiro atracado no porto
+q21	prédio do Tribunal de Contas da União
+q22	prédio do Banco do Brasil
+q23	emblema das Nações Unidas
+q24	profissional de saúde em hospital do SUS

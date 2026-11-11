@@ -18,10 +18,15 @@ def page_id(pdf_path: str, page: int) -> str:
     return f"{Path(pdf_path).name}#p{page}"
 
 
-def parse_pages(pdf_path: str, *, extractor: Callable[[str], str], n: int = 20) -> list[PointerRecord]:
+def parse_pages(
+    pdf_path: str, *, extractor: Callable[[str], str], n: int = 20,
+    renderer: Callable[[int, Path], None] | None = None, bin_dir: str | Path | None = None,
+) -> list[PointerRecord]:
     """Gera ate `n` records 'documento'; o extractor recebe o page_id ('<arquivo>#pN').
 
     Paginas sem texto sao puladas; IndexError do extractor sinaliza fim do documento.
+    Com `renderer(page, destino)` + `bin_dir`, a imagem da pagina e gravada em
+    `bin_dir/<arquivo>_p<N>.png` e registrada em meta["path"]/meta["a_repr"] (binario retido).
     """
     out: list[PointerRecord] = []
     page = 0
@@ -36,13 +41,20 @@ def parse_pages(pdf_path: str, *, extractor: Callable[[str], str], n: int = 20) 
             continue
         except IndexError:
             break
+        meta = {"pdf": str(pdf_path), "page": page}
+        if renderer is not None and bin_dir is not None:
+            img = Path(bin_dir) / f"{Path(pdf_path).name}_p{page}.png"
+            img.parent.mkdir(parents=True, exist_ok=True)
+            renderer(page, img)
+            meta["path"] = str(img)
+            meta["a_repr"] = str(img)
         rec = PointerRecord(
             id=f"documento-{pid}",
             modality="documento",
             descriptor=desc,
             pointer_uri=pid,
             source="pdf",
-            meta={"pdf": str(pdf_path), "page": page},
+            meta=meta,
         )
         validate_record(rec)
         out.append(rec)
@@ -63,6 +75,17 @@ def _pdfium_extractor(pdf_path: str) -> Callable[[str], str]:
     return extract
 
 
+def _pdfium_renderer(pdf_path: str) -> Callable[[int, Path], None]:
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(pdf_path)
+
+    def render(page: int, destino: Path) -> None:
+        pdf[page - 1].render(scale=1.5).to_pil().save(destino)
+
+    return render
+
+
 def fetch_budget_pages(pdf_url: str, dest_dir: str = "data/ensemble", n: int = 20) -> list[PointerRecord]:
     """Wrapper fino de rede: baixa o PDF (LOA / relatorio CMO) e extrai texto via pypdfium2.
 
@@ -73,4 +96,5 @@ def fetch_budget_pages(pdf_url: str, dest_dir: str = "data/ensemble", n: int = 2
     req = urllib.request.Request(pdf_url, headers={"User-Agent": "Mozilla/5.0 (ensemble-capture)"})
     with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as f:
         f.write(resp.read())
-    return parse_pages(dest, extractor=_pdfium_extractor(dest), n=n)
+    return parse_pages(dest, extractor=_pdfium_extractor(dest), n=n,
+                       renderer=_pdfium_renderer(dest), bin_dir=Path(dest_dir) / "pages")

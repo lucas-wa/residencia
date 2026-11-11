@@ -1,0 +1,3 @@
+q1 0 itemA 1
+q1 0 itemB 0
+q2 0 itemC 0
