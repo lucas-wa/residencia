@@ -66,7 +66,7 @@
 #   B         -> (nenhum espaco)      ensemble de especialistas: o eixo documento e o
 #                                     ColQwen2.5 late-interaction (MaxSim em memoria)
 #   ensemble  -> (nenhum espaco)      ensemble v2 NATIVO: 5 especialistas (texto BGE-M3,
-#                                     imagem SigLIP2, audio CLAP, video WeMM, documento
+#                                     imagem SigLIP2, audio CLAP, video SigLIP2, documento
 #                                     ColQwen2.5) fundidos por RRF e comparados com os
 #                                     baselines A (Qwen3-VL) e B (so documento). Os
 #                                     modelos carregam UM EIXO POR VEZ -- cabe na L4 --
@@ -127,6 +127,10 @@ BOOT_DISK_SIZE="${BOOT_DISK_SIZE:-200GB}"
 # Imagem Deep Learning usada na rodada que funcionou (torch 2.9 + CUDA 12.9 + driver 580).
 IMAGE_FAMILY="${IMAGE_FAMILY:-pytorch-2-9-cu129-ubuntu-2204-nvidia-580}"
 IMAGE_PROJECT="${IMAGE_PROJECT:-deeplearning-platform-release}"
+# Modelo de provisionamento da VM: STANDARD (on-demand, o de sempre) ou SPOT. O spot puxa
+# de OUTRO pool de capacidade, entao e a saida quando a L4 on-demand esta em stockout em
+# todas as zonas da lista -- ao custo de poder ser preemptada no meio da rodada.
+PROVISIONING_MODEL="${PROVISIONING_MODEL:-STANDARD}"
 
 # Insumos da indexacao.
 SOURCE="${SOURCE:-tse_planos}"              # particao `fonte=` do Bronze
@@ -231,6 +235,14 @@ esac
 case "$PHASE" in
     capture|eval|all) ;;
     *) echo "ERRO: fase desconhecida: '$PHASE' (use capture, eval ou all)" >&2; exit 2 ;;
+esac
+
+# Mesmo raciocinio da fase: um PROVISIONING_MODEL escrito errado (spot, Spot, PREEMPTIBLE)
+# cairia em silencio no caminho on-demand -- que e justamente o que esta em stockout.
+case "$PROVISIONING_MODEL" in
+    STANDARD|SPOT) ;;
+    *) echo "ERRO: PROVISIONING_MODEL invalido: '$PROVISIONING_MODEL' (use STANDARD ou SPOT)" >&2
+       exit 2 ;;
 esac
 if [ "$USA_ENSEMBLE" != "1" ] && [ "$PHASE" != "all" ]; then
     echo "--- aviso: --phase $PHASE nao tem efeito em --arch $ARCH (so em --arch ensemble) ---" >&2
@@ -899,6 +911,7 @@ eval)
             --queries "$ENSEMBLE_QUERIES" \
             --qrels "$ENSEMBLE_QRELS" \
             --out "$OUT_CSV" \
+            --audio-mode asr \
             --log "$ENSEMBLE_LOG"
         echo "=== [eval] CSV comparativo ==="
         cat "$OUT_CSV" || true
@@ -1020,6 +1033,16 @@ provisionar_sql() {
 provisionar_vm() {
     etapa "[2/7] VM L4 ($MACHINE_TYPE + $ACCELERATOR) com fallback de zona"
     echo "--- zonas na ordem: $ZONES ---"
+    # Flags do spot, montadas a parte para que o caminho STANDARD fique com o create
+    # EXATAMENTE como sempre foi (array vazio -> expansao vazia). O
+    # `--instance-termination-action=DELETE` e o que importa para o teardown: numa
+    # preempcao a VM se APAGA em vez de ficar STOPPED cobrando disco -- e o trap de saida
+    # ainda tenta o delete depois, que vira no-op.
+    local spot_flags=()
+    if [ "$PROVISIONING_MODEL" = "SPOT" ]; then
+        echo "--- provisionamento SPOT (sujeito a preempcao) ---"
+        spot_flags=(--provisioning-model=SPOT --instance-termination-action=DELETE)
+    fi
     local zona
     for zona in $ZONES; do
         echo "--- tentando $zona ---"
@@ -1030,6 +1053,7 @@ provisionar_vm() {
                 --machine-type="$MACHINE_TYPE" \
                 --accelerator="type=$ACCELERATOR,count=1" \
                 --maintenance-policy=TERMINATE \
+                ${spot_flags[@]+"${spot_flags[@]}"} \
                 --image-family="$IMAGE_FAMILY" \
                 --image-project="$IMAGE_PROJECT" \
                 --boot-disk-size="$BOOT_DISK_SIZE" \
@@ -1209,6 +1233,7 @@ coletar_resultados() {
 # -------------------------------------------------------------------------------------
 etapa "rodada: arquitetura $ARCH | espacos: ${SPACES:-<nenhum>} | especialistas: ${SPECIALISTS:-<nenhum>} | dry-run: $DRY_RUN"
 echo "    projeto=$PROJECT_ID  regiao=$REGION  instancia=$INSTANCE  vm=$VM"
+echo "    provisioning=$PROVISIONING_MODEL"
 echo "    bucket=$BUCKET  fonte=$SOURCE  dt=$DT  csv=$OUT_CSV"
 if [ "$USA_ENSEMBLE" = "1" ]; then
     echo "    fase=$PHASE  corpus=$ENSEMBLE_CORPUS  bin=$ENSEMBLE_BIN_DIR"

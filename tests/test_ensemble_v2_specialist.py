@@ -115,6 +115,39 @@ def test_dense_video_sem_a_repr_cai_para_path_e_avisa(caplog):
     assert any("v1" in r.message for r in caplog.records)
 
 
+def test_dense_repr_fn_custom_substitui_a_representacao_padrao():
+    # Modo ASR do eixo audio: a representacao do item e a TRANSCRICAO (descriptor),
+    # nao o meta["path"] usado por padrao em audio.
+    calls = []
+
+    def spy(texts):
+        calls.append(list(texts))
+        return _bow(texts)
+
+    recs = [
+        _rec("a1", "audio", "orçamento da saúde", path="clipes/a1.mp3"),
+        _rec("a2", "audio", "estrada praia", path="clipes/a2.mp3"),
+    ]
+    sp = DenseSpecialist("audio", recs, embed_items=spy, embed_query=_bow,
+                         repr_fn=lambda r: r.descriptor)
+    assert calls == [["orçamento da saúde", "estrada praia"]]
+    res = sp.search("orçamento saúde", 2)
+    assert res[0][0] == "a1"
+
+
+def test_dense_sem_repr_fn_mantem_o_padrao_por_modalidade():
+    # Sem `repr_fn`, audio continua representado por meta["path"] (comportamento atual).
+    calls = []
+
+    def spy(texts):
+        calls.append(list(texts))
+        return _bow(texts)
+
+    recs = [_rec("a1", "audio", "orçamento da saúde", path="estrada")]
+    DenseSpecialist("audio", recs, embed_items=spy, embed_query=_bow)
+    assert calls == [["estrada"]]
+
+
 def test_dense_embed_items_contagem_de_linhas_diverge_falha():
     # embed_items que devolve menos linhas que ids -> ValueError claro.
     def bad(texts):

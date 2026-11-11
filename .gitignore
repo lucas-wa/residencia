@@ -18,7 +18,13 @@ data/govexe/ptbr_planos/pages/
 data/govexe/ptbr_planos/pdf_cache/
 data/govexe/audio_eval/audio/
 data/vidore_cache/
+# corpus ensemble Orcamento: binarios pesados (audio/video/doc/imagem ~536M) ficam fora;
+# records.jsonl (ponteiros + transcricoes ASR) e versionado e re-baixa os binarios por pointer_uri
+data/govexe/ensemble_orcamento/bin/
 *.parquet
+
+# Logs de execucao (runner GCP / eval)
+logs/
 
 # HF caches
 .cache/

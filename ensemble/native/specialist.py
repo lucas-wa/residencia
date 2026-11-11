@@ -62,12 +62,14 @@ class DenseSpecialist:
         *,
         embed_items: Embedder,
         embed_query: Embedder,
+        repr_fn: Callable[[PointerRecord], str] = item_repr,
     ) -> None:
         self.modality = modality
         self._embed_query = embed_query
+        self._repr_fn = repr_fn
         self._ids = [r.id for r in records if r.modality == modality]
         if self._ids:
-            items = [item_repr(r) for r in records if r.modality == modality]
+            items = [self._repr_fn(r) for r in records if r.modality == modality]
             matrix = _l2_normalize(embed_items(items))
             if matrix.shape[0] != len(self._ids):
                 raise ValueError(

@@ -225,7 +225,7 @@ def _build_doc_ranker():
 
 
 def _default_builders() -> dict:
-    """Registry da Task 6 (texto/imagem/audio/video/unified_a) + ranker de documento.
+    """Registry da Task 6 (texto/imagem/audio/audio_asr/video/unified_a) + ranker de documento.
 
     Import tardio de `EMBEDDER_BUILDERS`: so a fiacao; os modelos reais carregam dentro de
     cada builder, no cluster.
@@ -238,12 +238,17 @@ def _default_builders() -> dict:
 
 
 def _build_systems(corpus: list[PointerRecord], builders: dict, *,
-                   pages_dir=None, data_dir=None):
+                   pages_dir=None, data_dir=None, audio_mode: str = "asr"):
     """Monta os 5 especialistas + retriever_a + retriever_b a partir dos builders.
 
     `builders["documento"]()` devolve um ranker (ColQwen-like); os demais devolvem o par
     `(embed_items, embed_query)`. retriever_b reusa o especialista de documento (mesmo
     indice ColQwen2.5), que ja ranqueia so paginas.
+
+    `audio_mode="asr"` (padrao) ranqueia o eixo audio pela TRANSCRICAO (`descriptor` do
+    record, posto la pelo Whisper na captura) com o BGE-M3 -- builder `"audio_asr"`;
+    `audio_mode="clap"` mantem o CLAP sobre o arquivo de audio (builder `"audio"`,
+    representacao padrao `meta["path"]`), como ablacao.
     """
     from ensemble.native.doc import DocSpecialist
     from ensemble.native.specialist import DenseSpecialist
@@ -253,9 +258,14 @@ def _build_systems(corpus: list[PointerRecord], builders: dict, *,
                              pages_dir=pages_dir, data_dir=data_dir)
     specialists: dict = {"documento": doc_spec}
     for mod in ("imagem", "audio", "texto", "video"):
-        embed_items, embed_query = builders[mod]()
+        kwargs: dict = {}
+        builder = builders[mod]
+        if mod == "audio" and audio_mode == "asr":
+            builder = builders.get("audio_asr", builders["audio"])
+            kwargs["repr_fn"] = lambda r: r.descriptor
+        embed_items, embed_query = builder()
         specialists[mod] = DenseSpecialist(mod, corpus, embed_items=embed_items,
-                                           embed_query=embed_query)
+                                           embed_query=embed_query, **kwargs)
 
     a_items, a_query = builders["unified_a"]()
     retriever_a = UnifiedRetrieverA(corpus, embed_items=a_items, embed_query=a_query)
@@ -283,6 +293,12 @@ def main(argv: list[str] | None = None, *, builders: dict | None = None) -> int:
     parser.add_argument("--pages-dir", default=None,
                         help="diretorio das paginas de documento (resolucao de caminho)")
     parser.add_argument("--data-dir", default=None, help="raiz alternativa do corpus")
+    parser.add_argument(
+        "--audio-mode", choices=["asr", "clap"], default="asr",
+        help="eixo audio: 'asr' (padrao) embute a TRANSCRICAO (descriptor do record, "
+             "vinda do Whisper) com o BGE-M3; 'clap' embute o arquivo de audio bruto "
+             "com o CLAP (ablacao)",
+    )
     args = parser.parse_args(argv)
 
     if args.log:
@@ -314,7 +330,8 @@ def main(argv: list[str] | None = None, *, builders: dict | None = None) -> int:
         builders = _default_builders()
 
     specialists, retriever_a, retriever_b = _build_systems(
-        corpus, builders, pages_dir=args.pages_dir, data_dir=args.data_dir)
+        corpus, builders, pages_dir=args.pages_dir, data_dir=args.data_dir,
+        audio_mode=args.audio_mode)
 
     rows = evaluate(corpus, queries, qrels, specialists=specialists,
                     retriever_a=retriever_a, retriever_b=retriever_b)

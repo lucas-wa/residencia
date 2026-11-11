@@ -23,7 +23,10 @@ EmbedderPair = tuple[Embed, Embed]
 TEXT_MODEL = "BAAI/bge-m3"
 IMAGE_MODEL = "google/siglip2-so400m-patch14-384"
 AUDIO_MODEL = "laion/larger_clap_general"
-VIDEO_MODEL = "tencent/WeMM-Embedding-2B"
+# o eixo video rankeia janelas pelo KEYFRAME (imagem), entao usa o mesmo SigLIP 2 do
+# eixo imagem -- mesma familia de modelo, conjuntos de itens diferentes (eixos separados
+# no RRF).
+VIDEO_MODEL = IMAGE_MODEL
 UNIFIED_A_MODEL = "Qwen/Qwen3-VL-Embedding-2B"
 
 
@@ -36,6 +39,26 @@ def build_text_embedder() -> EmbedderPair:
     from sentence_transformers import SentenceTransformer
 
     log.info("carregando %s", TEXT_MODEL)
+    model = SentenceTransformer(TEXT_MODEL, device="cuda")
+    model.half()
+
+    def encode(texts: list[str]) -> np.ndarray:
+        return _f32(model.encode(list(texts), convert_to_numpy=True, normalize_embeddings=False))
+
+    return encode, encode
+
+
+def build_audio_asr_embedder() -> EmbedderPair:
+    """BGE-M3 sobre a TRANSCRICAO do audio (ASR->texto); items e query sao texto.
+
+    O record de audio ja carrega a transcricao Whisper em `descriptor` (ver
+    `ensemble/capture/audio.py`), entao o eixo audio pode ser ranqueado como texto,
+    pelo mesmo modelo do eixo texto. Carrega o BGE-M3 uma segunda vez (um eixo por
+    vez, instancias independentes); o modo CLAP fica em `build_audio_embedder`.
+    """
+    from sentence_transformers import SentenceTransformer
+
+    log.info("carregando %s (eixo audio, ASR->texto)", TEXT_MODEL)
     model = SentenceTransformer(TEXT_MODEL, device="cuda")
     model.half()
 
@@ -68,32 +91,27 @@ def build_audio_embedder() -> EmbedderPair:
 
 
 def build_video_embedder() -> EmbedderPair:
-    """WeMM-Embedding-2B: items = KEYFRAME POR JANELA (imagem), query = texto.
+    """SigLIP 2: items = KEYFRAME POR JANELA (imagem), query = texto.
 
     O eixo de video rankeia janelas; o artefato discriminativo por janela e o
     keyframe (`meta["a_repr"]`), nao o video inteiro (`meta["path"]`, igual para
     todas as janelas). Logo `embed_items` embute a IMAGEM do keyframe de cada
-    janela -- WeMM-Embedding e multimodal e trata imagens -- e NAO roda
-    `encode_video` sobre o arquivo de video compartilhado.
+    janela e `embed_query` embute o texto da consulta -- exatamente o que o
+    SigLIP 2 faz. Mesmo modelo do eixo imagem, mas os dois eixos indexam
+    conjuntos de itens diferentes e entram separados no RRF.
 
-    API do model card: carrega por `SentenceTransformer(..., trust_remote_code=True)` e
-    expoe o par assimetrico `encode_document` / `encode_query`. O lado documento recebe
-    uma lista de DICTS (`{"image": <caminho>}`) -- e assim que o WeMM declara a
-    modalidade de cada item; o lado query recebe texto cru. Saida: [n, 2048] ja
-    L2-normalizada.
+    O WeMM-Embedding-2B foi preterido: o checkpoint declara o backbone `qwen3_5`,
+    so reconhecido em transformers >= 5.3, e o stack esta pinado em transformers
+    4.57 (para casar com torch 2.9/CUDA e nao quebrar Qwen3-VL e ColQwen2.5).
+    Fica como trabalho futuro, num ambiente separado.
     """
-    from sentence_transformers import SentenceTransformer
+    from benchmark.models.clip_siglip import ClipSiglipRetriever
 
     log.info("carregando %s", VIDEO_MODEL)
-    model = SentenceTransformer(VIDEO_MODEL, trust_remote_code=True, device="cuda")
-
-    def embed_items(paths: list[str]) -> np.ndarray:
-        return _f32(model.encode_document([{"image": p} for p in paths]))
-
-    def embed_query(texts: list[str]) -> np.ndarray:
-        return _f32(model.encode_query(list(texts)))
-
-    return embed_items, embed_query
+    m = ClipSiglipRetriever(VIDEO_MODEL, backend="hf", device="cuda")
+    return (lambda paths: _f32(m._embed_image(list(paths)))), (
+        lambda texts: _f32(m._embed_text(list(texts)))
+    )
 
 
 def build_unified_a_embedder() -> EmbedderPair:
@@ -110,6 +128,7 @@ EMBEDDER_BUILDERS: dict[str, Callable[[], EmbedderPair]] = {
     "texto": build_text_embedder,
     "imagem": build_image_embedder,
     "audio": build_audio_embedder,
+    "audio_asr": build_audio_asr_embedder,
     "video": build_video_embedder,
     "unified_a": build_unified_a_embedder,
 }

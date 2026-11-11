@@ -16,6 +16,7 @@ from ensemble.eval.rrf import rrf_fuse
 from ensemble.eval.run_eval import (
     AXES,
     CSV_HEADER,
+    _build_systems,
     ensemble_search,
     evaluate,
     main,
@@ -305,6 +306,94 @@ def test_main_grava_csv(tmp_path):
     assert "conjunto" in corpo
     assert "n/a" in corpo                 # B fora de documento
     # nao baixou modelo: nenhuma lib de modelo foi importada
+    assert not {"torch", "sentence_transformers"} & set(sys.modules)
+
+
+# --------------------------------------------------------------------------- #
+# test 5: --audio-mode escolhe entre ASR->texto (padrao) e CLAP (ablacao)
+# --------------------------------------------------------------------------- #
+def _audio_corpus() -> list[PointerRecord]:
+    """Audio com transcricao em `descriptor` e arquivo em meta["path"] -- distintos."""
+    return [
+        PointerRecord(id="a1", modality="audio",
+                      descriptor="orçamento da saúde", pointer_uri="file://a1",
+                      source="radio", meta={"path": "clipes/a1.mp3"}),
+        PointerRecord(id="a2", modality="audio",
+                      descriptor="estrada", pointer_uri="file://a2",
+                      source="radio", meta={"path": "clipes/a2.mp3"}),
+    ]
+
+
+def _spy_pair(registro: list, rotulo: str):
+    """Builder duble: registra o rotulo e os itens que chegam a `embed_items`."""
+
+    def build():
+        def embed_items(texts):
+            registro.append((rotulo, list(texts)))
+            return _bow(texts)
+
+        return embed_items, _bow
+
+    return build
+
+
+def _builders_com_espioes(registro: list) -> dict:
+    builders = {
+        "documento": FakeColRetriever,
+        "imagem": _spy_pair(registro, "imagem"),
+        "texto": _spy_pair(registro, "texto"),
+        "video": _spy_pair(registro, "video"),
+        "unified_a": _spy_pair(registro, "unified_a"),
+        "audio": _spy_pair(registro, "audio-clap"),
+        "audio_asr": _spy_pair(registro, "audio-asr"),
+    }
+    return builders
+
+
+def test_audio_mode_asr_usa_builder_asr_e_a_transcricao():
+    registro: list = []
+    specialists, _, _ = _build_systems(
+        _audio_corpus(), _builders_com_espioes(registro), audio_mode="asr")
+
+    chamadas = [c for c in registro if c[0].startswith("audio-")]
+    # o builder do eixo audio e o `audio_asr`, e os itens embutidos sao as TRANSCRICOES
+    assert chamadas == [("audio-asr", ["orçamento da saúde", "estrada"])]
+    # e o especialista montado ranqueia por elas
+    assert specialists["audio"].search("orçamento saúde", 2)[0][0] == "a1"
+
+
+def test_audio_mode_asr_e_o_padrao():
+    registro: list = []
+    _build_systems(_audio_corpus(), _builders_com_espioes(registro))
+    assert [c for c in registro if c[0].startswith("audio-")] == [
+        ("audio-asr", ["orçamento da saúde", "estrada"])]
+
+
+def test_audio_mode_clap_preserva_o_comportamento_atual():
+    registro: list = []
+    _build_systems(_audio_corpus(), _builders_com_espioes(registro), audio_mode="clap")
+    # builder `audio` (CLAP) sobre os CAMINHOS dos arquivos -- representacao padrao
+    assert [c for c in registro if c[0].startswith("audio-")] == [
+        ("audio-clap", ["clipes/a1.mp3", "clipes/a2.mp3"])]
+
+
+def test_audio_asr_cai_para_o_builder_audio_quando_a_chave_falta():
+    # builders injetados sem `audio_asr` (dubles antigos) continuam funcionando no
+    # modo asr: so a representacao muda para a transcricao.
+    registro: list = []
+    builders = _builders_com_espioes(registro)
+    del builders["audio_asr"]
+    _build_systems(_audio_corpus(), builders, audio_mode="asr")
+    assert [c for c in registro if c[0].startswith("audio-")] == [
+        ("audio-clap", ["orçamento da saúde", "estrada"])]
+
+
+def test_default_builders_registra_audio_asr():
+    from ensemble.eval.run_eval import _default_builders
+
+    builders = _default_builders()
+    assert "audio_asr" in builders and "audio" in builders
+    assert callable(builders["audio_asr"])
     assert not {"torch", "sentence_transformers"} & set(sys.modules)
 
 
