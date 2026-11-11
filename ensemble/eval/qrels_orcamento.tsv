@@ -1,6 +1,7 @@
-# qrels PROPOSTA (gated — revisao do Lucas) | corpus data/govexe/ensemble_orcamento/records.jsonl (n=71)
+# qrels PROPOSTA (gated — revisao do Lucas) | corpus data/govexe/ensemble_orcamento/records.jsonl (n=83; +12 imagens de orcamento recapturadas 2026-11-11)
 # Formato TREC: qid 0 item_id rel. rel=1 (binario). item_ids reais do corpus congelado 2026-11-11.
 # FLAGS de baixa confianca (revisar/possivel drop): q09 (so pagina setorial-indice), q14 (nenhum item forte: repasse Uniao->entes nao capturado; unico proximo e audio sobre renegociacao de dividas de estados/municipios), q16 (2 itens).
+# q17-q24: queries de IMAGEM (eixo imagem), visual-descritivas das fotos do corpus de noticias de orcamento (recuperadas pelo SigLIP2 pela cena, nao pela legenda). Aprovadas pelo Lucas 2026-11-11. Distratores nao-julgados no pool: imagem-fedb9dc0d90b (Domingos Neto/CMO), imagem-e5f94bcbdb00 (Flavia Morais).
 q01 0 documento-27b3dd01-42d6-4e0a-aff7-0f2cba33b67b#p14 1
 q01 0 documento-27b3dd01-42d6-4e0a-aff7-0f2cba33b67b#p15 1
 q01 0 documento-27b3dd01-42d6-4e0a-aff7-0f2cba33b67b#p16 1
@@ -78,3 +79,13 @@ q15 0 texto-1ba984abdbf1 1
 q15 0 texto-cda11f60fdff 1
 q16 0 texto-cda11f60fdff 1
 q16 0 audio-cd34f4cc5eb8 1
+q17 0 imagem-79c29e613e7b 1
+q17 0 imagem-cc293bdd276c 1
+q18 0 imagem-def2577de5d0 1
+q19 0 imagem-9925f73d4cb6 1
+q19 0 imagem-986b8838d43f 1
+q20 0 imagem-facd1ceb224a 1
+q21 0 imagem-2674fbee5f99 1
+q22 0 imagem-819d7a90bf78 1
+q23 0 imagem-8a4707470888 1
+q24 0 imagem-0b84cad447c0 1

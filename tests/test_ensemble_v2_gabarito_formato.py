@@ -10,7 +10,7 @@ QRELS = EVAL / "qrels_orcamento.tsv"
 
 def test_queries_parseiam_com_acentos():
     q = load_queries(QUERIES)
-    assert 15 <= len(q) <= 20
+    assert 15 <= len(q) <= 30  # 16 queries base + 8 de imagem (q17-q24) = 24
     assert all(t.strip() for t in q.values())
     assert any("ç" in t or "ã" in t or "ú" in t for t in q.values())
 
