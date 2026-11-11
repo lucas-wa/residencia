@@ -163,6 +163,10 @@ ENSEMBLE_QUERIES="${ENSEMBLE_QUERIES:-ensemble/eval/queries_orcamento_v2.txt}"
 ENSEMBLE_QRELS="${ENSEMBLE_QRELS:-ensemble/eval/qrels_orcamento.tsv}"
 ENSEMBLE_OUT_CSV="${ENSEMBLE_OUT_CSV:-results/comparacao_v2.csv}"
 ENSEMBLE_LOG="${ENSEMBLE_LOG:-logs/ensemble_v2.txt}"
+# Rankings por query (por eixo antes do RRF, fundido, A e B): artefato que sustenta o
+# sweep de fusao OFFLINE (k do RRF, pesos por eixo) sem re-rodar GPU. Saida secundaria --
+# tanto a gravacao na VM quanto o resgate sao best-effort.
+ENSEMBLE_RANKINGS="${ENSEMBLE_RANKINGS:-results/rankings_v2.json}"
 # Teto PROPRIO do scp dos binarios do corpus: o tar do `bin/` leva os videos das janelas e
 # nao cabe nos 120s do resgate do CSV. So o tar usa este teto; o CSV segue no RESGATE_TIMEOUT.
 ENSEMBLE_RESGATE_TIMEOUT="${ENSEMBLE_RESGATE_TIMEOUT:-900}"
@@ -487,6 +491,7 @@ ENSEMBLE_BIN_DIR='$ENSEMBLE_BIN_DIR'
 ENSEMBLE_QUERIES='$ENSEMBLE_QUERIES'
 ENSEMBLE_QRELS='$ENSEMBLE_QRELS'
 ENSEMBLE_LOG='$ENSEMBLE_LOG'
+ENSEMBLE_RANKINGS='$ENSEMBLE_RANKINGS'
 BUCKET='$BUCKET'
 DB='$DB'
 DB_USER='$DB_USER'
@@ -911,6 +916,7 @@ eval)
             --queries "$ENSEMBLE_QUERIES" \
             --qrels "$ENSEMBLE_QRELS" \
             --out "$OUT_CSV" \
+            --rankings-out "$ENSEMBLE_RANKINGS" \
             --audio-mode asr \
             --log "$ENSEMBLE_LOG"
         echo "=== [eval] CSV comparativo ==="
@@ -1223,6 +1229,13 @@ coletar_resultados() {
         com_timeout "$RESGATE_TIMEOUT" \
             gcloud compute scp "$VM:residencia/$ENSEMBLE_LOG" "$REPO_DIR/$ENSEMBLE_LOG" \
                 --zone="$ZONE" --project="$PROJECT_ID" --quiet || true
+        # Rankings por query (re-fusao offline): saida secundaria -- se nao existir (fase
+        # capture, eval que nem chegou la) o scp falha e a coleta segue.
+        run mkdir -p "$REPO_DIR/$(dirname "$ENSEMBLE_RANKINGS")" || true
+        com_timeout "$RESGATE_TIMEOUT" \
+            gcloud compute scp "$VM:residencia/$ENSEMBLE_RANKINGS" \
+                "$REPO_DIR/$ENSEMBLE_RANKINGS" \
+                --zone="$ZONE" --project="$PROJECT_ID" --quiet || true
     fi
     RESULTADOS_COLETADOS=1
     return 0
@@ -1262,6 +1275,7 @@ exige_relativo ENSEMBLE_BIN_DIR "$ENSEMBLE_BIN_DIR"
 exige_relativo ENSEMBLE_QUERIES "$ENSEMBLE_QUERIES"
 exige_relativo ENSEMBLE_QRELS "$ENSEMBLE_QRELS"
 exige_relativo ENSEMBLE_LOG "$ENSEMBLE_LOG"
+exige_relativo ENSEMBLE_RANKINGS "$ENSEMBLE_RANKINGS"
 
 # O conjunto de avaliacao de audio entra em QUALQUER arquitetura, nao so nas que tem CLAP:
 # o espaco qwen3vl ja indexa os mesmos clipes como `audio_asr` (Whisper -> texto), e e essa

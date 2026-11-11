@@ -6,6 +6,7 @@ calculo a mao (posicoes escolhidas a dedo; DCG/IDCG escritos aqui, nao via a
 implementacao)."""
 from __future__ import annotations
 
+import json
 import math
 import sys
 
@@ -16,6 +17,8 @@ from ensemble.eval.rrf import rrf_fuse
 from ensemble.eval.run_eval import (
     AXES,
     CSV_HEADER,
+    RANKINGS_TOPN,
+    RRF_K,
     _build_systems,
     ensemble_search,
     evaluate,
@@ -248,7 +251,8 @@ class FakeColRetriever:
         return [tok for _ in queries]
 
 
-def test_main_grava_csv(tmp_path):
+def _insumos_main(tmp_path):
+    """Corpus/queries/qrels em disco + builders dubles (sem GPU) para o `main`."""
     pages = tmp_path / "pages"
     pages.mkdir()
     (pages / "d0.png").write_bytes(b"")
@@ -272,8 +276,6 @@ def test_main_grava_csv(tmp_path):
     qrels_path.write_text(
         "q1 0 d0 1\nq1 0 i0 1\nq2 0 d1 1\nq2 0 a0 1\n", encoding="utf-8")
 
-    out_path = tmp_path / "comparacao_v2.csv"
-
     def pair():
         return _bow, _bow
 
@@ -285,6 +287,12 @@ def test_main_grava_csv(tmp_path):
         "video": pair,
         "unified_a": pair,
     }
+    return corpus_path, queries_path, qrels_path, builders
+
+
+def test_main_grava_csv(tmp_path):
+    corpus_path, queries_path, qrels_path, builders = _insumos_main(tmp_path)
+    out_path = tmp_path / "comparacao_v2.csv"
 
     rc = main(
         ["--corpus", str(corpus_path), "--queries", str(queries_path),
@@ -395,6 +403,129 @@ def test_default_builders_registra_audio_asr():
     assert "audio_asr" in builders and "audio" in builders
     assert callable(builders["audio_asr"])
     assert not {"torch", "sentence_transformers"} & set(sys.modules)
+
+
+# --------------------------------------------------------------------------- #
+# test 6: --rankings-out dumpa os rankings por query (re-fusao offline)
+# --------------------------------------------------------------------------- #
+def _cenario_rankings():
+    corpus = [
+        _rec("d1", "documento"), _rec("d2", "documento"), _rec("i1", "imagem"),
+        _rec("a1", "audio"), _rec("t1", "texto"), _rec("v1", "video"),
+    ]
+    specs = {
+        "documento": Ranker({"qa": ["d1", "d2"]}, "documento"),
+        "imagem": Ranker({"qa": ["i1"]}, "imagem"),
+        "audio": Ranker({"qa": ["a1"]}, "audio"),
+        "texto": Ranker({"qa": ["t1"]}, "texto"),
+        "video": Ranker({"qa": ["v1"]}, "video"),
+    }
+    retriever_a = Ranker({"qa": ["i1", "d1", "a1", "t1", "v1", "d2"]})
+    retriever_b = Ranker({"qa": ["d1", "d2"]}, "documento")
+    return corpus, specs, retriever_a, retriever_b
+
+
+def test_rankings_out_dumpa_rankings_por_query(tmp_path):
+    corpus, specs, retriever_a, retriever_b = _cenario_rankings()
+    queries = {"q1": "qa"}
+    qrels = {"q1": {"d1", "i1"}}
+    destino = tmp_path / "sub" / "rankings_v2.json"   # diretorio criado na hora
+
+    rows = evaluate(corpus, queries, qrels, specialists=specs,
+                    retriever_a=retriever_a, retriever_b=retriever_b,
+                    rankings_out=str(destino))
+
+    assert rows                                        # o CSV continua sendo produzido
+    dump = json.loads(destino.read_text(encoding="utf-8"))
+    assert dump["rrf_k"] == RRF_K
+    assert list(dump["queries"]) == ["q1"]
+    q = dump["queries"]["q1"]
+    assert q["text"] == "qa"
+    assert q["relevant"] == ["d1", "i1"]               # do qrels, ordenado
+    # per_axis: a lista de CADA especialista, ANTES do RRF, na ordem de AXES
+    assert list(q["per_axis"]) == list(AXES)
+    assert q["per_axis"] == {
+        "documento": ["d1", "d2"], "imagem": ["i1"], "audio": ["a1"],
+        "texto": ["t1"], "video": ["v1"],
+    }
+    # ensemble_fused: exatamente o que o RRF produz com o mesmo k_search (= len(corpus))
+    assert q["ensemble_fused"] == [i for i, _ in ensemble_search(specs, "qa", len(corpus))]
+    assert q["A"] == ["i1", "d1", "a1", "t1", "v1", "d2"]
+    assert q["B"] == ["d1", "d2"]
+    # re-fundir offline o per_axis reproduz o ensemble_fused do dump
+    assert [i for i, _ in rrf_fuse([q["per_axis"][m] for m in AXES], k=dump["rrf_k"])] \
+        == q["ensemble_fused"]
+
+
+def test_rankings_out_trunca_as_listas(tmp_path):
+    ids = [f"t{i:02d}" for i in range(RANKINGS_TOPN + 10)]
+    corpus = [_rec(i, "texto") for i in ids]
+    specs = {"documento": Ranker({}, "documento"), "imagem": Ranker({}, "imagem"),
+             "audio": Ranker({}, "audio"), "texto": Ranker({"qa": ids}, "texto"),
+             "video": Ranker({}, "video")}
+    destino = tmp_path / "rankings_v2.json"
+
+    evaluate(corpus, {"q1": "qa"}, {"q1": {"t00"}}, specialists=specs,
+             retriever_a=Ranker({"qa": ids}), retriever_b=Ranker({}, "documento"),
+             rankings_out=str(destino))
+
+    q = json.loads(destino.read_text(encoding="utf-8"))["queries"]["q1"]
+    assert len(q["A"]) == RANKINGS_TOPN and q["A"] == ids[:RANKINGS_TOPN]
+    assert len(q["per_axis"]["texto"]) == RANKINGS_TOPN
+    assert len(q["ensemble_fused"]) == RANKINGS_TOPN
+
+
+def test_rankings_out_falha_nao_derruba_a_avaliacao(tmp_path):
+    corpus, specs, retriever_a, retriever_b = _cenario_rankings()
+    queries, qrels = {"q1": "qa"}, {"q1": {"d1", "i1"}}
+    arquivo = tmp_path / "nao_e_pasta.txt"
+    arquivo.write_text("x", encoding="utf-8")
+    destino = arquivo / "rankings_v2.json"   # pai e um ARQUIVO: gravar vai falhar
+
+    esperado = evaluate(corpus, queries, qrels, specialists=specs,
+                        retriever_a=retriever_a, retriever_b=retriever_b)
+    rows = evaluate(corpus, queries, qrels, specialists=specs,
+                    retriever_a=retriever_a, retriever_b=retriever_b,
+                    rankings_out=str(destino))
+
+    # mesmas linhas do CSV, sem excecao -- a saida secundaria e best-effort
+    assert [r["sistema"] for r in rows] == [r["sistema"] for r in esperado]
+    assert [r["recall@1"] for r in rows] == [r["recall@1"] for r in esperado]
+    assert not destino.exists()
+
+
+def test_main_rankings_out_grava_json(tmp_path):
+    corpus_path, queries_path, qrels_path, builders = _insumos_main(tmp_path)
+    out_path = tmp_path / "comparacao_v2.csv"
+    rankings_path = tmp_path / "results" / "rankings_v2.json"
+
+    rc = main(
+        ["--corpus", str(corpus_path), "--queries", str(queries_path),
+         "--qrels", str(qrels_path), "--out", str(out_path),
+         "--rankings-out", str(rankings_path)],
+        builders=builders,
+    )
+
+    assert rc == 0
+    assert out_path.is_file()
+    dump = json.loads(rankings_path.read_text(encoding="utf-8"))
+    assert dump["rrf_k"] == RRF_K
+    assert set(dump["queries"]) == {"q1", "q2"}
+    for q in dump["queries"].values():
+        assert set(q) == {"text", "relevant", "ensemble_fused", "per_axis", "A", "B"}
+        assert list(q["per_axis"]) == list(AXES)
+        assert q["relevant"]
+
+
+def test_main_sem_rankings_out_nao_grava_json(tmp_path):
+    corpus_path, queries_path, qrels_path, builders = _insumos_main(tmp_path)
+    rc = main(
+        ["--corpus", str(corpus_path), "--queries", str(queries_path),
+         "--qrels", str(qrels_path), "--out", str(tmp_path / "comparacao_v2.csv")],
+        builders=builders,
+    )
+    assert rc == 0
+    assert list(tmp_path.glob("*.json")) == []
 
 
 def test_main_arquivo_faltando_retorna_nao_zero(tmp_path):

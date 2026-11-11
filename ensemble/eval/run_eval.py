@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import sys
 from pathlib import Path
@@ -41,7 +42,7 @@ from ensemble.eval.rrf import rrf_fuse
 from ensemble.records import PointerRecord, load_records
 
 __all__ = ["AXES", "CONJUNTO", "SYSTEMS", "B_AXES", "CSV_HEADER", "RRF_K",
-           "ensemble_search", "evaluate", "write_csv", "main"]
+           "RANKINGS_TOPN", "ensemble_search", "evaluate", "write_csv", "main"]
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,9 @@ AXES: tuple[str, ...] = ("documento", "imagem", "audio", "texto", "video")
 CONJUNTO = "conjunto"
 SYSTEMS: tuple[str, ...] = ("ensemble", "A", "B")
 RRF_K = 60  # k do Reciprocal Rank Fusion (spec: RRF uniforme, k=60).
+# Quantos ids por lista sobrevivem no dump de `--rankings-out`: @10 e o maior corte das
+# metricas e a re-fusao offline so mexe no topo -- 50 cobre as duas sem JSON gigante.
+RANKINGS_TOPN = 50
 
 # Metricas por linha, na ordem do CSV do v1 (a `latencia` entra a parte).
 _METRICS: tuple[str, ...] = (
@@ -83,16 +87,23 @@ DOC_KIND = "colqwen2.5"
 
 
 def ensemble_search(specialists: dict, query: str, k: int,
-                    *, rrf_k: int = RRF_K) -> list[tuple[str, float]]:
+                    *, rrf_k: int = RRF_K,
+                    per_axis_out: dict | None = None) -> list[tuple[str, float]]:
     """O ensemble: funde por RRF as listas de item_ids dos especialistas.
 
     Cada especialista ranqueia so o seu eixo; o RRF usa apenas a ORDEM (os scores dos
     especialistas sao descartados -- escalas diferentes). A iteracao segue a ordem do dict
     (o `main` o monta em `AXES`), entao o desempate do RRF e determinista.
+
+    `per_axis_out`, se dado, recebe eixo->lista de item_ids ANTES do RRF (as listas que
+    acabaram de ser fundidas). E so um espelho para o dump de `--rankings-out`: evita
+    repetir o `sp.search` (que e a parte cara, em GPU) so para registrar o ranking bruto.
     """
-    listas = [[item_id for item_id, _ in sp.search(query, k)]
-              for sp in specialists.values()]
-    return rrf_fuse(listas, k=rrf_k)
+    listas = {axis: [item_id for item_id, _ in sp.search(query, k)]
+              for axis, sp in specialists.items()}
+    if per_axis_out is not None:
+        per_axis_out.update(listas)
+    return rrf_fuse(list(listas.values()), k=rrf_k)
 
 
 def _metrics(ranked_ids: list[str], relevant: set[str]) -> dict[str, float]:
@@ -109,13 +120,18 @@ def _metrics(ranked_ids: list[str], relevant: set[str]) -> dict[str, float]:
 
 def evaluate(corpus: list[PointerRecord], queries: dict[str, str],
              qrels: dict[str, set[str]], *, specialists: dict,
-             retriever_a, retriever_b) -> list[dict]:
+             retriever_a, retriever_b, rankings_out: str | None = None) -> list[dict]:
     """Avalia ensemble/A/B por (sistema, eixo) + conjunto, media sobre as queries.
 
     `corpus` da a modalidade de cada id (filtro por eixo) e o `k` de busca (ranking
     completo). `specialists` e um dict eixo->Specialist; `retriever_a` ranqueia global;
     `retriever_b` so documento. Devolve uma linha-dict por (sistema, eixo), com `None`
     (n/a) nas metricas de B fora de documento.
+
+    `rankings_out`, se dado, grava tambem um JSON com os rankings de cada query (por eixo
+    antes do RRF, fundido, A, B e o conjunto-relevante), que sustenta experimentos de
+    fusao OFFLINE (sweep de k do RRF, pesos por eixo) sem re-rodar GPU. A gravacao e
+    best-effort: falhar nela NAO derruba a avaliacao -- o CSV e a saida principal.
     """
     modality_by_id = {r.id: r.modality for r in corpus}
     k_search = max(len(corpus), 1)
@@ -129,14 +145,17 @@ def evaluate(corpus: list[PointerRecord], queries: dict[str, str],
     }
     lat: dict[str, float] = {s: 0.0 for s in SYSTEMS}
     julgadas: dict[str, int] = {axis: 0 for axis in (*AXES, CONJUNTO)}
+    dump: dict[str, dict] | None = {} if rankings_out else None
 
     for qid, qtext in queries.items():
         rel_all = set(qrels.get(qid, ()))
         rel_axis = {axis: {i for i in rel_all if modality_by_id.get(i) == axis}
                     for axis in AXES}
 
+        per_axis: dict[str, list[str]] | None = {} if dump is not None else None
         t0 = perf_counter()
-        fused_ids = [i for i, _ in ensemble_search(specialists, qtext, k_search)]
+        fused_ids = [i for i, _ in ensemble_search(specialists, qtext, k_search,
+                                                   per_axis_out=per_axis)]
         lat["ensemble"] += perf_counter() - t0
 
         t0 = perf_counter()
@@ -148,6 +167,18 @@ def evaluate(corpus: list[PointerRecord], queries: dict[str, str],
         lat["B"] += perf_counter() - t0
 
         rankings = {"ensemble": fused_ids, "A": a_ids, "B": b_ids}
+        if dump is not None:
+            dump[qid] = {
+                "text": qtext,
+                # `relevant` NAO e truncado: e o denominador das metricas offline.
+                "relevant": sorted(rel_all),
+                "ensemble_fused": fused_ids[:RANKINGS_TOPN],
+                "per_axis": {axis: ids[:RANKINGS_TOPN]
+                             for axis, ids in (per_axis or {}).items()},
+                "A": a_ids[:RANKINGS_TOPN],
+                "B": b_ids[:RANKINGS_TOPN],
+            }
+
         for axis in AXES:
             rel = rel_axis[axis]
             if not rel:          # query nao-julgada neste eixo: nao conta na media
@@ -164,6 +195,9 @@ def evaluate(corpus: list[PointerRecord], queries: dict[str, str],
             julgadas[CONJUNTO] += 1
             for sistema in SYSTEMS:
                 _accum(somas[(sistema, CONJUNTO)], _metrics(rankings[sistema], rel_all))
+
+    if dump is not None:
+        _dump_rankings(dump, rankings_out)
 
     rows: list[dict] = []
     for sistema in SYSTEMS:
@@ -199,6 +233,26 @@ def _na_row(sistema: str, eixo: str) -> dict:
         row[m] = None
     row["latencia"] = None
     return row
+
+
+def _dump_rankings(queries_dump: dict[str, dict], path) -> None:
+    """Grava o JSON de rankings por query -- best-effort, NUNCA levanta.
+
+    O artefato alimenta a re-fusao offline (`{"rrf_k": ..., "queries": {qid: {...}}}`);
+    perde-lo e um aborrecimento, nao um motivo para perder a rodada de GPU, entao
+    qualquer falha vira warning no log e a avaliacao segue com o CSV.
+    """
+    try:
+        out = Path(path)
+        if out.parent != Path(""):
+            out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump({"rrf_k": RRF_K, "queries": queries_dump}, f,
+                      ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001 -- saida secundaria: nao derruba a avaliacao
+        log.warning("nao foi possivel gravar os rankings em %s: %s", path, e)
+    else:
+        log.info("rankings de %d query(ies) -> %s", len(queries_dump), path)
 
 
 def write_csv(rows: list[dict], path) -> None:
@@ -289,6 +343,10 @@ def main(argv: list[str] | None = None, *, builders: dict | None = None) -> int:
     parser.add_argument("--queries", required=True, help="arquivo qid<TAB>texto")
     parser.add_argument("--qrels", required=True, help="qrels TREC `qid 0 item_id rel`")
     parser.add_argument("--out", required=True, help="CSV de saida")
+    parser.add_argument("--rankings-out", default=None,
+                        help="JSON opcional com os rankings de cada query (por eixo, "
+                             "fundido, A e B) para re-fusao OFFLINE; best-effort: "
+                             "falhar ao gravar nao derruba a avaliacao")
     parser.add_argument("--log", default=None, help="arquivo de log opcional")
     parser.add_argument("--pages-dir", default=None,
                         help="diretorio das paginas de documento (resolucao de caminho)")
@@ -334,7 +392,8 @@ def main(argv: list[str] | None = None, *, builders: dict | None = None) -> int:
         audio_mode=args.audio_mode)
 
     rows = evaluate(corpus, queries, qrels, specialists=specialists,
-                    retriever_a=retriever_a, retriever_b=retriever_b)
+                    retriever_a=retriever_a, retriever_b=retriever_b,
+                    rankings_out=args.rankings_out)
     write_csv(rows, args.out)
 
     print(f"ok: {len(queries)} query(ies), {len(corpus)} record(s), "
