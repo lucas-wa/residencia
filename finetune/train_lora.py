@@ -551,6 +551,136 @@ class LateInteractionEncoder:
                 im.close()
 
 
+# Sentinela do teto de resolucao: no encoder de inferencia `max_pixels=None` significa
+# "SEM teto", entao o default do DenseEncoder nao pode ser None -- ele herda
+# `qwen3vl_embed.DEFAULT_MAX_PIXELS` (import local), para o finetune ver as paginas na
+# mesma resolucao em que a inferencia vai ve-las depois.
+_HERDA_MAX_PIXELS = object()
+
+# Modalidades aceitas por `DenseEncoder.encode_items`.
+DENSE_MODALITIES = ("image", "text")
+
+
+def dense_item(item, default_modality: str = "image") -> tuple[str, object]:
+    """Um item do lado do corpus -> `(modalidade, valor)`.
+
+    HOJE o treino manda uma lista homogenea de caminhos de imagem (`PairBatch.images`), e
+    a string crua herda `default_modality`. A separacao por modalidade dentro do batch
+    (tarefa seguinte) ja cabe aqui sem reescrita: um par `("text", "...")` ou qualquer
+    objeto com `.modality`/`.value` passa direto.
+    """
+    mod = getattr(item, "modality", None)
+    if mod is not None:
+        return str(mod), getattr(item, "value", item)
+    if (isinstance(item, (tuple, list)) and len(item) == 2
+            and item[0] in DENSE_MODALITIES):
+        return str(item[0]), item[1]
+    return default_modality, item
+
+
+class DenseEncoder:
+    """Encode DENSO (um vetor por item) COM gradiente -- o analogo denso do
+    `LateInteractionEncoder`, para a base `qwen3vl`.
+
+    Reusa os helpers de montagem de input do encoder de INFERENCIA
+    (`benchmark/models/qwen3vl_embed.py`), que sao diferenciaveis: `_messages`
+    (system(instrucao) + user([imagem|texto])), `_build_inputs` (chat template +
+    processor, de onde saem os `input_ids` com os placeholders de imagem), `_cap_pixels`
+    (teto de resolucao) e `_pool` (ultimo token NAO-pad, o "lasttoken" do 1_Pooling). O
+    que NAO se reusa e o `_embed_*`/`_forward_generic` daquele modulo: eles rodam em
+    `torch.no_grad()` e devolvem numpy -- aqui o forward e nu e a saida continua sendo um
+    tensor com `requires_grad`.
+
+    Os dois lados saem L2-normalizados, entao `q @ d.T` ja e cosseno (ver
+    `dense_infonce_loss`).
+    """
+
+    def __init__(self, model, processor, *, instruction: str | None = None,
+                 max_length: int | None = None, max_pixels=_HERDA_MAX_PIXELS):
+        from benchmark.models import qwen3vl_embed as qwen
+
+        self.model = model
+        # `_proc`/`max_length` sao os nomes que `Qwen3VLEmbedRetriever._build_inputs` le
+        # no dono -- ver `_forward`.
+        self._proc = processor
+        self.instruction = instruction or qwen.DEFAULT_INSTRUCTION
+        self.max_length = max_length or qwen.MAX_LENGTH
+        self.max_pixels = (qwen.DEFAULT_MAX_PIXELS if max_pixels is _HERDA_MAX_PIXELS
+                           else max_pixels)
+
+    @property
+    def proc(self):
+        """Processor (alias publico de `_proc`, que existe pelo contrato do helper)."""
+        return self._proc
+
+    def _device(self):
+        return getattr(self.model, "device", None) or next(self.model.parameters()).device
+
+    def _forward(self, convs: list[list[dict]], images: list | None = None):
+        """Conversas -> `[N, D]` L2-normalizado, SEM `no_grad` (o grad nasce aqui)."""
+        import torch.nn.functional as F
+        from benchmark.models.qwen3vl_embed import Qwen3VLEmbedRetriever, _field
+
+        # `_build_inputs` e `_pool` so tocam `self._proc`/`self.max_length` do dono: a
+        # funcao nao-ligada roda com ESTE encoder no lugar do retriever de inferencia, o
+        # que evita duplicar o chat template (e o bug historico de mandar so pixel_values).
+        inputs = Qwen3VLEmbedRetriever._build_inputs(self, convs, images=images)
+        device = self._device()
+        batch = {k: (v.to(device) if hasattr(v, "to") else v)
+                 for k, v in dict(inputs).items()}
+        out = self.model(**batch)
+        emb = _field(out, "embeddings")        # repacks que ja devolvem o vetor pronto
+        if emb is None:
+            hidden = _field(out, "last_hidden_state")
+            if hidden is None:
+                hidden_states = _field(out, "hidden_states")
+                hidden = hidden_states[-1] if hidden_states else out
+            mask = _field(out, "attention_mask")
+            if mask is None:
+                mask = batch.get("attention_mask")
+            emb = Qwen3VLEmbedRetriever._pool(hidden, mask)
+        return F.normalize(emb.float(), p=2, dim=-1)
+
+    def encode_queries(self, texts: list[str]):
+        """Textos das queries -> `[B, D]` L2-normalizado, com gradiente."""
+        from benchmark.models.qwen3vl_embed import _messages
+
+        return self._forward([_messages(self.instruction, text=t) for t in texts])
+
+    def encode_items(self, items, modality: str = "image"):
+        """Itens do corpus -> `[N, D]` L2-normalizado, com gradiente.
+
+        `items` sao caminhos de imagem (default) e/ou textos; `modality` e a modalidade
+        de quem vier como string crua. Itens ja anotados (`("text", "...")` ou objeto com
+        `.modality`) mandam na propria modalidade -- ver `dense_item`.
+        """
+        from PIL import Image
+
+        from benchmark.models.qwen3vl_embed import _cap_pixels, _messages
+
+        normalizados = [dense_item(it, modality) for it in items]
+        desconhecidas = {m for m, _ in normalizados if m not in DENSE_MODALITIES}
+        if desconhecidas:
+            raise ValueError(f"modalidade desconhecida: {sorted(desconhecidas)} "
+                             f"(use {'/'.join(DENSE_MODALITIES)})")
+        convs: list[list[dict]] = []
+        imagens: list = []
+        try:
+            for mod, valor in normalizados:
+                if mod == "image":
+                    # mesmo teto da inferencia: o vetor treinado tem de valer na hora de
+                    # indexar o corpus
+                    im = _cap_pixels(Image.open(valor).convert("RGB"), self.max_pixels)
+                    imagens.append(im)
+                    convs.append(_messages(self.instruction, image=im))
+                else:
+                    convs.append(_messages(self.instruction, text=str(valor)))
+            return self._forward(convs, images=imagens or None)
+        finally:
+            for im in imagens:
+                im.close()
+
+
 def maxsim_scores(q, d, q_mask=None, d_mask=None):
     """MaxSim (late interaction): [B, Lq, D] x [N, Ld, D] -> [B, N].
 
@@ -574,6 +704,17 @@ def contrastive_loss(scores, temperature: float = 0.02):
 
     alvos = torch.arange(scores.shape[0], device=scores.device)
     return F.cross_entropy(scores / max(temperature, 1e-6), alvos)
+
+
+def dense_infonce_loss(q, d, temperature: float = 0.02):
+    """InfoNCE denso: cosseno `[B, D] x [N, D] -> [B, N]`, positivos na diagonal.
+
+    O analogo de `contrastive_loss(maxsim_scores(...))` no caminho de um vetor por item:
+    `q` e `d` ja saem L2-normalizados do `DenseEncoder`, entao o produto interno E o
+    cosseno. Os B positivos vem PRIMEIRO em `d` (contrato do `PairBatch.images`), logo o
+    alvo e `arange(B)` -- quem faz a cross-entropy e a `contrastive_loss`.
+    """
+    return contrastive_loss(q.float() @ d.float().t(), temperature)
 
 
 # -- treino ---------------------------------------------------------------------------

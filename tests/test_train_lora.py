@@ -268,6 +268,95 @@ def test_missing_deps_depende_do_metodo_e_da_base():
     assert T.missing_deps(T.resolve_config("qwen3vl", "qlora"), sem_colpali) == ["bitsandbytes"]
 
 
+# -- encoder denso + InfoNCE ----------------------------------------------------------
+
+
+class _ProcessadorDuble:
+    """Processor minimo para o caminho denso: chat template -> string, batch -> ids+mascara.
+
+    Fica no formato que `Qwen3VLEmbedRetriever._build_inputs` espera (ele so chama
+    `apply_chat_template` e depois o proprio processor), sem baixar pesos nem tokenizer.
+    """
+
+    def apply_chat_template(self, conv, **kw):
+        return " ".join(parte.get("text", "") for msg in conv for parte in msg["content"])
+
+    def __call__(self, text=None, **kw):
+        import torch
+
+        n = len(list(text))
+        return {"input_ids": torch.ones((n, 4), dtype=torch.long),
+                "attention_mask": torch.ones((n, 4), dtype=torch.long)}
+
+
+def _modelo_duble(hidden: int = 8, vocab: int = 16):
+    """nn.Module treinavel cujo forward devolve `last_hidden_state` [B, L, H] com grad."""
+    import torch
+
+    class Duble(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = torch.nn.Embedding(vocab, hidden)
+
+        def forward(self, input_ids=None, attention_mask=None, **kw):
+            return types.SimpleNamespace(last_hidden_state=self.emb(input_ids))
+
+    return Duble()
+
+
+def test_dense_encoder_preserva_grad():
+    torch = pytest.importorskip("torch")
+    enc = T.DenseEncoder(_modelo_duble(hidden=8), _ProcessadorDuble())
+
+    q = enc.encode_queries(["o que o plano propoe?", "qual a meta de saude?"])
+
+    assert tuple(q.shape) == (2, 8)
+    assert q.requires_grad is True                      # nada de no_grad/detach/numpy
+    assert torch.allclose(q.norm(dim=-1), torch.ones(2), atol=1e-5)   # L2-normalizado
+
+    q.sum().backward()                                  # o gradiente chega ao modelo
+    assert enc.model.emb.weight.grad is not None
+
+
+def test_dense_encoder_encode_items_aceita_imagem_e_texto(tmp_path):
+    """O lado do corpus: caminho de imagem (default) e item ja anotado como texto."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    pagina = tmp_path / "BR_p00.png"
+    Image.new("RGB", (40, 50), "white").save(pagina)
+    enc = T.DenseEncoder(_modelo_duble(hidden=8), _ProcessadorDuble())
+
+    d = enc.encode_items([str(pagina), ("text", "trecho do plano")])
+
+    assert tuple(d.shape) == (2, 8)
+    assert d.requires_grad is True
+    assert torch.allclose(d.norm(dim=-1), torch.ones(2), atol=1e-5)
+
+    with pytest.raises(ValueError, match="modalidade desconhecida"):
+        enc.encode_items([("audio", "x.wav")], modality="audio")
+
+
+def test_dense_infonce_diagonal():
+    torch = pytest.importorskip("torch")
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+    q = F.normalize(torch.randn(3, 8), dim=-1)
+    # os B positivos PRIMEIRO (identicos as queries) e depois um negativo -- o contrato
+    # de `PairBatch.images`, logo o alvo e a diagonal
+    d = torch.cat([q.clone(), F.normalize(torch.randn(1, 8), dim=-1)])
+
+    scores = q @ d.T
+    assert torch.equal(scores.argmax(dim=1), torch.arange(3))
+
+    perda = T.dense_infonce_loss(q, d, temperature=0.05)
+
+    assert torch.isfinite(perda) and float(perda) > 0
+    assert float(perda) == pytest.approx(float(T.contrastive_loss(scores, 0.05)), rel=1e-5)
+
+
 # -- dry run --------------------------------------------------------------------------
 
 
