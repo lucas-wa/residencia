@@ -9,11 +9,16 @@ A query (texto) e o anchor, `pos_image` e o unico positivo e `neg_images` sao os
 daquele exemplo. Com `--max-neg 0` os negativos do arquivo sao ignorados e o treino usa so
 in-batch negatives (os positivos dos OUTROS exemplos do batch).
 
-Bases (todas late-interaction/MaxSim, o mesmo contrato do `benchmark/models/colvision.py`
-e `benchmark/models/colembed.py`):
+Bases late-interaction/MaxSim (o mesmo contrato do `benchmark/models/colvision.py` e
+`benchmark/models/colembed.py`):
 
     colqwen2.5  vidore/colqwen2.5-v0.2             ~3B   PRIMARIA
     colembed8b  nvidia/nemotron-colembed-vl-8b-v2  ~8B   opcao (licenca nao comercial)
+
+Base DENSA (um vetor por item, cosseno -- o contrato do
+`benchmark/models/qwen3vl_embed.py`):
+
+    qwen3vl     Qwen/Qwen3-VL-Embedding-2B         ~2B   unificado (Semana 10)
 
 Metodos:
 
@@ -82,7 +87,7 @@ class BaseSpec:
 
     key: str
     model_id: str
-    kind: str                       # "colqwen2.5" | "colembed" (dispatch do encoder)
+    kind: str                       # "colqwen2.5" | "colembed" | "qwen3vl" (dispatch do encoder)
     params_b: float                 # tamanho da base, em bilhoes de parametros
     hidden: int
     layers: int
@@ -115,6 +120,19 @@ BASES: dict[str, BaseSpec] = {
         heads=32, kv_heads=8, head_dim=128,
         license_note="NAO comercial (uso academico)",
         eval_config="benchmark/configs/v3_colembed8b.yaml",
+    ),
+    # Qwen3-VL-Embedding 2B -- unico DENSO aqui (um vetor por item, cosseno; o encoder
+    # e o `load_base_model` deste kind vem nas tarefas seguintes). Dimensoes do
+    # `text_config` do card (backbone Qwen3-1.7B: hidden 2048, 28 camadas, MLP 6144,
+    # 16 heads / 8 kv heads, head_dim 128); a torre de visao fica FORA da estimativa,
+    # como nas outras bases. TODO confirmar em runtime: `model.config` do checkpoint
+    # carregado (--load-model).
+    "qwen3vl": BaseSpec(
+        key="qwen3vl", model_id="Qwen/Qwen3-VL-Embedding-2B", kind="qwen3vl",
+        params_b=2.0, hidden=2048, layers=28, intermediate=6144,
+        heads=16, kv_heads=8, head_dim=128,
+        license_note="Apache-2.0 (confirmar no card)",
+        eval_config="",                 # hook de avaliacao do ensemble: tarefa posterior
     ),
 }
 
@@ -390,7 +408,10 @@ def available_deps() -> dict[str, str | None]:
 def missing_deps(cfg: TrainConfig, deps: dict[str, str | None]) -> list[str]:
     """Deps que FALTAM para esta config treinar de fato."""
     preciso = ["torch", "transformers", "peft"]
-    if cfg.spec.kind != "colembed":
+    # Bases densas/custom-code carregam por transformers puro (AutoModel /
+    # Qwen3VLForConditionalGeneration): so o caminho late-interaction precisa do
+    # colpali-engine.
+    if cfg.spec.kind not in ("colembed", "qwen3vl"):
         preciso.append("colpali_engine")
     if cfg.method == "qlora":
         preciso.append("bitsandbytes")
@@ -813,7 +834,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--pairs", default=DEFAULT_PAIRS,
                     help=f"pairs.jsonl de finetune/make_pairs.py (default: {DEFAULT_PAIRS})")
     ap.add_argument("--base", choices=sorted(BASES), default="colqwen2.5",
-                    help="base a treinar (colqwen2.5 = primaria, ~3B)")
+                    help="base a treinar (colqwen2.5 = primaria, ~3B; "
+                         "qwen3vl = unificado denso, ~2B)")
     ap.add_argument("--method", choices=METHODS, default="lora",
                     help="lora (bf16, H100) ou qlora (NF4 4-bit, L4 24GB)")
     ap.add_argument("--output-dir", default="",

@@ -171,6 +171,20 @@ def test_resolve_config_resolve_base_e_metodo():
     assert cfg8b.spec.params_b == 8.0 and cfg8b.spec.kind == "colembed"
 
 
+def test_base_qwen3vl_resolve():
+    """A base DENSA (Qwen3-VL-Embedding-2B) resolve e atravessa as estimativas."""
+    cfg = T.resolve_config("qwen3vl", "lora")
+
+    assert cfg.spec.kind == "qwen3vl"
+    assert "Qwen3-VL" in cfg.spec.model_id
+
+    estimado = T.estimate_lora_params(cfg.spec, cfg.lora_r)
+    assert estimado > 0
+
+    vram = T.estimate_vram_gb(cfg, estimado)
+    assert "total" in vram and vram["total"] > 0
+
+
 @pytest.mark.parametrize("base,metodo,erro", [
     ("colqwen3", "lora", "base desconhecida"),
     ("colqwen2.5", "full", "metodo desconhecido"),
@@ -249,6 +263,9 @@ def test_missing_deps_depende_do_metodo_e_da_base():
     # ColEmbed carrega por AutoModel(trust_remote_code): nao precisa do colpali-engine
     sem_colpali = {**todas, "colpali_engine": None}
     assert T.missing_deps(T.resolve_config("colembed8b", "lora"), sem_colpali) == []
+    # idem a base densa Qwen3-VL (transformers puro), mas QLoRA ainda exige bitsandbytes
+    assert T.missing_deps(T.resolve_config("qwen3vl", "lora"), sem_colpali) == []
+    assert T.missing_deps(T.resolve_config("qwen3vl", "qlora"), sem_colpali) == ["bitsandbytes"]
 
 
 # -- dry run --------------------------------------------------------------------------
