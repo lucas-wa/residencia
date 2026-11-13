@@ -4,29 +4,37 @@ Entrada: o diretorio do benchmark pt-BR dos planos, no layout produzido por
 `data/govexe/build_planos_benchmark.py` (e lido por `benchmark.common.datasets.load_local`):
 
     <corpus_dir>/corpus.jsonl    {"id": "<tse_seq>_p<NN>", "image_path": "..."}
+                                 {"id": "<item_id>", "text": "..."}   # item TEXTUAL (v4)
     <corpus_dir>/queries.jsonl   {"id": "<tse_seq>_<destaque|resumo|eixoN>", "text": "..."}
     <corpus_dir>/qrels.tsv       <query_id>\t<page_id>\t1
 
 `corpus.jsonl` e obrigatorio; `queries.jsonl`/`qrels.tsv` sao opcionais e, quando existem,
 alimentam o contexto do gerador (destaque/resumo/eixos do plano daquela pagina).
 
-Saida: `<out>/pairs.jsonl` -- uma linha JSON por par (query, pagina positiva, negativos):
+Um item do corpus e de UMA modalidade: `image_path` -> pagina (modalidade "imagem"), ou um
+campo de texto (`text`, ou `a_repr` no layout do ensemble) -> modalidade "texto". E assim
+que os pares cobrem TODOS os dominios que o unificado denso embedda (Semana 10).
 
-    {"id": "<sha1 curto de query+pos_image>",   # chave de dedup/idempotencia
+Saida: `<out>/pairs.jsonl` -- uma linha JSON por par (query, item positivo, negativos):
+
+    {"id": "<sha1 curto de query+positivo>",    # chave de dedup/idempotencia
      "query": "quais as propostas do plano BR001 para saude publica?",
-     "pos_id": "BR001_p00",                     # id da pagina no corpus.jsonl
-     "pos_image": "...../pages/BR001_p00.png",  # pagina RELEVANTE (label=1)
+     "pos_id": "BR001_p00",                     # id do item no corpus.jsonl
+     "pos_modality": "imagem",                  # "imagem" | "texto"
+     "pos_image": "...../pages/BR001_p00.png",  # pagina RELEVANTE (label=1); "" se texto
+     "pos_text": "",                            # texto RELEVANTE (label=1); "" se imagem
      "neg_ids": ["BR002_p03", ...],             # len == --neg (ou menos, corpus pequeno)
      "neg_images": [".../BR002_p03.png", ...],  # amostradas de OUTRAS paginas
      "label": 1,
      "generator": "template"}
 
-Contrato com o treinador (`finetune/train_lora.py`, tarefa C2 -- ainda nao existe): cada
-linha e um exemplo contrastivo pronto: a query (texto) e o anchor, `pos_image` e o unico
-positivo e `neg_images` sao os negativos daquele exemplo (hard negatives quando o gerador
-real entrar; por ora, negativos aleatorios de outros planos). O treinador le o jsonl
-linha a linha, nao precisa do corpus original e pode ignorar `neg_images` se usar apenas
-in-batch negatives.
+Contrato com o treinador (`finetune/train_lora.py`): cada linha e um exemplo contrastivo
+pronto: a query (texto) e o anchor, o positivo e `pos_image` OU `pos_text` (conforme
+`pos_modality`) e `neg_images` sao os negativos daquele exemplo (hard negatives quando o
+gerador real entrar; por ora, negativos aleatorios de outros planos). O treinador le o
+jsonl linha a linha, nao precisa do corpus original e pode ignorar `neg_images` se usar
+apenas in-batch negatives. Linhas antigas (sem `pos_modality`/`pos_text`) continuam
+valendo: o treinador assume "imagem".
 
 A geracao de consultas e plugavel: `generate_queries(context: PageContext) -> list[str]`.
 O default (`template_generate_queries`) e deterministico e offline -- roda nos testes e
@@ -53,17 +61,35 @@ DEFAULT_K = 3
 DEFAULT_NEG = 4
 TOPIC_WORDS = 12          # palavras aproveitadas de cada texto do plano como "topico"
 
+MODALIDADE_IMAGEM = "imagem"
+MODALIDADE_TEXTO = "texto"
+MODALIDADES = (MODALIDADE_IMAGEM, MODALIDADE_TEXTO)
+
+# Campos do corpus.jsonl que carregam o texto de um item textual, em ordem de preferencia
+# (`text` e o layout do benchmark; `a_repr` e o do ensemble/corpus v4).
+TEXT_FIELDS = ("text", "a_repr")
+
 
 @dataclass(frozen=True)
 class PageContext:
-    """Tudo o que o gerador de consultas enxerga de uma pagina (sem IO proprio)."""
+    """Tudo o que o gerador de consultas enxerga de um ITEM do corpus (sem IO proprio).
+
+    O nome vem de quando todo item era uma pagina; no corpus v4 um item tambem pode ser
+    textual (`modality == "texto"`, `image_path == ""`).
+    """
 
     page_id: str
     image_path: str
     plan_id: str
-    k: int                                  # quantas consultas pedir para esta pagina
-    text: str | None = None                 # texto da pagina, quando o corpus trouxer
+    k: int                                  # quantas consultas pedir para este item
+    text: str | None = None                 # texto do item, quando o corpus trouxer
     plan_texts: tuple[str, ...] = ()        # destaque/resumo/eixos do plano (queries.jsonl)
+    modality: str = MODALIDADE_IMAGEM       # "imagem" | "texto"
+
+    @property
+    def pos_value(self) -> str:
+        """O POSITIVO em si: o caminho da pagina, ou o texto do item."""
+        return (self.text or "") if self.modality == MODALIDADE_TEXTO else self.image_path
 
 
 QueryGenerator = Callable[[PageContext], list[str]]
@@ -140,8 +166,28 @@ def plan_id_of(page_id: str) -> str:
     return head if sep and tail.isdigit() else page_id
 
 
+def _item_text(doc: dict) -> str:
+    """Texto de um item do corpus (`text` ou `a_repr`), ja limpo -- "" quando nao ha."""
+    for campo in TEXT_FIELDS:
+        valor = doc.get(campo)
+        if valor and str(valor).strip():
+            return str(valor).strip()
+    return ""
+
+
+def item_modality(doc: dict) -> str:
+    """Modalidade de um item do corpus: tem `image_path` -> "imagem"; senao texto.
+
+    A imagem manda quando o item traz as duas coisas (uma pagina com OCR continua sendo
+    uma pagina) -- e o que mantem o corpus antigo gerando exatamente os mesmos pares.
+    """
+    if (doc.get("image_path") or "").strip():
+        return MODALIDADE_IMAGEM
+    return MODALIDADE_TEXTO if _item_text(doc) else MODALIDADE_IMAGEM
+
+
 def load_contexts(corpus_dir: str | Path, k: int = DEFAULT_K) -> list[PageContext]:
-    """Monta um `PageContext` por pagina do corpus, anexando os textos do plano."""
+    """Monta um `PageContext` por item do corpus, anexando os textos do plano."""
     root = Path(corpus_dir)
     docs = _read_jsonl(root / "corpus.jsonl")
     if not docs:
@@ -171,8 +217,9 @@ def load_contexts(corpus_dir: str | Path, k: int = DEFAULT_K) -> list[PageContex
             image_path=d.get("image_path") or "",
             plan_id=plan_id_of(page_id),
             k=k,
-            text=d.get("text"),
+            text=_item_text(d) or None,
             plan_texts=tuple(dict.fromkeys(texts)),
+            modality=item_modality(d),
         ))
     return ctxs
 
@@ -180,16 +227,26 @@ def load_contexts(corpus_dir: str | Path, k: int = DEFAULT_K) -> list[PageContex
 # -- geracao dos pares ----------------------------------------------------------------
 
 
-def pair_id(query: str, pos_image: str) -> str:
-    """Chave de dedup: o mesmo (query, pagina positiva) nunca vira duas linhas."""
-    return hashlib.sha1(f"{query}\x00{pos_image}".encode()).hexdigest()[:16]
+def pair_id(query: str, pos_value: str) -> str:
+    """Chave de dedup: o mesmo (query, positivo) nunca vira duas linhas.
+
+    `pos_value` e o caminho da pagina (modalidade imagem) ou o proprio texto do item
+    (modalidade texto) -- os ids das linhas so-imagem ja escritas nao mudam.
+    """
+    return hashlib.sha1(f"{query}\x00{pos_value}".encode()).hexdigest()[:16]
 
 
 def sample_negatives(ctx: PageContext, pool: list[PageContext], n: int,
                      rng: random.Random) -> list[PageContext]:
-    """Amostra `n` paginas != `ctx`, preferindo paginas de OUTROS planos."""
-    outros_planos = [c for c in pool if c.plan_id != ctx.plan_id]
-    outras_paginas = [c for c in pool if c.page_id != ctx.page_id]
+    """Amostra `n` paginas != `ctx`, preferindo paginas de OUTROS planos.
+
+    So entram itens COM imagem: `neg_images` e uma lista de caminhos (contrato do
+    treinador), e um item textual so renderia string vazia ali. Os negativos textuais
+    chegam pelos in-batch negatives (os positivos dos outros exemplos do batch).
+    """
+    com_imagem = [c for c in pool if c.image_path]
+    outros_planos = [c for c in com_imagem if c.plan_id != ctx.plan_id]
+    outras_paginas = [c for c in com_imagem if c.page_id != ctx.page_id]
     candidatos = outros_planos or outras_paginas
     if not candidatos:
         return []
@@ -207,11 +264,13 @@ def make_pairs(corpus_dir: str | Path, out: str | Path,
                k: int = DEFAULT_K, neg: int = DEFAULT_NEG, limit: int | None = None,
                force: bool = False, seed: int = SEED,
                generator_name: str = "template") -> list[dict]:
-    """Escreve `pairs.jsonl` com K consultas por pagina + `neg` negativos, e devolve as linhas.
+    """Escreve `pairs.jsonl` com K consultas por item + `neg` negativos, e devolve as linhas.
 
-    E idempotente: o jsonl existente e relido como cache; paginas que ja tem pares nao
+    Cada item vira um par da SUA modalidade (pagina -> `pos_image`, texto -> `pos_text`).
+
+    E idempotente: o jsonl existente e relido como cache; itens que ja tem pares nao
     voltam ao gerador (que no caminho real custa chamada de LLM) e as linhas antigas sao
-    preservadas na ordem original. A dedup final e por `pair_id(query, pos_image)`, entao
+    preservadas na ordem original. A dedup final e por `pair_id(query, positivo)`, entao
     rodar duas vezes nao duplica nada. `force=True` ignora o cache e refaz tudo.
 
     Os negativos vem de um `random.Random` semeado por `(seed, page_id)`, logo a mesma
@@ -238,14 +297,16 @@ def make_pairs(corpus_dir: str | Path, out: str | Path,
             query = (query or "").strip()
             if not query:
                 continue
-            rid = pair_id(query, ctx.image_path)
+            rid = pair_id(query, ctx.pos_value)
             if rid in registros:
                 continue
             registros[rid] = {
                 "id": rid,
                 "query": query,
                 "pos_id": ctx.page_id,
-                "pos_image": ctx.image_path,
+                "pos_modality": ctx.modality,
+                "pos_image": ctx.image_path if ctx.modality == MODALIDADE_IMAGEM else "",
+                "pos_text": ctx.pos_value if ctx.modality == MODALIDADE_TEXTO else "",
                 "neg_ids": [c.page_id for c in negativos],
                 "neg_images": [c.image_path for c in negativos],
                 "label": 1,

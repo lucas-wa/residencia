@@ -3,11 +3,15 @@
 Entrada: o `pairs.jsonl` produzido por `finetune/make_pairs.py` -- uma linha por exemplo
 contrastivo ja montado:
 
-    {"id", "query", "pos_id", "pos_image", "neg_ids", "neg_images", "label", "generator"}
+    {"id", "query", "pos_id", "pos_modality", "pos_image", "pos_text",
+     "neg_ids", "neg_images", "label", "generator"}
 
-A query (texto) e o anchor, `pos_image` e o unico positivo e `neg_images` sao os negativos
-daquele exemplo. Com `--max-neg 0` os negativos do arquivo sao ignorados e o treino usa so
-in-batch negatives (os positivos dos OUTROS exemplos do batch).
+A query (texto) e o anchor e o unico positivo e `pos_image` OU `pos_text`, conforme
+`pos_modality` ("imagem"|"texto" -- linha sem o campo e de imagem, o formato da S7);
+`neg_images` sao os negativos daquele exemplo. Com `--max-neg 0` os negativos do arquivo
+sao ignorados e o treino usa so in-batch negatives (os positivos dos OUTROS exemplos do
+batch). O caminho DENSO treina os dois tipos de positivo no mesmo batch; o caminho
+late-interaction (MaxSim) so ve paginas.
 
 Bases late-interaction/MaxSim (o mesmo contrato do `benchmark/models/colvision.py` e
 `benchmark/models/colembed.py`):
@@ -62,8 +66,19 @@ DEFAULT_PAIRS = "finetune/data/pairs.jsonl"
 DEFAULT_OUT = "finetune/runs"
 SEED = 42
 
-# Campos obrigatorios de cada linha do pairs.jsonl (contrato de make_pairs.py).
-REQUIRED_FIELDS = ("id", "query", "pos_id", "pos_image")
+# Campos obrigatorios de cada linha do pairs.jsonl (contrato de make_pairs.py), fora o
+# campo do POSITIVO, que depende da modalidade (ver `CAMPO_POSITIVO`).
+REQUIRED_FIELDS = ("id", "query", "pos_id")
+
+# Modalidade do par (pt-BR, como `make_pairs.py` escreve) -> modalidade do `DenseEncoder`
+# (ingles, `DENSE_MODALITIES`). UNICO ponto de traducao entre os dois vocabularios.
+MODALIDADE_DENSE = {"imagem": "image", "texto": "text"}
+
+# Campo do pairs.jsonl que carrega o positivo de cada modalidade.
+CAMPO_POSITIVO = {"imagem": "pos_image", "texto": "pos_text"}
+
+# Modalidade default de uma linha sem `pos_modality` (retrocompat: pairs.jsonl da S7).
+MODALIDADE_DEFAULT = "imagem"
 
 # Tokens visuais por pagina assumidos nas estimativas de VRAM (resolucao dinamica do
 # Qwen-VL: uma pagina A4 rasterizada costuma cair nesta ordem de grandeza).
@@ -208,7 +223,11 @@ def resolve_config(base: str, method: str, **kw) -> TrainConfig:
 
 @dataclass(frozen=True)
 class Pair:
-    """Uma linha do pairs.jsonl ja validada."""
+    """Uma linha do pairs.jsonl ja validada.
+
+    O positivo e `pos_image` (modalidade "imagem") OU `pos_text` (modalidade "texto") --
+    o corpus v4 tem as duas, e o unificado denso embedda as duas.
+    """
 
     id: str
     query: str
@@ -218,11 +237,26 @@ class Pair:
     neg_images: tuple[str, ...] = ()
     label: int = 1
     generator: str = ""
+    pos_modality: str = MODALIDADE_DEFAULT
+    pos_text: str = ""
+
+    @property
+    def pos_value(self) -> str:
+        """O positivo em si, conforme a modalidade (caminho da pagina ou texto)."""
+        return self.pos_text if self.pos_modality == "texto" else self.pos_image
 
 
 def parse_pair(obj: dict, lineno: int = 0) -> Pair:
-    """dict -> Pair, com erro apontando a linha (o jsonl vem de um gerador externo)."""
-    faltando = [f for f in REQUIRED_FIELDS if not str(obj.get(f) or "").strip()]
+    """dict -> Pair, com erro apontando a linha (o jsonl vem de um gerador externo).
+
+    Retrocompat: linha sem `pos_modality` e uma linha de imagem (o unico formato da S7).
+    """
+    modalidade = str(obj.get("pos_modality") or MODALIDADE_DEFAULT).strip().lower()
+    if modalidade not in CAMPO_POSITIVO:
+        raise ValueError(f"linha {lineno}: modalidade desconhecida {modalidade!r} "
+                         f"(use {'/'.join(CAMPO_POSITIVO)})")
+    obrigatorios = (*REQUIRED_FIELDS, CAMPO_POSITIVO[modalidade])
+    faltando = [f for f in obrigatorios if not str(obj.get(f) or "").strip()]
     if faltando:
         raise ValueError(f"linha {lineno}: campos ausentes/vazios {faltando} em {obj!r}")
     negs = [str(p) for p in obj.get("neg_images") or []]
@@ -231,9 +265,10 @@ def parse_pair(obj: dict, lineno: int = 0) -> Pair:
         raise ValueError(f"linha {lineno}: neg_ids ({len(neg_ids)}) != neg_images ({len(negs)})")
     return Pair(
         id=str(obj["id"]), query=str(obj["query"]).strip(),
-        pos_id=str(obj["pos_id"]), pos_image=str(obj["pos_image"]),
+        pos_id=str(obj["pos_id"]), pos_image=str(obj.get("pos_image") or ""),
         neg_ids=tuple(neg_ids), neg_images=tuple(negs),
         label=int(obj.get("label", 1)), generator=str(obj.get("generator") or ""),
+        pos_modality=modalidade, pos_text=str(obj.get("pos_text") or ""),
     )
 
 
@@ -276,13 +311,32 @@ def missing_images(pairs: list[Pair], max_report: int = 5) -> list[str]:
 class PairBatch:
     """Um passo contrastivo: B queries x (B positivos + negativos explicitos).
 
-    `images` = os B positivos PRIMEIRO (na ordem das queries) e depois os negativos, logo
-    o alvo da cross-entropy e simplesmente `arange(B)` -- ver `contrastive_loss`.
+    `items` = os B positivos PRIMEIRO (na ordem das queries) e depois os negativos, logo
+    o alvo da cross-entropy e simplesmente `arange(B)` -- ver `contrastive_loss`. Cada
+    item e `(modalidade pt-BR, valor)`: `("imagem", caminho)` ou `("texto", trecho)`.
+
+    As duas vistas do mesmo lado do corpus:
+      - `dense_items` traduz a modalidade para o vocabulario do `DenseEncoder`
+        (`("image"|"text", valor)`) -- o caminho denso do `qwen3vl`;
+      - `images` devolve so os caminhos de imagem, na ordem -- o caminho MaxSim, cujos
+        batches sao sempre so-imagem (ali `images` e exatamente o que sempre foi).
     """
 
     pairs: tuple[Pair, ...]
     queries: tuple[str, ...]
-    images: tuple[str, ...]
+    items: tuple[tuple[str, str], ...]
+
+    @property
+    def images(self) -> tuple[str, ...]:
+        return tuple(valor for mod, valor in self.items if mod == "imagem")
+
+    @property
+    def dense_items(self) -> tuple[tuple[str, str], ...]:
+        desconhecidas = sorted({m for m, _ in self.items if m not in MODALIDADE_DENSE})
+        if desconhecidas:
+            raise ValueError(f"modalidade desconhecida no batch: {desconhecidas} "
+                             f"(use {'/'.join(MODALIDADE_DENSE)})")
+        return tuple((MODALIDADE_DENSE[mod], valor) for mod, valor in self.items)
 
     @property
     def n_pos(self) -> int:
@@ -290,25 +344,29 @@ class PairBatch:
 
     @property
     def n_neg(self) -> int:
-        return len(self.images) - len(self.pairs)
+        return len(self.items) - len(self.pairs)
 
 
 def make_batch(pairs: list[Pair], max_neg: int = 0) -> PairBatch:
     """Monta um PairBatch, cortando `max_neg` negativos por exemplo e deduplicando.
 
+    Cada positivo entra na modalidade da propria linha; os negativos do arquivo sao
+    sempre caminhos de imagem (contrato de `make_pairs.sample_negatives`).
+
     Um negativo que ja e positivo de outro exemplo do batch e descartado: ele nao pode
     entrar como "errado" se a linha dele diz que e certo.
     """
-    positivos = [p.pos_image for p in pairs]
+    positivos = [(p.pos_modality, p.pos_value) for p in pairs]
     ja = set(positivos)
-    negativos: list[str] = []
+    negativos: list[tuple[str, str]] = []
     for par in pairs:
         for caminho in par.neg_images[:max(max_neg, 0)]:
-            if caminho not in ja:
-                ja.add(caminho)
-                negativos.append(caminho)
+            item = ("imagem", caminho)
+            if item not in ja:
+                ja.add(item)
+                negativos.append(item)
     return PairBatch(pairs=tuple(pairs), queries=tuple(p.query for p in pairs),
-                     images=tuple(positivos + negativos))
+                     items=tuple(positivos + negativos))
 
 
 def iter_batches(pairs: list[Pair], batch_size: int, max_neg: int = 0,
@@ -618,10 +676,9 @@ DENSE_MODALITIES = ("image", "text")
 def dense_item(item, default_modality: str = "image") -> tuple[str, object]:
     """Um item do lado do corpus -> `(modalidade, valor)`.
 
-    HOJE o treino manda uma lista homogenea de caminhos de imagem (`PairBatch.images`), e
-    a string crua herda `default_modality`. A separacao por modalidade dentro do batch
-    (tarefa seguinte) ja cabe aqui sem reescrita: um par `("text", "...")` ou qualquer
-    objeto com `.modality`/`.value` passa direto.
+    O treino manda `PairBatch.dense_items`, ja anotado (`("image", caminho)` /
+    `("text", trecho)`); uma string crua (uso manual/teste) herda `default_modality`.
+    Qualquer objeto com `.modality`/`.value` tambem passa direto.
     """
     mod = getattr(item, "modality", None)
     if mod is not None:
@@ -752,7 +809,7 @@ def maxsim_scores(q, d, q_mask=None, d_mask=None):
 
 
 def contrastive_loss(scores, temperature: float = 0.02):
-    """InfoNCE com os positivos na diagonal (ver `PairBatch.images`)."""
+    """InfoNCE com os positivos na diagonal (ver `PairBatch.items`)."""
     import torch
     import torch.nn.functional as F
 
@@ -765,10 +822,37 @@ def dense_infonce_loss(q, d, temperature: float = 0.02):
 
     O analogo de `contrastive_loss(maxsim_scores(...))` no caminho de um vetor por item:
     `q` e `d` ja saem L2-normalizados do `DenseEncoder`, entao o produto interno E o
-    cosseno. Os B positivos vem PRIMEIRO em `d` (contrato do `PairBatch.images`), logo o
+    cosseno. Os B positivos vem PRIMEIRO em `d` (contrato do `PairBatch.items`), logo o
     alvo e `arange(B)` -- quem faz a cross-entropy e a `contrastive_loss`.
     """
     return contrastive_loss(q.float() @ d.float().t(), temperature)
+
+
+# -- dispatch por kind (encoder + perda) ----------------------------------------------
+
+
+def build_encoder(cfg: TrainConfig, model, proc):
+    """O encoder COM gradiente da base: denso no `qwen3vl`, MaxSim nos demais kinds."""
+    if cfg.spec.kind == "qwen3vl":
+        return DenseEncoder(model, proc)
+    return LateInteractionEncoder(model, proc, cfg.spec.kind)
+
+
+def batch_loss(cfg: TrainConfig, encoder, batch: PairBatch):
+    """Perda de UM batch, no caminho que o kind da base pede.
+
+    Denso (`qwen3vl`): um vetor por item, InfoNCE sobre o cosseno -- os itens vao COM
+    modalidade (`batch.dense_items`), que e o que faz um batch texto+imagem treinar.
+    Late-interaction (colqwen2.5/colembed): multi-vetor + MaxSim sobre os caminhos de
+    imagem, exatamente como antes.
+    """
+    if cfg.spec.kind == "qwen3vl":
+        q = encoder.encode_queries(list(batch.queries))
+        d = encoder.encode_items(list(batch.dense_items))
+        return dense_infonce_loss(q, d, cfg.temperature)
+    q, q_mask = encoder.queries(list(batch.queries))
+    d, d_mask = encoder.images(list(batch.images))
+    return contrastive_loss(maxsim_scores(q, d, q_mask, d_mask), cfg.temperature)
 
 
 # -- treino ---------------------------------------------------------------------------
@@ -811,7 +895,7 @@ def train(cfg: TrainConfig, pairs: list[Pair] | None = None) -> Path:
     model, proc = load_base_model(cfg)
     model = wrap_lora(model, cfg)
     model.train()
-    enc = LateInteractionEncoder(model, proc, cfg.spec.kind)
+    enc = build_encoder(cfg, model, proc)
 
     por_epoca, total_passos = count_steps(len(pares), cfg)
     otim = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=cfg.lr)
@@ -825,9 +909,7 @@ def train(cfg: TrainConfig, pairs: list[Pair] | None = None) -> Path:
     for epoca in range(cfg.epochs):
         for batch in iter_batches(pares, cfg.batch_size, max_neg=cfg.max_neg,
                                   shuffle=True, seed=cfg.seed + epoca):
-            q, q_mask = enc.queries(list(batch.queries))
-            d, d_mask = enc.images(list(batch.images))
-            perda = contrastive_loss(maxsim_scores(q, d, q_mask, d_mask), cfg.temperature)
+            perda = batch_loss(cfg, enc, batch)
             (perda / cfg.grad_accum).backward()
             acumulados += 1
             if acumulados % cfg.grad_accum:
@@ -965,7 +1047,8 @@ def dry_run(cfg: TrainConfig, load_model: bool = False) -> DryRunReport:
         config=cfg.to_dict(), model_id=cfg.spec.model_id, n_pairs=len(pares),
         n_batches=por_epoca, n_steps=passos,
         batch_exemplo={"queries": exemplo.n_pos, "positivos": exemplo.n_pos,
-                       "negativos": exemplo.n_neg, "imagens": len(exemplo.images)},
+                       "negativos": exemplo.n_neg, "itens": len(exemplo.items),
+                       "imagens": len(exemplo.images)},
         trainable_estimado=estimado, vram_gb=estimate_vram_gb(cfg, estimado),
         deps=deps, deps_faltando=faltando_dep, imagens_faltando=faltando_img,
         avisos=avisos,
@@ -997,8 +1080,9 @@ def format_report(rel: DryRunReport) -> str:
         f"  passos totais   {rel.n_steps} (epocas={c['epochs']}, "
         f"grad_accum={c['grad_accum']}, max_steps={c['max_steps']})",
         f"  batch exemplo   {rel.batch_exemplo['queries']} queries x "
-        f"{rel.batch_exemplo['imagens']} imagens "
-        f"({rel.batch_exemplo['positivos']} pos + {rel.batch_exemplo['negativos']} neg)",
+        f"{rel.batch_exemplo['itens']} itens "
+        f"({rel.batch_exemplo['positivos']} pos + {rel.batch_exemplo['negativos']} neg, "
+        f"{rel.batch_exemplo['imagens']} imagens)",
         f"  LoRA            r={c['lora_r']} alpha={c['lora_alpha']} "
         f"dropout={c['lora_dropout']} alvos={','.join(c['target_modules'])}",
         f"  treinaveis      ~{rel.trainable_estimado:,} (estimativa analitica)",

@@ -59,13 +59,43 @@ def test_formato_dos_pares(tmp_path: Path):
     assert len(linhas) == 4 * 2                      # 4 paginas x 2 consultas
     assert _read_pairs(out) == linhas
     for r in linhas:
-        assert set(r) == {"id", "query", "pos_id", "pos_image", "neg_ids", "neg_images",
-                          "label", "generator"}
+        assert set(r) == {"id", "query", "pos_id", "pos_modality", "pos_image", "pos_text",
+                          "neg_ids", "neg_images", "label", "generator"}
         assert r["label"] == 1
+        assert r["pos_modality"] == "imagem" and r["pos_text"] == ""
         assert r["query"].startswith("consulta ")
         assert Path(r["pos_image"]).name == f"{r['pos_id']}.png"
         assert len(r["neg_images"]) == len(r["neg_ids"]) == 2
         assert all(Path(p).exists() for p in [r["pos_image"], *r["neg_images"]])
+
+
+def test_make_pairs_emite_texto_e_imagem(tmp_path: Path):
+    """Corpus v4: o positivo pode ser a PAGINA (imagem) ou o texto do item (`a_repr`)."""
+    root = tmp_path / "corpus_v4"
+    root.mkdir()
+    png = root / "BR001_p00.png"
+    png.write_bytes(b"png")
+    corpus = [
+        {"id": "BR001_p00", "image_path": str(png)},
+        {"id": "TX001", "a_repr": "o plano preve mais UBS no interior"},
+    ]
+    root.joinpath("corpus.jsonl").write_text(
+        "\n".join(json.dumps(c, ensure_ascii=False) for c in corpus), encoding="utf-8")
+
+    linhas = make_pairs(root, tmp_path / "pairs.jsonl", generate_queries=_mock_gen(),
+                        k=1, neg=1)
+
+    por_modalidade = {r["pos_modality"]: r for r in linhas}
+    assert set(por_modalidade) == {"imagem", "texto"}
+    imagem = por_modalidade["imagem"]
+    assert imagem["pos_id"] == "BR001_p00" and imagem["pos_image"] == str(png)
+    assert not imagem["pos_text"]
+    texto = por_modalidade["texto"]
+    assert texto["pos_id"] == "TX001"
+    assert texto["pos_text"] == "o plano preve mais UBS no interior"
+    assert not texto["pos_image"]
+    # negativos continuam sendo caminhos de imagem: nenhum vazio escapa para o jsonl
+    assert all(p for r in linhas for p in r["neg_images"])
 
 
 def test_negativos_nunca_sao_a_pagina_positiva(tmp_path: Path):

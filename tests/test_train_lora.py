@@ -133,6 +133,51 @@ def test_max_neg_zero_deixa_so_in_batch_negatives(tmp_path):
     assert batch.images == tuple(p.pos_image for p in pares)
 
 
+def test_pairbatch_dense_items_modalidade_mista(tmp_path):
+    """Batch misto: `.dense_items` leva a modalidade (em ingles) ao `DenseEncoder`."""
+    pagina = str(tmp_path / "BR_p99.png")
+    texto = T.Pair(id="t0", query="o que o plano diz sobre creches?", pos_id="TX001",
+                   pos_image="", pos_modality="texto", pos_text="trecho do plano")
+    imagem = T.Pair(id="i0", query="qual a meta de saude?", pos_id="BR_p99",
+                    pos_image=pagina)
+
+    batch = T.make_batch([texto, imagem], max_neg=0)
+
+    assert list(batch.dense_items) == [("text", "trecho do plano"), ("image", pagina)]
+    assert batch.images == (pagina,)          # so o caminho de imagem; o texto nao vaza
+    assert batch.n_pos == 2 and batch.n_neg == 0
+
+    # caso so-imagem: `.images` continua identico ao de antes (caminho MaxSim/colqwen)
+    pares = T.load_pairs(_pairs_file(tmp_path, n=2))
+    so_imagem = T.make_batch(pares, max_neg=1)
+    assert so_imagem.images[:2] == (pares[0].pos_image, pares[1].pos_image)
+    assert list(so_imagem.dense_items)[:2] == [("image", pares[0].pos_image),
+                                               ("image", pares[1].pos_image)]
+    assert len(so_imagem.dense_items) == len(so_imagem.images)
+
+
+def test_modalidade_dense_mapeia_pt_para_o_encoder():
+    """O par fala pt-BR ("imagem"/"texto"); o `DenseEncoder`, ingles ("image"/"text")."""
+    assert T.MODALIDADE_DENSE == {"imagem": "image", "texto": "text"}
+    assert set(T.MODALIDADE_DENSE.values()) == set(T.DENSE_MODALITIES)
+
+
+def test_parse_pair_le_modalidade_e_texto_com_retrocompat():
+    antigo = T.parse_pair({"id": "a", "query": "q", "pos_id": "p", "pos_image": "x.png"})
+    assert antigo.pos_modality == "imagem" and antigo.pos_text == ""
+
+    novo = T.parse_pair({"id": "b", "query": "q", "pos_id": "t", "pos_modality": "texto",
+                         "pos_text": "trecho", "pos_image": ""})
+    assert novo.pos_modality == "texto" and novo.pos_text == "trecho"
+
+    with pytest.raises(ValueError, match="campos ausentes"):   # texto sem pos_text
+        T.parse_pair({"id": "c", "query": "q", "pos_id": "t", "pos_modality": "texto",
+                      "pos_image": "x.png"}, lineno=3)
+    with pytest.raises(ValueError, match="modalidade"):
+        T.parse_pair({"id": "d", "query": "q", "pos_id": "t", "pos_modality": "audio",
+                      "pos_image": "x.png"}, lineno=4)
+
+
 def test_iter_batches_cobre_todos_os_pares_e_o_ultimo_batch_e_menor(tmp_path):
     pares = T.load_pairs(_pairs_file(tmp_path, n=5))
 
@@ -472,6 +517,82 @@ def test_dense_infonce_diagonal():
 
     assert torch.isfinite(perda) and float(perda) > 0
     assert float(perda) == pytest.approx(float(T.contrastive_loss(scores, 0.05)), rel=1e-5)
+
+
+def test_build_encoder_dispatch_por_kind():
+    """`qwen3vl` -> encoder DENSO; as bases late-interaction seguem no MaxSim."""
+    pytest.importorskip("torch")
+    denso = T.build_encoder(T.resolve_config("qwen3vl", "lora"),
+                            _modelo_duble(hidden=8), _ProcessadorDuble())
+    assert isinstance(denso, T.DenseEncoder)
+
+    tardio = T.build_encoder(T.resolve_config("colqwen2.5", "lora"), object(), object())
+    assert isinstance(tardio, T.LateInteractionEncoder) and tardio.kind == "colqwen2.5"
+
+
+class _EncoderDenosDuble:
+    """Dublê do `DenseEncoder`: registra o que recebeu e devolve vetores normalizados."""
+
+    def __init__(self, dim: int = 4):
+        import torch
+        import torch.nn.functional as F
+
+        self.dim = dim
+        self.vistos: dict = {}
+        self._F, self._torch = F, torch
+
+    def _vecs(self, n: int):
+        self._torch.manual_seed(n)
+        return self._F.normalize(self._torch.randn(n, self.dim), dim=-1)
+
+    def encode_queries(self, texts):
+        self.vistos["queries"] = list(texts)
+        return self._vecs(len(self.vistos["queries"]))
+
+    def encode_items(self, items):
+        self.vistos["items"] = list(items)
+        return self._vecs(len(self.vistos["items"]))
+
+
+class _EncoderTardioDuble:
+    """Dublê do `LateInteractionEncoder`: devolve multi-vetores [N, L, D] + mascara."""
+
+    def __init__(self, dim: int = 4):
+        import torch
+
+        self.vistos: dict = {}
+        self.dim, self._torch = dim, torch
+
+    def queries(self, texts):
+        self.vistos["queries"] = list(texts)
+        self._torch.manual_seed(1)
+        return self._torch.randn(len(self.vistos["queries"]), 3, self.dim), None
+
+    def images(self, paths):
+        self.vistos["images"] = list(paths)
+        self._torch.manual_seed(2)
+        return self._torch.randn(len(self.vistos["images"]), 5, self.dim), None
+
+
+def test_batch_loss_dispatch_por_kind(tmp_path):
+    """O kind escolhe encoder+perda: denso (InfoNCE cosseno) vs late-interaction (MaxSim)."""
+    torch = pytest.importorskip("torch")
+    pares = T.load_pairs(_pairs_file(tmp_path, n=2))
+    batch = T.make_batch(pares, max_neg=1)
+
+    denso = _EncoderDenosDuble()
+    perda = T.batch_loss(T.resolve_config("qwen3vl", "lora"), denso, batch)
+
+    assert perda.ndim == 0 and torch.isfinite(perda)
+    assert denso.vistos["queries"] == list(batch.queries)
+    assert denso.vistos["items"] == list(batch.dense_items)      # itens COM modalidade
+
+    tardio = _EncoderTardioDuble()
+    perda2 = T.batch_loss(T.resolve_config("colqwen2.5", "lora"), tardio, batch)
+
+    assert perda2.ndim == 0 and torch.isfinite(perda2)
+    assert tardio.vistos["queries"] == list(batch.queries)
+    assert tardio.vistos["images"] == list(batch.images)         # caminhos de imagem
 
 
 # -- dry run --------------------------------------------------------------------------
