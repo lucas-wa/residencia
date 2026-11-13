@@ -114,12 +114,18 @@ def build_video_embedder() -> EmbedderPair:
     )
 
 
-def build_unified_a_embedder() -> EmbedderPair:
-    """Qwen3-VL-Embedding (A): items = representacao-A (texto), query = texto."""
+def build_unified_a_embedder(adapter_path: str | None = None) -> EmbedderPair:
+    """Qwen3-VL-Embedding (A): items = representacao-A (texto), query = texto.
+
+    `adapter_path` carrega o adaptador LoRA do finetune denso (Semana 10) FUNDIDO na base
+    -- e assim que o mesmo benchmark mede o A antes e depois do treino (ver
+    `finetune/eval_ensemble.py`). `None` = checkpoint publico, como sempre.
+    """
     from benchmark.models.qwen3vl_embed import Qwen3VLEmbedRetriever
 
-    log.info("carregando %s", UNIFIED_A_MODEL)
-    m = Qwen3VLEmbedRetriever(UNIFIED_A_MODEL, device="cuda")
+    log.info("carregando %s%s", UNIFIED_A_MODEL,
+             f" + adaptador {adapter_path}" if adapter_path else "")
+    m = Qwen3VLEmbedRetriever(UNIFIED_A_MODEL, device="cuda", adapter_path=adapter_path)
     enc = lambda texts: _f32(m.embed_texts(list(texts)))  # noqa: E731
     return enc, enc
 

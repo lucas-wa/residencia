@@ -347,6 +347,110 @@ def test_instrucao_customizada_vai_no_system_prompt(fake_libs, fake_vision):
         "Retrieve relevant documents for the query.")
 
 
+# -- adaptador LoRA treinado (`adapter_path`) ------------------------------------------
+
+
+@pytest.fixture
+def base_e_peft_dublados(monkeypatch):
+    """`from_pretrained` da base, o processor e o `peft.PeftModel` dublados.
+
+    Nada e baixado: o teste so quer saber QUAIS classes foram chamadas. Atencao ao lazy
+    loading de `transformers`/`peft`: tocar um atributo lazy troca o objeto em
+    `sys.modules` e levaria junto os patches -- resolvemos os nomes ANTES de patchar
+    (mesmo padrao de `tests/test_train_lora.py`).
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("peft")
+    import peft
+    import transformers
+
+    for nome in ("AutoProcessor", "AutoModelForImageTextToText",
+                 "Qwen3VLForConditionalGeneration"):
+        getattr(transformers, nome, None)
+    getattr(peft, "PeftModel", None)
+    transformers = sys.modules["transformers"]
+    peft = sys.modules["peft"]
+
+    visto: dict = {"peft": []}
+
+    class _Interno:
+        """O `Qwen3VLModel` interno (`full.model`) -- o que o wrapper guarda."""
+
+        def __init__(self, tag):
+            self.tag = tag
+            self.evaled = False
+
+        def eval(self):
+            self.evaled = True
+            return self
+
+    class _Full:
+        def __init__(self):
+            self.model = visto["base"] = _Interno("base")
+
+    class _ModelCls:
+        @staticmethod
+        def from_pretrained(model_id, **kw):
+            visto["model_id"] = model_id
+            visto["kwargs"] = kw
+            return _Full()
+
+    class _PeftWrapper:
+        def __init__(self, base):
+            self.base = base
+
+        def merge_and_unload(self):
+            visto["merged"] = _Interno("merged")
+            return visto["merged"]
+
+    class _PeftModel:
+        @staticmethod
+        def from_pretrained(base, path, **kw):
+            visto["peft"].append((base, str(path)))
+            return _PeftWrapper(base)
+
+    class _Proc:
+        tokenizer = types.SimpleNamespace(padding_side="left")
+
+        @classmethod
+        def from_pretrained(cls, model_id, **kw):
+            return cls()
+
+    monkeypatch.setattr(transformers, "Qwen3VLForConditionalGeneration", _ModelCls,
+                        raising=False)
+    monkeypatch.setattr(transformers, "AutoModelForImageTextToText", _ModelCls,
+                        raising=False)
+    monkeypatch.setattr(transformers, "AutoProcessor", _Proc)
+    monkeypatch.setattr(peft, "PeftModel", _PeftModel, raising=False)
+    return visto
+
+
+def test_retriever_aceita_adapter_path(base_e_peft_dublados):
+    """Com `adapter_path`: PeftModel sobre a base + merge, e so entao `.eval()`."""
+    visto = base_e_peft_dublados
+
+    r = Qwen3VLEmbedRetriever("test/qwen3vl", device="cpu", adapter_path="runs/qwen3vl-lora")
+
+    # o adaptador embrulha o MESMO objeto que o finetune embrulhou: o `.model` interno
+    assert visto["peft"] == [(visto["base"], "runs/qwen3vl-lora")]
+    assert r._model is visto["merged"]            # inferencia com os pesos FUNDIDOS
+    assert r._model.evaled is True                # `.eval()` veio depois do merge
+    assert visto["base"].evaled is False          # a base crua nao e o modelo final
+    assert r.adapter_path == "runs/qwen3vl-lora"
+
+
+def test_sem_adapter_path_o_peft_nao_e_tocado(base_e_peft_dublados):
+    """Sem `adapter_path` o comportamento e identico ao de antes."""
+    visto = base_e_peft_dublados
+
+    r = Qwen3VLEmbedRetriever("test/qwen3vl", device="cpu")
+
+    assert visto["peft"] == []
+    assert r._model is visto["base"] and r._model.evaled is True
+    assert r.adapter_path is None
+
+
 def test_default_e_o_2b():
     assert DEFAULT_MODEL_ID == "Qwen/Qwen3-VL-Embedding-2B"
 

@@ -147,6 +147,55 @@ def test_video_embute_o_keyframe_com_siglip2(monkeypatch):
     assert modelo.calls[1] == ("_embed_text", ["orcamento da saude"])
 
 
+class _FakeQwen3VL:
+    """Duble do `Qwen3VLEmbedRetriever` -- nenhum checkpoint e tocado."""
+
+    def __init__(self, model_id, **kwargs):
+        self.model_id = model_id
+        self.kwargs = kwargs
+
+    def embed_texts(self, texts):
+        return np.ones((len(texts), 8), dtype="float64")
+
+
+def _fake_qwen3vl(monkeypatch, feitos):
+    modulo = types.ModuleType("benchmark.models.qwen3vl_embed")
+
+    def fabrica(model_id, **kwargs):
+        m = _FakeQwen3VL(model_id, **kwargs)
+        feitos.append(m)
+        return m
+
+    modulo.Qwen3VLEmbedRetriever = fabrica
+    monkeypatch.setitem(sys.modules, "benchmark.models.qwen3vl_embed", modulo)
+
+
+def test_unified_a_repassa_o_adapter_path(monkeypatch):
+    """O A avaliado DEPOIS do finetune carrega o adaptador LoRA treinado."""
+    from ensemble.native.embedders import UNIFIED_A_MODEL, build_unified_a_embedder
+
+    feitos: list[_FakeQwen3VL] = []
+    _fake_qwen3vl(monkeypatch, feitos)
+
+    embed_items, embed_query = build_unified_a_embedder(adapter_path="finetune/runs/x")
+
+    assert feitos[0].model_id == UNIFIED_A_MODEL
+    assert feitos[0].kwargs == {"device": "cuda", "adapter_path": "finetune/runs/x"}
+    assert embed_items is embed_query                  # items e query no mesmo encoder
+    assert embed_items(["orcamento"]).dtype == np.float32
+
+
+def test_unified_a_sem_adapter_path_segue_na_base(monkeypatch):
+    from ensemble.native.embedders import build_unified_a_embedder
+
+    feitos: list[_FakeQwen3VL] = []
+    _fake_qwen3vl(monkeypatch, feitos)
+
+    build_unified_a_embedder()
+
+    assert feitos[0].kwargs == {"device": "cuda", "adapter_path": None}
+
+
 def test_imagem_e_video_compartilham_o_modelo_mas_sao_eixos_separados(monkeypatch):
     """Mesma familia de modelo nos dois eixos; cada um indexa seu proprio conjunto."""
     from ensemble.native.embedders import (

@@ -11,6 +11,11 @@ github.com/QwenLM/Qwen3-VL-Embedding.
 `dim` ativa Matryoshka (MRL): o vetor e truncado para `dim` e renormalizado. `None`
 mantem a dimensao nativa do checkpoint.
 
+`adapter_path` aponta para um diretorio de adaptador LoRA treinado (o que
+`finetune/train_lora.py` salva): a base e carregada, embrulhada em
+`peft.PeftModel.from_pretrained` e FUNDIDA (`merge_and_unload`) antes do `.eval()` --
+inferencia com os pesos fundidos, sem overhead do PEFT. Sem o argumento nada muda.
+
 `_embed_queries` / `_embed_images` sao metodos de instancia de proposito: o teste de
 contrato os substitui para exercitar o wrapper sem baixar pesos.
 
@@ -195,7 +200,8 @@ class Qwen3VLEmbedRetriever:
     def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: str = "cuda",
                  dtype: str = "bfloat16", batch_size: int = 8, dim: int | None = None,
                  instruction: str | None = None, max_length: int = MAX_LENGTH,
-                 max_pixels: int | None = DEFAULT_MAX_PIXELS):
+                 max_pixels: int | None = DEFAULT_MAX_PIXELS,
+                 adapter_path: str | None = None):
         import torch
         from transformers import AutoProcessor
         try:    # classe cujo state_dict casa com o checkpoint (ver docstring do modulo)
@@ -205,6 +211,8 @@ class Qwen3VLEmbedRetriever:
 
         self.name = f"qwen3vl:{model_id}"
         self.model_id = model_id
+        # diretorio do adaptador LoRA treinado (`finetune/train_lora.py`); None = base crua
+        self.adapter_path = adapter_path
         self.device = device
         self.batch_size = batch_size
         self.dim = dim
@@ -238,7 +246,18 @@ class Qwen3VLEmbedRetriever:
             raise last_error  # noqa: TRY201 -- erro real do ultimo from_pretrained
         # `.model` e o Qwen3VLModel base COM os pesos carregados: PreTrainedModel, logo
         # tem `.device` e devolve `last_hidden_state` -- o que `_forward_generic` espera.
-        self._model = getattr(full, "model", full).eval()
+        base = getattr(full, "model", full)
+        if adapter_path:
+            # O adaptador do finetune foi embrulhado em volta DESTE mesmo objeto (ver
+            # `finetune/train_lora.load_base_model`, que tambem fica com o `.model`), logo
+            # os nomes de modulo do `adapter_config.json` casam aqui. `merge_and_unload`
+            # funde A·B nos pesos da base e devolve o modelo nu: a inferencia roda sem
+            # overhead do PEFT e sem mudar nada no resto do wrapper. O merge vem ANTES do
+            # `.eval()` para que o modo de avaliacao valha para o modelo final.
+            from peft import PeftModel
+
+            base = PeftModel.from_pretrained(base, str(adapter_path)).merge_and_unload()
+        self._model = base.eval()
         # padding a DIREITA: o pooling pega o ultimo token nao-pad por `soma(mask) - 1`,
         # que so vale com essa convencao (a mesma do modeling de referencia).
         self._proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True,

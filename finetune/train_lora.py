@@ -42,10 +42,19 @@ Uso:
     python finetune/train_lora.py --dry-run --base colembed8b --method qlora
     python finetune/train_lora.py --base colqwen2.5 --method lora --epochs 1   # treina
 
-Hook de avaliacao (OPT-IN, antes/depois): `--eval-config benchmark/configs/v3_colqwen25.yaml`
-chama `benchmark.run_vidore` por import, antes do treino (baseline) e de novo ao fim, com
-o YAML derivado que aponta para o adaptador salvo. As duas linhas caem no mesmo
-`results/vidore.csv`. Sem a flag nao se avalia nada -- o ViDoRe V3 inteiro custa GPU.
+Hook de avaliacao (OPT-IN, antes/depois) -- um benchmark por tipo de base:
+
+  late-interaction (colqwen2.5/colembed8b): `--eval-config benchmark/configs/v3_*.yaml`
+    chama `benchmark.run_vidore` por import, antes do treino (baseline) e de novo ao fim,
+    com o YAML derivado que aponta para o adaptador salvo. As duas linhas caem no mesmo
+    `results/vidore.csv`.
+
+  denso (qwen3vl): `--eval-corpus <records.jsonl do v4>` mede o retriever A no benchmark
+    do ENSEMBLE (nDCG@10, `finetune/eval_ensemble.py`) com e sem o adaptador -- e onde
+    este modelo vai ser usado de fato. As queries/qrels tem default do conjunto Orcamento
+    (`--eval-queries` / `--eval-qrels`).
+
+Sem a flag do kind correspondente nao se avalia nada: os dois benchmarks custam GPU.
 """
 
 from __future__ import annotations
@@ -65,6 +74,12 @@ log = logging.getLogger(__name__)
 DEFAULT_PAIRS = "finetune/data/pairs.jsonl"
 DEFAULT_OUT = "finetune/runs"
 SEED = 42
+
+# Julgamentos do conjunto Orcamento (v4), usados pelo hook de avaliacao do ENSEMBLE --
+# os mesmos defaults do `slurm_run.sh` (ENSEMBLE_V2_QUERIES/ENSEMBLE_V2_QRELS). O corpus
+# (`--eval-corpus`) NAO tem default: ele vive fora do repo e e quem LIGA o hook.
+DEFAULT_EVAL_QUERIES = "ensemble/eval/queries_orcamento_v2.txt"
+DEFAULT_EVAL_QRELS = "ensemble/eval/qrels_orcamento.tsv"
 
 # Campos obrigatorios de cada linha do pairs.jsonl (contrato de make_pairs.py), fora o
 # campo do POSITIVO, que depende da modalidade (ver `CAMPO_POSITIVO`).
@@ -153,7 +168,9 @@ BASES: dict[str, BaseSpec] = {
         params_b=2.0, hidden=2048, layers=28, intermediate=6144,
         heads=16, kv_heads=8, head_dim=128,
         license_note="Apache-2.0 (confirmar no card)",
-        eval_config="",                 # hook de avaliacao do ensemble: tarefa posterior
+        # sem config do ViDoRe de proposito: esta base e avaliada no benchmark do
+        # ENSEMBLE (v4), por `--eval-corpus` -- ver `run_eval_depois`.
+        eval_config="",
     ),
 }
 
@@ -190,6 +207,10 @@ class TrainConfig:
     seed: int = SEED
     eval_config: str = ""
     eval_limit: int | None = None
+    # hook de avaliacao do ENSEMBLE (base densa): corpus v4 + julgamentos
+    eval_corpus: str = ""
+    eval_queries: str = DEFAULT_EVAL_QUERIES
+    eval_qrels: str = DEFAULT_EVAL_QRELS
 
     @property
     def spec(self) -> BaseSpec:
@@ -970,6 +991,64 @@ def run_benchmark_eval(config_path: str | Path, limit: int | None = None,
         sys.argv = anterior
 
 
+def run_ensemble_eval(cfg: TrainConfig, adapter_dir: Path) -> bool:
+    """Hook da base DENSA: nDCG@10 do A no v4, antes e depois do adaptador.
+
+    Le o corpus/queries/qrels dos caminhos da config e delega a
+    `finetune/eval_ensemble.py`. Mesma politica do `run_benchmark_eval`: a avaliacao
+    NUNCA derruba o treino -- insumo faltando ou erro viram aviso no log.
+    """
+    for rotulo, caminho in (("corpus", cfg.eval_corpus), ("queries", cfg.eval_queries),
+                            ("qrels", cfg.eval_qrels)):
+        if not caminho or not Path(caminho).is_file():
+            log.warning("[eval ensemble] %s nao encontrado: %s", rotulo, caminho or "(vazio)")
+            return False
+    try:
+        from finetune import eval_ensemble
+
+        records, queries, qrels = eval_ensemble.load_eval_data(
+            cfg.eval_corpus, cfg.eval_queries, cfg.eval_qrels)
+        eval_ensemble.run_ensemble_eval_before_after(cfg, adapter_dir, records, queries,
+                                                     qrels)
+        return True
+    except Exception as e:                      # avaliacao NAO pode derrubar o treino
+        log.warning("[eval ensemble] falhou (%s: %s)", type(e).__name__, e)
+        return False
+
+
+def eval_ativo(cfg: TrainConfig) -> bool:
+    """O hook de avaliacao esta LIGADO? (opt-in, e a flag depende do kind da base.)"""
+    if cfg.spec.kind == "qwen3vl":
+        return bool(cfg.eval_corpus)
+    return bool(cfg.eval_config)
+
+
+def run_eval_antes(cfg: TrainConfig) -> bool:
+    """Baseline, ANTES do treino -- so o caminho ViDoRe mede aqui.
+
+    No caminho denso o par antes/depois sai de uma unica chamada ao fim
+    (`run_eval_depois`): o "antes" e o checkpoint publico, que o hook do ensemble carrega
+    por conta propria.
+    """
+    if cfg.spec.kind == "qwen3vl":
+        return False
+    return run_benchmark_eval(cfg.eval_config, limit=cfg.eval_limit, tag="antes")
+
+
+def run_eval_depois(cfg: TrainConfig, adapter_dir: Path) -> bool:
+    """Avaliacao DEPOIS do treino, no benchmark que o kind da base pede.
+
+    Denso (`qwen3vl`): o benchmark do ENSEMBLE (v4), antes e depois num so passo.
+    Late-interaction: o ViDoRe V3, com o YAML derivado apontando para o adaptador.
+    """
+    if cfg.spec.kind == "qwen3vl":
+        return run_ensemble_eval(cfg, adapter_dir)
+    depois = write_after_config(cfg, adapter_dir)
+    if not depois:
+        return False
+    return run_benchmark_eval(depois, limit=cfg.eval_limit, tag="depois")
+
+
 def write_after_config(cfg: TrainConfig, adapter_dir: Path) -> Path | None:
     """YAML derivado do `--eval-config`, apontando para o adaptador recem-salvo.
 
@@ -1145,8 +1224,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "(ex.: benchmark/configs/v3_colqwen25.yaml). Sem ele, nao avalia.")
     ap.add_argument("--eval-limit", type=int, default=None,
                     help="--limit repassado ao benchmark.run_vidore")
+    ap.add_argument("--eval-corpus", default="",
+                    help="records.jsonl do corpus v4: LIGA o hook de avaliacao do "
+                         "ENSEMBLE (nDCG@10 do A antes/depois), usado pela base densa "
+                         "qwen3vl no lugar do ViDoRe")
+    ap.add_argument("--eval-queries", default=DEFAULT_EVAL_QUERIES,
+                    help=f"queries do hook do ensemble (default: {DEFAULT_EVAL_QUERIES})")
+    ap.add_argument("--eval-qrels", default=DEFAULT_EVAL_QRELS,
+                    help=f"qrels do hook do ensemble (default: {DEFAULT_EVAL_QRELS})")
     ap.add_argument("--no-eval", action="store_true",
-                    help="desliga o hook de avaliacao mesmo com --eval-config")
+                    help="desliga o hook de avaliacao mesmo com --eval-config/--eval-corpus")
     ap.add_argument("--dry-run", action="store_true",
                     help="valida config/dados/LoRA, imprime o resumo e SAI sem treinar")
     ap.add_argument("--load-model", action="store_true",
@@ -1170,7 +1257,8 @@ def main(argv: list[str] | None = None) -> int:
             lora_dropout=a.lora_dropout,
             target_modules=tuple(m.strip() for m in a.target_modules.split(",") if m.strip()),
             gradient_checkpointing=a.gradient_checkpointing, device=a.device, dtype=a.dtype,
-            limit=a.limit, seed=a.seed, eval_config=a.eval_config, eval_limit=a.eval_limit)
+            limit=a.limit, seed=a.seed, eval_config=a.eval_config, eval_limit=a.eval_limit,
+            eval_corpus=a.eval_corpus, eval_queries=a.eval_queries, eval_qrels=a.eval_qrels)
     except ValueError as e:
         log.error("%s", e)
         return 2
@@ -1185,18 +1273,16 @@ def main(argv: list[str] | None = None) -> int:
               else format_report(rel))
         return 0
 
-    # O hook e OPT-IN: sem --eval-config nao se gasta GPU rodando o ViDoRe V3 inteiro
-    # por acidente antes e depois do treino.
-    avalia = bool(cfg.eval_config) and not a.no_eval
+    # O hook e OPT-IN (ver `eval_ativo`): sem a flag do kind nao se gasta GPU rodando o
+    # ViDoRe V3 -- ou o benchmark do ensemble -- por acidente antes e depois do treino.
+    avalia = eval_ativo(cfg) and not a.no_eval
     if avalia:
-        run_benchmark_eval(cfg.eval_config, limit=cfg.eval_limit, tag="antes")
+        run_eval_antes(cfg)
 
     adapter = train(cfg)
 
     if avalia:
-        depois = write_after_config(cfg, adapter)
-        if depois:
-            run_benchmark_eval(depois, limit=cfg.eval_limit, tag="depois")
+        run_eval_depois(cfg, adapter)
     print(f"adaptador: {adapter}")
     return 0
 

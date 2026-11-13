@@ -798,3 +798,109 @@ def test_write_after_config_aponta_para_o_adaptador(tmp_path):
 def test_write_after_config_sem_base_devolve_none(tmp_path):
     cfg = T.resolve_config("colqwen2.5", "lora", eval_config=str(tmp_path / "nao_existe.yaml"))
     assert T.write_after_config(cfg, tmp_path) is None
+
+
+# -- hook de avaliacao da base DENSA: ensemble/v4 em vez do ViDoRe ---------------------
+
+
+def _v4_fixture(tmp_path: Path):
+    """corpus/queries/qrels minimos do v4 -- os arquivos que o hook do ensemble le."""
+    from ensemble.records import PointerRecord, save_records
+
+    corpus = tmp_path / "records.jsonl"
+    save_records([PointerRecord("doc1", "documento", "d", "file://doc1", "t",
+                                {"a_repr": "orcamento"})], corpus)
+    queries = tmp_path / "queries_v4.txt"
+    queries.write_text("q1\torcamento\n", encoding="utf-8")
+    qrels = tmp_path / "qrels_v4.tsv"
+    qrels.write_text("q1 0 doc1 1\n", encoding="utf-8")
+    return corpus, queries, qrels
+
+
+def _argv_qwen3vl(tmp_path, corpus, queries, qrels, *extra):
+    return ["--base", "qwen3vl", "--pairs", str(_pairs_file(tmp_path, n=2)),
+            "--eval-corpus", str(corpus), "--eval-queries", str(queries),
+            "--eval-qrels", str(qrels), *extra]
+
+
+def test_eval_hook_qwen3vl_usa_ensemble_nao_vidore(tmp_path, monkeypatch):
+    """Base densa: o antes/depois sai do benchmark do ENSEMBLE, nao do ViDoRe V3."""
+    from finetune import eval_ensemble
+
+    corpus, queries, qrels = _v4_fixture(tmp_path)
+    adapter = tmp_path / "runs" / "qwen3vl-lora"
+    adapter.mkdir(parents=True)
+    chamadas: list[dict] = []
+
+    monkeypatch.setattr(T, "train", lambda cfg, pairs=None: adapter)
+    monkeypatch.setattr(T, "run_benchmark_eval",
+                        lambda *a, **kw: pytest.fail("ViDoRe nao avalia a base densa"))
+    monkeypatch.setattr(T, "write_after_config",
+                        lambda *a, **kw: pytest.fail("YAML do ViDoRe nao entra aqui"))
+
+    def fake_hook(cfg, adapter_dir, records, qs, qr):
+        chamadas.append({"base": cfg.base, "adapter": str(adapter_dir),
+                         "ids": [r.id for r in records], "queries": qs, "qrels": qr})
+        return {"antes": 0.4, "depois": 0.6, "delta": 0.2, "n_queries": 1}
+
+    monkeypatch.setattr(eval_ensemble, "run_ensemble_eval_before_after", fake_hook)
+
+    rc = T.main(_argv_qwen3vl(tmp_path, corpus, queries, qrels))
+
+    assert rc == 0
+    assert len(chamadas) == 1
+    assert chamadas[0]["base"] == "qwen3vl"
+    assert chamadas[0]["adapter"] == str(adapter)
+    assert chamadas[0]["ids"] == ["doc1"]              # corpus v4 lido do disco
+    assert chamadas[0]["queries"] == {"q1": "orcamento"}
+    assert chamadas[0]["qrels"] == {"q1": {"doc1"}}
+
+
+def test_eval_hook_qwen3vl_desligado_sem_corpus(tmp_path, monkeypatch):
+    """Opt-in: sem `--eval-corpus` nao se gasta GPU avaliando o v4."""
+    from finetune import eval_ensemble
+
+    adapter = tmp_path / "runs"
+    adapter.mkdir()
+    monkeypatch.setattr(T, "train", lambda cfg, pairs=None: adapter)
+    monkeypatch.setattr(eval_ensemble, "run_ensemble_eval_before_after",
+                        lambda *a, **kw: pytest.fail("avaliacao disparada sem opt-in"))
+
+    assert T.main(["--base", "qwen3vl", "--pairs", str(_pairs_file(tmp_path, n=2))]) == 0
+
+
+def test_eval_hook_qwen3vl_respeita_no_eval(tmp_path, monkeypatch):
+    from finetune import eval_ensemble
+
+    corpus, queries, qrels = _v4_fixture(tmp_path)
+    adapter = tmp_path / "runs"
+    adapter.mkdir()
+    monkeypatch.setattr(T, "train", lambda cfg, pairs=None: adapter)
+    monkeypatch.setattr(eval_ensemble, "run_ensemble_eval_before_after",
+                        lambda *a, **kw: pytest.fail("--no-eval ignorado"))
+
+    assert T.main(_argv_qwen3vl(tmp_path, corpus, queries, qrels, "--no-eval")) == 0
+
+
+def test_eval_hook_late_interaction_continua_no_vidore(tmp_path, monkeypatch):
+    """colqwen2.5/colembed nao mudam: ViDoRe antes e depois, com o YAML derivado."""
+    from finetune import eval_ensemble
+
+    base_yaml = tmp_path / "v3.yaml"
+    base_yaml.write_text("name: v3\nmodel_id: vidore/colqwen2.5-v0.2\n", encoding="utf-8")
+    adapter = tmp_path / "runs"
+    adapter.mkdir()
+    tags: list[str] = []
+
+    monkeypatch.setattr(T, "train", lambda cfg, pairs=None: adapter)
+    monkeypatch.setattr(T, "run_benchmark_eval",
+                        lambda config_path, limit=None, tag="": tags.append(tag) or True)
+    monkeypatch.setattr(eval_ensemble, "run_ensemble_eval_before_after",
+                        lambda *a, **kw: pytest.fail("hook do ensemble no caminho ViDoRe"))
+
+    rc = T.main(["--base", "colqwen2.5", "--pairs", str(_pairs_file(tmp_path, n=2)),
+                 "--eval-config", str(base_yaml)])
+
+    assert rc == 0
+    assert tags == ["antes", "depois"]
+    assert (adapter / "eval_after.yaml").exists()
