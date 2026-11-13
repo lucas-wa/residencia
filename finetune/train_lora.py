@@ -51,6 +51,7 @@ import json
 import logging
 import math
 import random
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -71,6 +72,11 @@ TOKENS_POR_PAGINA = 1280
 # Projecoes alvo do LoRA nos backbones Qwen2.5-VL / Qwen3-VL (atencao + MLP).
 DEFAULT_TARGET_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj",
                           "gate_proj", "up_proj", "down_proj")
+
+# Caminho do backbone de TEXTO dentro do Qwen3VLModel (o irmao e `visual.*`, a torre de
+# visao): o LoRA do kind `qwen3vl` so pode entrar sob este prefixo -- ver
+# `lora_target_modules`.
+QWEN3VL_LANGUAGE_PATH = "language_model"
 
 
 # -- bases e metodos ------------------------------------------------------------------
@@ -441,7 +447,8 @@ def load_base_model(cfg: TrainConfig):
 
     Reaproveita o dispatch de classes do benchmark (`colvision.resolve_classes`) para as
     bases ColQwen2.5 e o caminho `AutoModel(trust_remote_code=True)` do ColEmbed -- os
-    mesmos de `benchmark/models/`.
+    mesmos de `benchmark/models/`. O kind `qwen3vl` (denso) espelha o carregamento do
+    `benchmark/models/qwen3vl_embed.py`, onde `AutoModel` NAO serve (ver abaixo).
     """
     import torch
 
@@ -458,6 +465,32 @@ def load_base_model(cfg: TrainConfig):
         model = AutoModel.from_pretrained(spec.model_id, trust_remote_code=True,
                                           attn_implementation="eager", **kw)
         proc = AutoProcessor.from_pretrained(spec.model_id, trust_remote_code=True)
+    elif spec.kind == "qwen3vl":
+        # ARMADILHA (documentada em benchmark/models/qwen3vl_embed.py): as chaves do
+        # checkpoint vivem sob o prefixo `model.`, que e o state_dict do
+        # `Qwen3VLForConditionalGeneration`. `AutoModel` instancia a classe BASE
+        # `Qwen3VLModel` (`language_model.*`/`visual.*`, SEM o prefixo): nenhuma chave
+        # casa, o transformers REINICIALIZA 100% dos pesos sem erro e o finetune treinaria
+        # sobre ruido. Carregamos o wrapper e ficamos com o `.model` -- o mesmo
+        # Qwen3VLModel, agora COM pesos (e em modo treino: nada de `.eval()` aqui).
+        from transformers import AutoProcessor
+        try:
+            from transformers import Qwen3VLForConditionalGeneration as _ModelCls
+        except ImportError:   # transformers sem o nome exportado -> rota Auto equivalente
+            from transformers import AutoModelForImageTextToText as _ModelCls
+
+        # `sdpa` e obrigatorio, nao cosmetico: com `eager` a matriz de atencao inteira de
+        # uma pagina (milhares de tokens de visao) estoura CUDA OOM numa L4 24 GB.
+        full = _ModelCls.from_pretrained(spec.model_id, trust_remote_code=True,
+                                         attn_implementation="sdpa", **kw)
+        model = getattr(full, "model", full)
+        proc = AutoProcessor.from_pretrained(spec.model_id)
+        # padding a DIREITA: o pooling denso (`Qwen3VLEmbedRetriever._pool`, reusado pelo
+        # DenseEncoder) acha o ultimo token nao-pad por `soma(mask) - 1`, o que so vale
+        # com essa convencao -- a mesma do encoder de inferencia.
+        tok = getattr(proc, "tokenizer", None)
+        if tok is not None:
+            tok.padding_side = "right"
     else:
         from benchmark.models.colvision import resolve_classes
 
@@ -465,6 +498,27 @@ def load_base_model(cfg: TrainConfig):
         model = model_cls.from_pretrained(spec.model_id, attn_implementation="eager", **kw)
         proc = proc_cls.from_pretrained(spec.model_id)
     return model, proc
+
+
+def lora_target_modules(cfg: TrainConfig) -> list[str] | str:
+    """`target_modules` do `LoraConfig`: lista de sufixos ou REGEX (base densa).
+
+    O PEFT aceita as duas formas e trata a string como regex com `re.fullmatch` sobre o
+    nome COMPLETO do modulo (`peft.tuners.tuners_utils.check_target_module_exists`),
+    enquanto a lista casa por sufixo (`key.endswith(f".{alvo}")`).
+
+    Nas bases late-interaction a lista basta: o LoRA entra no backbone inteiro. No
+    `qwen3vl` NAO basta -- o `Qwen3VLModel` tem DUAS torres (`language_model.*` e
+    `visual.*`) com as MESMAS projecoes (`q_proj`, ..., `down_proj`), entao o match por
+    sufixo adaptaria junto o encoder de visao. Restringimos pelo CAMINHO: so entra o que
+    estiver sob `language_model.`. O prefixo opcional `(.*\\.)?` existe porque o nome
+    visto pelo PEFT depende de onde o adaptador e embrulhado (`language_model...` no
+    Qwen3VLModel nu, `model.language_model...` se vier de um wrapper).
+    """
+    if cfg.spec.kind != "qwen3vl":
+        return list(cfg.target_modules)
+    alvos = "|".join(re.escape(m) for m in cfg.target_modules)
+    return rf"(.*\.)?{re.escape(QWEN3VL_LANGUAGE_PATH)}\..*\.({alvos})"
 
 
 def wrap_lora(model, cfg: TrainConfig):
@@ -476,7 +530,7 @@ def wrap_lora(model, cfg: TrainConfig):
             model, use_gradient_checkpointing=cfg.gradient_checkpointing)
     lora = LoraConfig(
         r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout,
-        target_modules=list(cfg.target_modules), bias="none",
+        target_modules=lora_target_modules(cfg), bias="none",
         task_type="FEATURE_EXTRACTION",
     )
     peft_model = get_peft_model(model, lora)

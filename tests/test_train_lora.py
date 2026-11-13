@@ -268,6 +268,123 @@ def test_missing_deps_depende_do_metodo_e_da_base():
     assert T.missing_deps(T.resolve_config("qwen3vl", "qlora"), sem_colpali) == ["bitsandbytes"]
 
 
+# -- carregamento da base + LoRA restrito ---------------------------------------------
+
+
+@pytest.fixture
+def _transformers_duble(monkeypatch):
+    """Substitui as classes de `transformers` usadas por `load_base_model` por dubles.
+
+    Nada e baixado: o dry-run/teste so precisa saber QUAL classe foi chamada e com que
+    kwargs. `AutoModel` vira uma armadilha de proposito -- carregar o Qwen3-VL por ela
+    reinicializa 100% dos pesos em silencio (ver a docstring de
+    `benchmark/models/qwen3vl_embed.py`).
+    """
+    pytest.importorskip("transformers")
+    # Tocar um atributo LAZY do `transformers` (`AutoProcessor` & cia.) troca o objeto de
+    # modulo em `sys.modules` e levaria junto os patches ja aplicados: resolvemos tudo
+    # ANTES e so entao pegamos o modulo definitivo.
+    import transformers
+
+    for nome in ("AutoModel", "AutoProcessor", "AutoModelForImageTextToText"):
+        getattr(transformers, nome, None)
+    transformers = sys.modules["transformers"]
+    visto: dict = {}
+
+    class _FullDuble:
+        """O wrapper `...ForConditionalGeneration`: o que interessa e o `.model`."""
+
+        def __init__(self):
+            self.model = "QWEN3VL_MODEL_INTERNO"
+
+    class _ForCondGenDuble:
+        @staticmethod
+        def from_pretrained(model_id, **kw):
+            visto["model_id"] = model_id
+            visto["kwargs"] = kw
+            return _FullDuble()
+
+    class _AutoModelProibido:
+        @staticmethod
+        def from_pretrained(*a, **kw):
+            pytest.fail("AutoModel reinicializa os pesos do Qwen3-VL em silencio")
+
+    class _ProcDuble:
+        tokenizer = types.SimpleNamespace(padding_side="left")
+
+        @classmethod
+        def from_pretrained(cls, model_id, **kw):
+            visto["proc_model_id"] = model_id
+            visto["proc_kwargs"] = kw
+            return cls()
+
+    monkeypatch.setattr(transformers, "Qwen3VLForConditionalGeneration", _ForCondGenDuble,
+                        raising=False)
+    monkeypatch.setattr(transformers, "AutoModel", _AutoModelProibido)
+    monkeypatch.setattr(transformers, "AutoProcessor", _ProcDuble)
+    visto["proc_cls"] = _ProcDuble
+    return visto
+
+
+def test_qwen3vl_carrega_forcondgen_e_usa_model(monkeypatch, _transformers_duble):
+    """A base densa carrega por `Qwen3VLForConditionalGeneration` e devolve o `.model`.
+
+    `AutoModel` instanciaria o `Qwen3VLModel` base, cujo state_dict NAO casa com o
+    checkpoint (prefixo `model.`): o treino rodaria sobre pesos aleatorios sem erro.
+    """
+    pytest.importorskip("torch")
+    cfg = T.resolve_config("qwen3vl", "lora", device="cpu")
+
+    model, proc = T.load_base_model(cfg)
+
+    assert _transformers_duble["model_id"] == "Qwen/Qwen3-VL-Embedding-2B"
+    assert model == "QWEN3VL_MODEL_INTERNO"        # o Qwen3VLModel interno, COM pesos
+    # `eager` materializa a atencao inteira e estoura OOM numa L4 com uma pagina densa
+    assert _transformers_duble["kwargs"]["attn_implementation"] == "sdpa"
+    assert "quantization_config" not in _transformers_duble["kwargs"]   # lora bf16
+    assert _transformers_duble["proc_model_id"] == cfg.spec.model_id
+    assert isinstance(proc, _transformers_duble["proc_cls"])
+
+    # QLoRA: o mesmo caminho, agora com a config NF4 dos outros ramos
+    nf4 = object()
+    monkeypatch.setattr(T, "quantization_config", lambda cfg: nf4)
+    T.load_base_model(T.resolve_config("qwen3vl", "qlora", device="cpu"))
+
+    assert _transformers_duble["kwargs"]["quantization_config"] is nf4
+
+
+def test_lora_target_so_language_model():
+    """O LoRA do `qwen3vl` nao pode tocar a torre de visao (`visual.*`).
+
+    As duas torres tem as MESMAS projecoes (`q_proj`, ..., `down_proj`), entao a lista de
+    sufixos do PEFT (match por `key.endswith`) adaptaria a visao junto.
+    """
+    import re
+
+    from peft.tuners.tuners_utils import check_target_module_exists
+
+    alvo = T.lora_target_modules(T.resolve_config("qwen3vl", "lora"))
+
+    assert isinstance(alvo, str)                   # regex: a lista de sufixos nao serve
+    assert re.fullmatch(alvo, "model.language_model.layers.0.self_attn.q_proj")
+    assert re.fullmatch(alvo, "language_model.layers.27.mlp.down_proj")
+    assert not re.fullmatch(alvo, "model.visual.blocks.0.attn.q_proj")
+    assert not re.fullmatch(alvo, "visual.blocks.0.mlp.down_proj")
+    assert not re.fullmatch(alvo, "model.language_model.layers.0.self_attn.rotary")
+
+    # o PEFT instalado aplica o MESMO criterio (`re.fullmatch` quando e string)
+    peft_cfg = types.SimpleNamespace(target_modules=alvo, exclude_modules=None)
+    assert check_target_module_exists(peft_cfg, "model.language_model.layers.0.mlp.up_proj")
+    assert not check_target_module_exists(peft_cfg, "model.visual.blocks.5.attn.v_proj")
+
+    # as bases late-interaction continuam na lista simples de sufixos
+    assert (T.lora_target_modules(T.resolve_config("colqwen2.5", "lora"))
+            == list(T.DEFAULT_TARGET_MODULES))
+    assert (T.lora_target_modules(T.resolve_config("colembed8b", "qlora",
+                                                   target_modules=("q_proj", "v_proj")))
+            == ["q_proj", "v_proj"])
+
+
 # -- encoder denso + InfoNCE ----------------------------------------------------------
 
 
