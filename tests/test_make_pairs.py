@@ -4,7 +4,9 @@ from pathlib import Path
 import pytest
 
 from finetune.make_pairs import (
+    GENERATORS,
     PageContext,
+    llm_generate_queries,
     load_contexts,
     make_pairs,
     plan_id_of,
@@ -206,3 +208,66 @@ def test_gerador_default_sem_texto_nenhum_ainda_gera_consulta():
 def test_corpus_ausente_falha_claro(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         load_contexts(tmp_path)
+
+
+def test_llm_generator_usa_chat_fn_injetado():
+    """O backend e injetado: o gerador so monta o prompt e limpa a resposta."""
+    prompts: list[str] = []
+
+    def duble(prompt: str) -> str:
+        prompts.append(prompt)
+        return ("1. quais as propostas de saude do plano BR001?\n"
+                "   \n"
+                "- quais as propostas de saude do plano BR001?\n"
+                "2) o plano preve creches em tempo integral?\n")
+
+    ctx = PageContext(page_id="BR001_p00", image_path="p.png", plan_id="BR001", k=3,
+                      text="o plano preve mais UBS no interior")
+
+    qs = llm_generate_queries(ctx, chat_fn=duble)
+
+    assert qs == ["quais as propostas de saude do plano BR001?",
+                  "o plano preve creches em tempo integral?"]
+    assert len(prompts) == 1
+    assert "BR001" in prompts[0] and "mais UBS no interior" in prompts[0]
+    assert "3" in prompts[0]                         # pede ctx.k consultas
+
+
+def test_llm_generator_respeita_k():
+    def duble(_prompt: str) -> str:
+        return "\n".join(f"consulta {i}" for i in range(10))
+
+    ctx = PageContext(page_id="BR001_p00", image_path="p.png", plan_id="BR001", k=2)
+
+    assert llm_generate_queries(ctx, chat_fn=duble) == ["consulta 0", "consulta 1"]
+
+
+def test_llm_generator_sem_backend_erra():
+    ctx = PageContext(page_id="BR001_p00", image_path="p.png", plan_id="BR001", k=2)
+
+    with pytest.raises((RuntimeError, ValueError)) as exc:
+        llm_generate_queries(ctx)
+
+    assert not isinstance(exc.value, NotImplementedError)
+    assert "chat_fn" in str(exc.value)
+
+
+def test_generators_llm_aponta_para_o_gerador_de_llm():
+    assert GENERATORS["llm"] is llm_generate_queries
+
+
+def test_make_pairs_injeta_o_chat_fn_no_gerador_llm(tmp_path: Path):
+    root = _corpus(tmp_path, planos=("BR001", "BR002"), paginas=1)
+    prompts: list[str] = []
+
+    def duble(prompt: str) -> str:
+        prompts.append(prompt)
+        return "o que o plano diz sobre saude?\no que o plano diz sobre saude?\n\n"
+
+    linhas = make_pairs(root, tmp_path / "pairs.jsonl", generator_name="llm",
+                        chat_fn=duble, k=2, neg=1)
+
+    assert len(prompts) == 2                         # uma chamada por pagina
+    assert {r["query"] for r in linhas} == {"o que o plano diz sobre saude?"}
+    assert {r["generator"] for r in linhas} == {"llm"}
+    assert {r["pos_id"] for r in linhas} == {"BR001_p00", "BR002_p00"}

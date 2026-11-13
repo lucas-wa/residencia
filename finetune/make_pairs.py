@@ -38,16 +38,21 @@ valendo: o treinador assume "imagem".
 
 A geracao de consultas e plugavel: `generate_queries(context: PageContext) -> list[str]`.
 O default (`template_generate_queries`) e deterministico e offline -- roda nos testes e
-sem API nenhuma. Ver `GENERATORS` para plugar um backend de LLM real depois.
+sem API nenhuma. O outro backend (`llm_generate_queries`, `--generator llm`) delega a um
+`chat_fn(prompt) -> str` injetado: este modulo monta o prompt e limpa a resposta, mas NAO
+carrega modelo nem fala com a rede. Quem liga o LLM (local no H100, ou API) e o runner,
+via `make_pairs(..., generator_name="llm", chat_fn=...)`.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import logging
 import random
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,6 +98,7 @@ class PageContext:
 
 
 QueryGenerator = Callable[[PageContext], list[str]]
+ChatFn = Callable[[str], str]       # fronteira com o LLM: prompt -> resposta crua
 
 # Templates pt-BR no registro de quem procura um plano de governo (o alvo do finetuning).
 TEMPLATES = (
@@ -131,24 +137,88 @@ def template_generate_queries(ctx: PageContext) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def llm_generate_queries(ctx: PageContext) -> list[str]:
-    """TODO(C1): backend de LLM real -- ponto de plug, NAO implementado de proposito.
+LLM_PROMPT = """Voce ajuda a montar um buscador de planos de governo brasileiros.
 
-    Aqui entra a chamada a um LLM (local via vLLM/transformers, ou API) pedindo `ctx.k`
-    consultas pt-BR que um eleitor faria e que sao respondidas pela pagina
-    `ctx.image_path` (modelo visual) ou por `ctx.text`/`ctx.plan_texts` (modelo textual).
-    Requisitos para nao quebrar o resto do script: devolver `list[str]` nao vazia, sem
-    duplicatas, e ser deterministico o bastante (temperatura baixa + seed) -- o cache em
-    disco ja garante que uma pagina so e gerada uma vez.
+Leia o trecho do plano {plano} abaixo e escreva {k} consultas em portugues do Brasil que um
+ELEITOR digitaria num buscador e que sao respondidas por esse trecho.
+
+Regras:
+- uma consulta por linha, sem numeracao, sem marcadores, sem aspas, sem comentarios;
+- linguagem de eleitor (curta, direta), nao copie frases inteiras do trecho;
+- cada consulta precisa ser respondida pelo trecho; nao invente o que nao esta la;
+- nao repita consultas.
+
+Trecho do plano {plano}:
+{contexto}
+"""
+
+NO_CHAT_FN = (
+    "backend de LLM nao ligado: llm_generate_queries precisa de chat_fn=<callable(prompt)->str>"
+    " (via make_pairs(..., generator_name='llm', chat_fn=...)). Para rodar offline, use"
+    " --generator template."
+)
+
+# Marcadores de lista que o LLM costuma prefixar em cada linha ("1. ", "1) ", "- ", "* ").
+MARKER_CHARS = "-*" + chr(0x2022) + chr(0x2013)      # hifen, asterisco, bullet, en dash
+QUOTE_CHARS = "\"'" + chr(0x201C) + chr(0x201D)      # aspas retas e curvas, em volta da query
+LIST_MARKERS = re.compile(
+    rf"^\s*(?:[{re.escape(MARKER_CHARS)}]+|\(?\d{{1,2}}\s*[.)\]:{re.escape(MARKER_CHARS)}])\s*")
+CONTEXT_CHARS = 1200      # quanto do contexto do item entra no prompt
+
+
+def build_query_prompt(ctx: PageContext) -> str:
+    """Prompt pt-BR pedindo `ctx.k` consultas respondidas pelo item `ctx`."""
+    partes = [t.strip() for t in (ctx.text, *ctx.plan_texts) if t and t.strip()]
+    contexto = "\n".join(dict.fromkeys(partes))[:CONTEXT_CHARS].strip()
+    if not contexto:      # item so-imagem sem OCR nem destaque/resumo: sobra o id da pagina
+        contexto = f"(sem texto extraido; pagina {ctx.page_id} do plano {ctx.plan_id})"
+    return LLM_PROMPT.format(plano=ctx.plan_id, k=max(ctx.k, 1), contexto=contexto)
+
+
+def parse_query_response(resposta: str, k: int) -> list[str]:
+    """Uma consulta por linha -> lista limpa, sem vazias, sem duplicatas, com no maximo `k`."""
+    limite = max(k, 0)
+    vistas: dict[str, str] = {}
+    for linha in (resposta or "").splitlines() if limite else ():
+        query = LIST_MARKERS.sub("", linha).strip().strip(QUOTE_CHARS).strip()
+        if not query:
+            continue
+        vistas.setdefault(query.casefold(), query)
+        if len(vistas) >= limite:
+            break
+    return list(vistas.values())
+
+
+def llm_generate_queries(ctx: PageContext, *, chat_fn: ChatFn | None = None) -> list[str]:
+    """Backend de LLM: monta o prompt, chama `chat_fn` e limpa a resposta.
+
+    `chat_fn(prompt) -> str` e a UNICA fronteira com o modelo -- este modulo nao carrega
+    nem baixa nada. O runner (LLM local no H100, ou API) passa o callable via
+    `make_pairs(..., generator_name="llm", chat_fn=...)`; os testes passam um duble.
+    Sem backend ligado, erra alto em vez de cair escondido para o template.
     """
-    raise NotImplementedError(
-        "backend de LLM ainda nao plugado; use --generator template (offline)")
+    if chat_fn is None:
+        raise RuntimeError(NO_CHAT_FN)
+    return parse_query_response(chat_fn(build_query_prompt(ctx)), ctx.k)
 
 
 GENERATORS: dict[str, QueryGenerator] = {
     "template": template_generate_queries,
     "llm": llm_generate_queries,
 }
+
+
+def resolve_generator(generator_name: str = "template",
+                      chat_fn: ChatFn | None = None) -> QueryGenerator:
+    """Gerador nomeado, com o backend de LLM ja ligado quando ele for o escolhido.
+
+    `GENERATORS` guarda funcoes de UM argumento (`ctx`), que e como `make_pairs` chama o
+    gerador; o `chat_fn` entra aqui, preso por `functools.partial`.
+    """
+    gen = GENERATORS[generator_name]
+    if gen is llm_generate_queries and chat_fn is not None:
+        return functools.partial(llm_generate_queries, chat_fn=chat_fn)
+    return gen
 
 
 # -- leitura do benchmark pt-BR -------------------------------------------------------
@@ -260,13 +330,18 @@ def _resolve_out(out: str | Path) -> Path:
 
 
 def make_pairs(corpus_dir: str | Path, out: str | Path,
-               generate_queries: QueryGenerator = template_generate_queries,
+               generate_queries: QueryGenerator | None = None,
                k: int = DEFAULT_K, neg: int = DEFAULT_NEG, limit: int | None = None,
                force: bool = False, seed: int = SEED,
-               generator_name: str = "template") -> list[dict]:
+               generator_name: str = "template",
+               chat_fn: ChatFn | None = None) -> list[dict]:
     """Escreve `pairs.jsonl` com K consultas por item + `neg` negativos, e devolve as linhas.
 
     Cada item vira um par da SUA modalidade (pagina -> `pos_image`, texto -> `pos_text`).
+
+    O gerador vem de `generate_queries` (um callable de um argumento, usado nos testes) ou,
+    quando nao informado, de `generator_name` via `resolve_generator` -- que e onde o
+    `chat_fn` do backend de LLM e ligado.
 
     E idempotente: o jsonl existente e relido como cache; itens que ja tem pares nao
     voltam ao gerador (que no caminho real custa chamada de LLM) e as linhas antigas sao
@@ -276,6 +351,11 @@ def make_pairs(corpus_dir: str | Path, out: str | Path,
     Os negativos vem de um `random.Random` semeado por `(seed, page_id)`, logo a mesma
     pagina sempre recebe os mesmos negativos -- independente da ordem/limite da rodada.
     """
+    if generate_queries is None:
+        generate_queries = resolve_generator(generator_name, chat_fn)
+    elif chat_fn is not None and generate_queries is llm_generate_queries:
+        generate_queries = functools.partial(llm_generate_queries, chat_fn=chat_fn)
+
     out_path = _resolve_out(out)
     contexts = load_contexts(corpus_dir, k=k)
     pool = contexts                       # negativos saem do corpus inteiro, nao do recorte
@@ -337,13 +417,13 @@ def main():
                     help="ignora o pairs.jsonl existente e regera tudo")
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--generator", choices=sorted(GENERATORS), default="template",
-                    help="backend de geracao de consultas (template = offline/deterministico)")
+                    help="backend de geracao de consultas (template = offline/deterministico; "
+                         "llm exige um chat_fn ligado por um runner, nao roda pela CLI pura)")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    linhas = make_pairs(a.corpus, a.out, generate_queries=GENERATORS[a.generator],
-                        k=a.k, neg=a.neg, limit=a.limit, force=a.force, seed=a.seed,
-                        generator_name=a.generator)
+    linhas = make_pairs(a.corpus, a.out, k=a.k, neg=a.neg, limit=a.limit, force=a.force,
+                        seed=a.seed, generator_name=a.generator)
     print(f"{len(linhas)} pares em {_resolve_out(a.out)}")
 
 
