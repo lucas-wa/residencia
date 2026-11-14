@@ -26,6 +26,11 @@
 #   BASE=colembed8b BATCH_SIZE=1 GRAD_ACCUM=16 MAX_NEG=1 \
 #       DRY_RUN=0 bash finetune/run_gcp_finetune.sh
 #
+#   # base DENSA (qwen3vl, o unificado da S10). Aqui o hook antes/depois NAO e o ViDoRe:
+#   # e o benchmark do ENSEMBLE (nDCG@10 do A no v4), ligado por EVAL_CORPUS:
+#   BASE=qwen3vl DRY_RUN=0 EVAL_CORPUS=/mnt/disks/data/ensemble/v4/records.jsonl \
+#       bash finetune/run_gcp_finetune.sh
+#
 #   # cache do HF num disco de dados (os checkpoints sao grandes):
 #   HF_CACHE_DIR=/mnt/disks/data/hf bash finetune/run_gcp_finetune.sh
 #
@@ -85,7 +90,8 @@ DRY_RUN="${DRY_RUN:-1}"
 LOAD_MODEL="${LOAD_MODEL:-0}"
 
 PAIRS="${PAIRS:-finetune/data/pairs.jsonl}"
-BASE="${BASE:-colqwen2.5}"          # colqwen2.5 (primaria, ~3B) | colembed8b (opcao)
+# colqwen2.5 (primaria, ~3B) | colembed8b (opcao) | qwen3vl (densa, unificado da S10)
+BASE="${BASE:-colqwen2.5}"
 METHOD="${METHOD:-qlora}"           # L4: QLoRA 4-bit (LoRA bf16 e o caminho da H100)
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 EPOCHS="${EPOCHS:-1}"
@@ -102,13 +108,19 @@ NO_GRAD_CKPT="${NO_GRAD_CKPT:-0}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
 EVAL_LIMIT="${EVAL_LIMIT:-}"
 NO_EVAL="${NO_EVAL:-0}"
+# Hook de avaliacao da base DENSA (BASE=qwen3vl): nDCG@10 do A no v4, antes/depois.
+# EVAL_CORPUS (records.jsonl do v4) e quem LIGA o hook -- sem ele a avaliacao fica muda.
+# Queries/qrels sao opcionais: o train_lora.py ja traz os defaults do conjunto Orcamento.
+EVAL_CORPUS="${EVAL_CORPUS:-}"
+EVAL_QUERIES="${EVAL_QUERIES:-}"
+EVAL_QRELS="${EVAL_QRELS:-}"
 
 HF_CACHE_DIR="${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
 VENV_DIR="${VENV_DIR:-$REPO_DIR/.venv-gcp}"
 
 case "$DRY_RUN" in 0|1) ;; *) echo "DRY_RUN invalido: '$DRY_RUN' (use 0|1)" >&2; exit 2 ;; esac
-case "$BASE" in colqwen2.5|colembed8b) ;;
-    *) echo "BASE invalida: '$BASE' (use colqwen2.5|colembed8b)" >&2; exit 2 ;; esac
+case "$BASE" in colqwen2.5|colembed8b|qwen3vl) ;;
+    *) echo "BASE invalida: '$BASE' (use colqwen2.5|colembed8b|qwen3vl)" >&2; exit 2 ;; esac
 case "$METHOD" in lora|qlora) ;;
     *) echo "METHOD invalido: '$METHOD' (use lora|qlora)" >&2; exit 2 ;; esac
 
@@ -301,6 +313,9 @@ if [ -n "${MAX_STEPS:-}" ];   then ARGS+=(--max-steps "$MAX_STEPS"); fi
 if [ -n "${LIMIT:-}" ];       then ARGS+=(--limit "$LIMIT"); fi
 if [ -n "${EVAL_CONFIG:-}" ]; then ARGS+=(--eval-config "$EVAL_CONFIG"); fi
 if [ -n "${EVAL_LIMIT:-}" ];  then ARGS+=(--eval-limit "$EVAL_LIMIT"); fi
+if [ -n "${EVAL_CORPUS:-}" ];  then ARGS+=(--eval-corpus "$EVAL_CORPUS"); fi
+if [ -n "${EVAL_QUERIES:-}" ]; then ARGS+=(--eval-queries "$EVAL_QUERIES"); fi
+if [ -n "${EVAL_QRELS:-}" ];   then ARGS+=(--eval-qrels "$EVAL_QRELS"); fi
 if [ "${NO_GRAD_CKPT:-0}" = "1" ]; then ARGS+=(--no-gradient-checkpointing); fi
 if [ "${NO_EVAL:-0}" = "1" ];      then ARGS+=(--no-eval); fi
 if [ "$DRY_RUN" = "1" ]; then

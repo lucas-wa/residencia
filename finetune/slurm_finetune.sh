@@ -36,6 +36,11 @@
 #   DRY_RUN=0 EVAL_CONFIG=benchmark/configs/v3_colqwen25.yaml EVAL_LIMIT=50 \
 #       sbatch finetune/slurm_finetune.sh
 #
+#   # base DENSA (qwen3vl, o unificado da S10). Aqui o hook antes/depois NAO e o ViDoRe:
+#   # e o benchmark do ENSEMBLE (nDCG@10 do A no v4), ligado por EVAL_CORPUS:
+#   BASE=qwen3vl DRY_RUN=0 EVAL_CORPUS=/work/ensemble/v4/records.jsonl \
+#       sbatch finetune/slurm_finetune.sh
+#
 # Logs:   logs/slurm_<jobid>_finetune.{out,err}
 # Saida:  finetune/runs/<base>-<metodo>/ (adaptador PEFT + train_config.json)
 #
@@ -84,7 +89,8 @@ DRY_RUN="${DRY_RUN:-1}"
 LOAD_MODEL="${LOAD_MODEL:-0}"
 
 PAIRS="${PAIRS:-finetune/data/pairs.jsonl}"
-BASE="${BASE:-colqwen2.5}"          # colqwen2.5 (primaria, ~3B) | colembed8b (opcao)
+# colqwen2.5 (primaria, ~3B) | colembed8b (opcao) | qwen3vl (densa, unificado da S10)
+BASE="${BASE:-colqwen2.5}"
 METHOD="${METHOD:-lora}"            # H100: LoRA bf16 (QLoRA e o caminho da L4)
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 EPOCHS="${EPOCHS:-1}"
@@ -101,10 +107,16 @@ NO_GRAD_CKPT="${NO_GRAD_CKPT:-0}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
 EVAL_LIMIT="${EVAL_LIMIT:-}"
 NO_EVAL="${NO_EVAL:-0}"
+# Hook de avaliacao da base DENSA (BASE=qwen3vl): nDCG@10 do A no v4, antes/depois.
+# EVAL_CORPUS (records.jsonl do v4) e quem LIGA o hook -- sem ele a avaliacao fica muda.
+# Queries/qrels sao opcionais: o train_lora.py ja traz os defaults do conjunto Orcamento.
+EVAL_CORPUS="${EVAL_CORPUS:-}"
+EVAL_QUERIES="${EVAL_QUERIES:-}"
+EVAL_QRELS="${EVAL_QRELS:-}"
 
 case "$DRY_RUN" in 0|1) ;; *) echo "DRY_RUN invalido: '$DRY_RUN' (use 0|1)" >&2; exit 2 ;; esac
-case "$BASE" in colqwen2.5|colembed8b) ;;
-    *) echo "BASE invalida: '$BASE' (use colqwen2.5|colembed8b)" >&2; exit 2 ;; esac
+case "$BASE" in colqwen2.5|colembed8b|qwen3vl) ;;
+    *) echo "BASE invalida: '$BASE' (use colqwen2.5|colembed8b|qwen3vl)" >&2; exit 2 ;; esac
 case "$METHOD" in lora|qlora) ;;
     *) echo "METHOD invalido: '$METHOD' (use lora|qlora)" >&2; exit 2 ;; esac
 
@@ -126,7 +138,7 @@ fi
 # -------------------------------------------------------------------------------------
 for _v in RESIDENCIA_DIR HF_CACHE_DIR DRY_RUN LOAD_MODEL PAIRS BASE METHOD OUTPUT_DIR \
           EPOCHS BATCH_SIZE GRAD_ACCUM LR MAX_NEG LORA_R MAX_STEPS LIMIT NO_GRAD_CKPT \
-          EVAL_CONFIG EVAL_LIMIT NO_EVAL; do
+          EVAL_CONFIG EVAL_LIMIT NO_EVAL EVAL_CORPUS EVAL_QUERIES EVAL_QRELS; do
     eval "export SINGULARITYENV_${_v}=\"\${${_v}}\""
     eval "export APPTAINERENV_${_v}=\"\${${_v}}\""
 done
@@ -255,6 +267,9 @@ srun singularity exec \
         if [ -n "${LIMIT:-}" ];       then ARGS+=(--limit "$LIMIT"); fi
         if [ -n "${EVAL_CONFIG:-}" ]; then ARGS+=(--eval-config "$EVAL_CONFIG"); fi
         if [ -n "${EVAL_LIMIT:-}" ];  then ARGS+=(--eval-limit "$EVAL_LIMIT"); fi
+        if [ -n "${EVAL_CORPUS:-}" ];  then ARGS+=(--eval-corpus "$EVAL_CORPUS"); fi
+        if [ -n "${EVAL_QUERIES:-}" ]; then ARGS+=(--eval-queries "$EVAL_QUERIES"); fi
+        if [ -n "${EVAL_QRELS:-}" ];   then ARGS+=(--eval-qrels "$EVAL_QRELS"); fi
         if [ "${NO_GRAD_CKPT:-0}" = "1" ]; then ARGS+=(--no-gradient-checkpointing); fi
         if [ "${NO_EVAL:-0}" = "1" ];      then ARGS+=(--no-eval); fi
         if [ "$DRY_RUN" = "1" ]; then
