@@ -22,6 +22,13 @@ Producao (Cloud Run, `min-instances=0`):
     ADAPTER_PATH  diretorio do adaptador LoRA da Semana 10           (opcional)
     API_KEY       chave esperada no header X-API-Key                 (obrigatorio)
     DEVICE        device do embedder (default "cuda")
+    ALLOW_ADAPTER_MISMATCH=1  serve com adaptador != o do indice (ver abaixo)
+
+O startup FALHA quando o adaptador que embeddou os ITENS (carimbado no `index_meta.json`
+pelo `api/build_index.py`) nao e o `ADAPTER_PATH` que vai embeddar as QUERIES: espacos
+diferentes degradam o ranking em silencio, entao a falha tem de ser fechada. Indice
+legado (sem carimbo) so avisa, e `ALLOW_ADAPTER_MISMATCH=1` libera a divergencia
+deliberada (servir a base crua de proposito).
 """
 from __future__ import annotations
 
@@ -35,7 +42,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
-from api.index_io import load_index
+from api.index_io import META_NAME, load_index
 from api.retriever import ConsultaRetriever
 
 log = logging.getLogger(__name__)
@@ -43,6 +50,7 @@ log = logging.getLogger(__name__)
 DEFAULT_K = 10
 MAX_K = 100
 DEFAULT_DEVICE = "cuda"
+ALLOW_MISMATCH_ENV = "ALLOW_ADAPTER_MISMATCH"
 
 
 class ConsultaRequest(BaseModel):
@@ -71,6 +79,47 @@ class ConsultaResponse(BaseModel):
     latency_ms: float
 
 
+def _adapter_normalizado(valor: str | None) -> str | None:
+    """Identidade do adaptador: o caminho, sem barra final e sem vazio-como-valor."""
+    if valor is None:
+        return None
+    texto = str(valor).strip()
+    return os.path.normpath(texto) if texto else None
+
+
+def check_adapter_do_indice(meta: dict | None, adapter_path: str | None, *,
+                            permitir_divergencia: bool = False) -> None:
+    """Exige que os ITENS do indice e as QUERIES do serving usem o MESMO adaptador.
+
+    Funcao pura (por isso testavel sem modelo): recebe o `index_meta.json` ja lido e o
+    `ADAPTER_PATH` do processo. Levanta `RuntimeError` na divergencia -- o startup morre
+    e o `/consulta` responde 503, que e melhor que servir um ranking degradado em
+    silencio. `meta=None` (indice legado, sem carimbo) so avisa, porque nao ha o que
+    comparar; `permitir_divergencia` (o env `ALLOW_ADAPTER_MISMATCH=1`) tambem so avisa.
+    """
+    if meta is None:
+        log.warning("indice sem %s: nao da para conferir se o adaptador do indice e o "
+                    "do serving (%s). Reconstrua com `python -m api.build_index` para "
+                    "carimbar a proveniencia.", META_NAME, adapter_path or "nenhum")
+        return
+
+    do_indice = _adapter_normalizado(meta.get("adapter_path"))
+    do_serving = _adapter_normalizado(adapter_path)
+    if do_indice == do_serving:
+        return
+
+    msg = (f"adaptador divergente: os itens do indice foram embeddados com "
+           f"{meta.get('adapter_path') or 'nenhum (base crua)'} e as queries seriam "
+           f"embeddadas com {adapter_path or 'nenhum (base crua)'} -- espacos diferentes, "
+           f"ranking degradado em silencio. Reconstrua o indice com o mesmo --adapter "
+           f"(`python -m api.build_index`) ou defina {ALLOW_MISMATCH_ENV}=1 para servir "
+           f"assim de proposito.")
+    if permitir_divergencia:
+        log.warning("%s=1: %s", ALLOW_MISMATCH_ENV, msg)
+        return
+    raise RuntimeError(msg)
+
+
 def load_production_retriever(*, index_path: str | None = None,
                               adapter_path: str | None = None,
                               device: str | None = None) -> ConsultaRetriever:
@@ -86,7 +135,10 @@ def load_production_retriever(*, index_path: str | None = None,
     adapter_path = adapter_path if adapter_path is not None else os.environ.get("ADAPTER_PATH")
     device = device or os.environ.get("DEVICE", DEFAULT_DEVICE)
 
-    records, matrix = load_index(index_path)
+    records, matrix, meta = load_index(index_path, with_meta=True)
+    check_adapter_do_indice(
+        meta, adapter_path,
+        permitir_divergencia=os.environ.get(ALLOW_MISMATCH_ENV, "").strip() == "1")
 
     from benchmark.models.qwen3vl_embed import get_embedder
     from ensemble.native.embedders import UNIFIED_A_MODEL

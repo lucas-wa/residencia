@@ -2,16 +2,23 @@
 
 O retriever entra INJETADO (records fake + matriz pequena + `embed_query` duble), que e
 como estes testes exercem o contrato inteiro sem baixar o Qwen3-VL nem tocar no bucket.
+O `build_index` entra pelo mesmo caminho (`embed_items` injetado): o que se exercita aqui
+e a PROVENIENCIA do indice (`index_meta.json`) e a sanidade de caminhos, nao o modelo.
 """
 from __future__ import annotations
+
+import json
 
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from api.app import create_app
-from api.index_io import load_index
+from api.app import ALLOW_MISMATCH_ENV, check_adapter_do_indice, create_app
+from api.build_index import build_index
+from api.index_io import META_NAME, load_index
 from api.retriever import ConsultaRetriever
+from ensemble.corpus_v4 import CorpusPathError
+from ensemble.native.embedders import UNIFIED_A_MODEL
 from ensemble.records import PointerRecord, save_records
 
 CHAVE = "chave-de-teste"
@@ -270,3 +277,151 @@ def test_load_index_erro_claro_sem_arquivo(tmp_path):
     d.mkdir()
     with pytest.raises(FileNotFoundError, match="records.jsonl"):
         load_index(str(d))
+
+
+# --- 7. proveniencia: build_index grava index_meta.json, load_index le ------------
+
+
+def _records_texto() -> list[PointerRecord]:
+    """Dois itens pela rota de TEXTO: o `a_repr` e o texto real, nao um caminho."""
+    return [
+        PointerRecord("tex1", "texto", "Nota", "https://exemplo.gov.br/tex1.html", "dou",
+                      {"a_repr": "educação"}),
+        PointerRecord("aud1", "audio", "Audiência", "https://exemplo.gov.br/aud1.mp3",
+                      "senado", {"a_repr": "orçamento"}),
+    ]
+
+
+def _embed_itens(pares: list[tuple[str, str]]) -> np.ndarray:
+    """Duble do `embed_items` do A: recebe pares `(rota, valor)` e embute o valor."""
+    return _bow([valor for _, valor in pares])
+
+
+def _construir(tmp_path, records, *, adapter_path=None, embed_items=_embed_itens):
+    entrada = tmp_path / "entrada" / "records.jsonl"
+    entrada.parent.mkdir(parents=True, exist_ok=True)
+    save_records(records, entrada)
+    return build_index(entrada, tmp_path / "idx", adapter_path=adapter_path,
+                       embed_items=embed_items)
+
+
+def test_build_index_grava_meta_com_adapter_modelo_dim_e_n(tmp_path):
+    out = _construir(tmp_path, _records_texto(), adapter_path="finetune/out/qwen3vl-lora")
+
+    meta = json.loads((out / META_NAME).read_text(encoding="utf-8"))
+    assert meta["adapter_path"] == "finetune/out/qwen3vl-lora"
+    assert meta["model_id"] == UNIFIED_A_MODEL
+    assert meta["n"] == 2
+    assert meta["dim"] == len(VOCAB)
+
+
+def test_build_index_sem_adapter_carimba_null(tmp_path):
+    out = _construir(tmp_path, _records_texto())
+
+    assert json.loads((out / META_NAME).read_text(encoding="utf-8"))["adapter_path"] is None
+
+
+def test_load_index_with_meta_devolve_o_que_o_build_gravou(tmp_path):
+    out = _construir(tmp_path, _records_texto(), adapter_path="finetune/out/qwen3vl-lora")
+
+    records, matrix, meta = load_index(str(out), with_meta=True)
+
+    assert [r.id for r in records] == ["tex1", "aud1"]
+    assert matrix.shape == (2, len(VOCAB))
+    assert meta["adapter_path"] == "finetune/out/qwen3vl-lora"
+
+
+def test_load_index_with_meta_em_indice_legado_devolve_none(tmp_path):
+    """Indice escrito antes do carimbo: a carga segue, sem proveniencia."""
+    d = _escrever_indice(tmp_path / "idx", _records(), _matrix())
+
+    records, matrix, meta = load_index(str(d), with_meta=True)
+
+    assert len(records) == 4 and matrix.shape == (4, 4)
+    assert meta is None
+
+
+def test_load_index_sem_with_meta_continua_devolvendo_o_par(tmp_path):
+    out = _construir(tmp_path, _records_texto())
+
+    assert len(load_index(str(out))) == 2
+
+
+# --- 8. serving: indice e query no MESMO espaco (checagem de adaptador) -----------
+
+
+def _meta(adapter_path):
+    return {"adapter_path": adapter_path, "model_id": UNIFIED_A_MODEL, "dim": 4, "n": 2}
+
+
+def test_check_adapter_passa_quando_indice_e_serving_casam():
+    assert check_adapter_do_indice(_meta("finetune/out/lora"), "finetune/out/lora") is None
+
+
+def test_check_adapter_passa_quando_os_dois_sao_base_crua():
+    assert check_adapter_do_indice(_meta(None), None) is None
+
+
+def test_check_adapter_falha_no_mismatch():
+    with pytest.raises(RuntimeError, match="adaptador"):
+        check_adapter_do_indice(_meta("finetune/out/lora"), "finetune/out/outro")
+
+
+def test_check_adapter_falha_quando_o_serving_serve_a_base_crua_de_um_indice_finetunado():
+    with pytest.raises(RuntimeError, match=ALLOW_MISMATCH_ENV):
+        check_adapter_do_indice(_meta("finetune/out/lora"), None)
+
+
+def test_check_adapter_so_avisa_com_allow_mismatch():
+    assert check_adapter_do_indice(_meta("finetune/out/lora"), None,
+                                   permitir_divergencia=True) is None
+
+
+def test_check_adapter_so_avisa_em_indice_legado_sem_meta():
+    assert check_adapter_do_indice(None, "finetune/out/lora") is None
+
+
+@pytest.mark.parametrize("serving", ["", "   ", None])
+def test_check_adapter_trata_vazio_como_sem_adaptador(serving):
+    assert check_adapter_do_indice(_meta(None), serving) is None
+
+
+def test_check_adapter_ignora_barra_final_e_separador():
+    assert check_adapter_do_indice(_meta("finetune/out/lora/"), "finetune/out/lora") is None
+
+
+# --- 9. build_index: falha rapida de caminho ANTES de carregar o modelo -----------
+
+
+def test_build_index_recusa_image_route_sem_arquivo_antes_de_carregar_o_embedder(
+        tmp_path, monkeypatch):
+    import ensemble.native.embedders as emb
+
+    construidos: list[str | None] = []
+
+    def nao_deveria_ser_chamado(adapter_path=None):
+        construidos.append(adapter_path)
+        return _embed_itens, _bow
+
+    monkeypatch.setattr(emb, "build_unified_a_embedder", nao_deveria_ser_chamado)
+    records = [*_records_texto(),
+               PointerRecord("img9", "imagem", "Foto", "https://exemplo.gov.br/img9.jpg",
+                             "rss", {"a_repr": str(tmp_path / "nao-existe.png")})]
+
+    with pytest.raises(CorpusPathError, match="img9"):
+        _construir(tmp_path, records, embed_items=None)
+
+    assert construidos == []                        # o modelo nem chegou a ser pedido
+    assert not (tmp_path / "idx").exists()          # e nada foi escrito
+
+
+def test_build_index_aceita_image_route_com_arquivo_em_disco(tmp_path):
+    pagina = tmp_path / "pagina.png"
+    pagina.write_bytes(b"\x89PNG\r\n")
+    records = [*_records_texto(),
+               PointerRecord("doc9", "documento", "Pagina", "https://exemplo.gov.br/d.pdf",
+                             "camara", {"a_repr": str(pagina)})]
+
+    out = _construir(tmp_path, records)
+
+    assert json.loads((out / META_NAME).read_text(encoding="utf-8"))["n"] == 3
