@@ -11,7 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ensemble.capture.audio import fetch_clips
-from ensemble.capture.document import fetch_budget_pages
+from ensemble.capture.document import fetch_budget_pages, fetch_budget_pages_multi
 from ensemble.capture.image import fetch_gallery
 from ensemble.capture.text import fetch_budget_articles
 from ensemble.capture.video import fetch_sessions
@@ -52,6 +52,31 @@ FONTES_PADRAO: dict[str, list[str] | str] = {
     ],
 }
 
+# Eixo documento do corpus v4: "legislativo geral" em vez do PLOA sozinho -- orcamento
+# (PLOA/LDO/informativo), lei ordinaria e relatorio de atividade legislativa, para o
+# fine-tune denso nao aprender so o layout de uma peca orcamentaria.
+# As 5 URLs foram conferidas em 2026-11-14 (HTTP 200 + corpo comecando com %PDF, sem
+# login/token). O v3 (FONTES_PADRAO["documento"]) segue com o PLOA unico.
+DOCUMENTO_V4: list[str] = [
+    # PLOA 2026, Volume I
+    FONTES_PADRAO["documento"],
+    # LDO 2026 (PLN 2/2025) -- atencao: o nome vindo da URL degenera para "pdf"
+    "https://www.congressonacional.leg.br/materias/pesquisa/-/materia/168120/pdf",
+    # Lei 15.321/2025 (anexo do projeto de lei)
+    "https://www2.camara.leg.br/legin/fed/lei/2025/lei-15321-31-dezembro-2025-798617-anexo-pl.pdf",
+    # Informativo do PLDO 2026 (Consultoria de Orcamento do Senado)
+    "https://www12.senado.leg.br/orcamento/documentos/estudos/tipos-de-estudos/notas-tecnicas-e-informativos/informativo_pldo-2026.pdf",
+    # Estatisticas da atividade legislativa da Camara, 2021
+    "https://www2.camara.leg.br/atividade-legislativa/plenario/relatorios-da-atividade-legislativa/sessoes-legislativas/2021/ESTATISTICA%202021.pdf",
+]
+
+
+def _fetch_documento(fonte: str | list[str], *, dest_dir: str, n: int) -> list[PointerRecord]:
+    """Eixo documento: uma URL (v3) ou uma lista de PDFs (v4)."""
+    if isinstance(fonte, str):
+        return fetch_budget_pages(fonte, dest_dir=dest_dir, n=n)
+    return fetch_budget_pages_multi(fonte, dest_dir=dest_dir, n=n)
+
 
 def _reter(rec: PointerRecord, eixo_dir: Path) -> None:
     """Garante o binario sob `eixo_dir`: copia meta["path"] de fora e reaponta o caminho."""
@@ -86,7 +111,7 @@ def build_corpus(
     d = {e: str(bin_dir / e) for e in ("documento", "imagem", "audio", "video")}
     eixos = [
         ("texto", lambda: fetch_budget_articles(f["texto"], n=por_eixo)),
-        ("documento", lambda: fetch_budget_pages(f["documento"], dest_dir=d["documento"], n=por_eixo)),
+        ("documento", lambda: _fetch_documento(f["documento"], dest_dir=d["documento"], n=por_eixo)),
         ("imagem", lambda: fetch_gallery(f["imagem"], n=por_eixo, dest_dir=d["imagem"])),
         ("audio", lambda: fetch_clips(f["audio"], dest_dir=d["audio"], n=por_eixo)),
         ("video", lambda: fetch_sessions(f["video"], n=por_eixo, dest_dir=d["video"])),
@@ -119,9 +144,13 @@ def build_corpus_v4(
     image-route com imagem de verdade em disco -- `check_corpus_paths` reprova o corpus
     ANTES de escrever o `records.jsonl`, em vez de deixar o `embed_images` do baseline A
     quebrar no meio do run.
+
+    O eixo documento do v4 vem de `DOCUMENTO_V4` (varios PDFs legislativos), nao do PLOA
+    sozinho; `fontes` explicitas do chamador ainda ganham.
     """
-    return build_corpus(destino, por_eixo=por_eixo, fontes=fontes, bin_dir=bin_dir,
-                        validar=check_corpus_paths)
+    return build_corpus(destino, por_eixo=por_eixo,
+                        fontes={"documento": DOCUMENTO_V4, **(fontes or {})},
+                        bin_dir=bin_dir, validar=check_corpus_paths)
 
 
 if __name__ == "__main__":
