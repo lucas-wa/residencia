@@ -3,9 +3,12 @@ from pathlib import Path
 
 import pytest
 
+from ensemble.records import PointerRecord, save_records
 from finetune.make_pairs import (
     GENERATORS,
     PageContext,
+    build_query_prompt,
+    contexts_from_records,
     llm_generate_queries,
     load_contexts,
     make_pairs,
@@ -254,6 +257,117 @@ def test_llm_generator_sem_backend_erra():
 
 def test_generators_llm_aponta_para_o_gerador_de_llm():
     assert GENERATORS["llm"] is llm_generate_queries
+
+
+def _records_v4(image_path: str = "/corpus/bin/documento/documento-001_p00.png"):
+    """Um record por modalidade do corpus v4 (`ensemble.records.PointerRecord`)."""
+    return [
+        PointerRecord(id="documento-001", modality="documento",
+                      descriptor="OCR: metas de saude do plano plurianual",
+                      pointer_uri="pdf:ppa#1", source="pdf",
+                      meta={"path": image_path, "a_repr": image_path}),
+        PointerRecord(id="imagem-002", modality="imagem",
+                      descriptor="foto da inauguracao de uma UBS no interior",
+                      pointer_uri="http://exemplo/ubs.jpg", source="galeria",
+                      meta={"path": "/corpus/bin/imagem/ubs.jpg",
+                            "a_repr": "/corpus/bin/imagem/ubs.jpg"}),
+        PointerRecord(id="video-003", modality="video",
+                      descriptor="trecho do debate sobre creches em tempo integral",
+                      pointer_uri="http://exemplo/debate#t=30", source="youtube",
+                      meta={"a_repr": "/corpus/bin/video/debate_t30.png"}),
+        PointerRecord(id="texto-004", modality="texto",
+                      descriptor="noticia sobre o orcamento da educacao",
+                      pointer_uri="http://exemplo/noticia", source="noticia",
+                      meta={"a_repr": "o orcamento da educacao cresce 7% em 2026"}),
+        PointerRecord(id="audio-005", modality="audio",
+                      descriptor="transcricao ASR do programa de radio",
+                      pointer_uri="http://exemplo/radio.mp3", source="radio",
+                      meta={"a_repr": "a prefeitura anunciou mais leitos de UTI"}),
+    ]
+
+
+def test_contexts_from_records_segue_a_rota_do_baseline_a():
+    """Mesmo roteamento do A: documento/imagem/video -> imagem; texto/audio -> texto."""
+    ctxs = contexts_from_records(_records_v4(), k=2)
+
+    por_id = {c.page_id: c for c in ctxs}
+    assert len(ctxs) == len(por_id) == 5
+    assert all(c.k == 2 for c in ctxs)
+
+    documento = por_id["documento-001"]
+    assert documento.modality == "imagem"
+    assert documento.image_path == "/corpus/bin/documento/documento-001_p00.png"
+    assert documento.pos_value == documento.image_path       # positivo = a pagina
+    assert documento.text == "OCR: metas de saude do plano plurianual"   # contexto = OCR
+    assert documento.plan_id == "pdf"                        # `source` do record
+
+    assert por_id["imagem-002"].modality == "imagem"
+    assert por_id["imagem-002"].image_path == "/corpus/bin/imagem/ubs.jpg"
+    assert por_id["video-003"].modality == "imagem"
+    assert por_id["video-003"].image_path == "/corpus/bin/video/debate_t30.png"
+    assert por_id["video-003"].text == "trecho do debate sobre creches em tempo integral"
+
+    texto = por_id["texto-004"]
+    assert texto.modality == "texto"
+    assert texto.image_path == ""
+    assert texto.text == "o orcamento da educacao cresce 7% em 2026"
+    assert texto.pos_value == texto.text                     # positivo = o texto
+    audio = por_id["audio-005"]
+    assert audio.modality == "texto"
+    assert audio.text == "a prefeitura anunciou mais leitos de UTI"
+    assert audio.pos_value == audio.text
+
+
+def test_item_de_imagem_leva_o_descriptor_para_o_prompt():
+    """O gap que isso fecha: item image-route gerava prompt sem contexto nenhum."""
+    ctx = contexts_from_records(_records_v4())[0]
+
+    prompt = build_query_prompt(ctx)
+
+    assert ctx.text and ctx.text.strip()
+    assert "metas de saude do plano plurianual" in prompt
+    assert "sem texto extraido" not in prompt
+
+
+def test_contexts_from_records_sem_source_cai_para_v4():
+    rec = PointerRecord(id="texto-009", modality="texto", descriptor="d",
+                        pointer_uri="http://x", source="", meta={"a_repr": "texto do artigo"})
+
+    assert contexts_from_records([rec])[0].plan_id == "v4"
+
+
+def test_make_pairs_le_records_jsonl_do_corpus_v4(tmp_path: Path):
+    """Entrada canonica do v4: `--records` em vez do corpus.jsonl do benchmark."""
+    png = tmp_path / "documento-001_p00.png"
+    png.write_bytes(b"png")
+    records = tmp_path / "records.jsonl"
+    save_records(_records_v4(image_path=str(png)), records)
+    out = tmp_path / "pairs.jsonl"
+
+    linhas = make_pairs(records=records, out=out, generate_queries=_mock_gen(), k=1, neg=2)
+
+    assert _read_pairs(out) == linhas
+    por_id = {r["pos_id"]: r for r in linhas}
+    assert set(por_id) == {"documento-001", "imagem-002", "video-003",
+                           "texto-004", "audio-005"}
+    documento = por_id["documento-001"]
+    assert documento["pos_modality"] == "imagem"
+    assert documento["pos_image"] == str(png) and documento["pos_text"] == ""
+    audio = por_id["audio-005"]
+    assert audio["pos_modality"] == "texto"
+    assert audio["pos_text"] == "a prefeitura anunciou mais leitos de UTI"
+    assert audio["pos_image"] == ""
+    assert all(p for r in linhas for p in r["neg_images"])   # negativo e sempre caminho
+    # deterministico: refazer do zero devolve exatamente as mesmas linhas
+    assert make_pairs(records=records, out=out, generate_queries=_mock_gen(), k=1, neg=2,
+                      force=True) == linhas
+
+
+def test_make_pairs_sem_corpus_nem_records_erra_claro():
+    with pytest.raises(ValueError) as exc:
+        make_pairs()
+
+    assert "records" in str(exc.value)
 
 
 def test_make_pairs_injeta_o_chat_fn_no_gerador_llm(tmp_path: Path):

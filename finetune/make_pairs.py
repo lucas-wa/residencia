@@ -1,15 +1,22 @@
 """Gera dados sinteticos de treino (consulta -> pagina relevante) para o finetuning pt-BR.
 
-Entrada: o diretorio do benchmark pt-BR dos planos, no layout produzido por
-`data/govexe/build_planos_benchmark.py` (e lido por `benchmark.common.datasets.load_local`):
+Entrada: uma de duas, e o resto do fluxo e identico.
+
+1. `--corpus <dir>`: o diretorio do benchmark pt-BR dos planos, no layout produzido por
+   `data/govexe/build_planos_benchmark.py` (e lido por `benchmark.common.datasets.load_local`):
 
     <corpus_dir>/corpus.jsonl    {"id": "<tse_seq>_p<NN>", "image_path": "..."}
                                  {"id": "<item_id>", "text": "..."}   # item TEXTUAL (v4)
     <corpus_dir>/queries.jsonl   {"id": "<tse_seq>_<destaque|resumo|eixoN>", "text": "..."}
     <corpus_dir>/qrels.tsv       <query_id>\t<page_id>\t1
 
-`corpus.jsonl` e obrigatorio; `queries.jsonl`/`qrels.tsv` sao opcionais e, quando existem,
-alimentam o contexto do gerador (destaque/resumo/eixos do plano daquela pagina).
+   `corpus.jsonl` e obrigatorio; `queries.jsonl`/`qrels.tsv` sao opcionais e, quando existem,
+   alimentam o contexto do gerador (destaque/resumo/eixos do plano daquela pagina).
+
+2. `--records <records.jsonl>`: o corpus v4 canonico do ensemble (`PointerRecord`, ver
+   `ensemble/build_corpus.py`), adaptado por `contexts_from_records` -- que roteia cada
+   item pela MESMA rota do baseline A (`ensemble.native.unified_a`). Quando os dois sao
+   informados, `--records` ganha.
 
 Um item do corpus e de UMA modalidade: `image_path` -> pagina (modalidade "imagem"), ou um
 campo de texto (`text`, ou `a_repr` no layout do ensemble) -> modalidade "texto". E assim
@@ -57,10 +64,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from ensemble.native.unified_a import a_repr, a_route
+from ensemble.records import PointerRecord, load_records
+
 log = logging.getLogger(__name__)
 
 SEED = 42
 DEFAULT_CORPUS_DIR = "data/govexe/ptbr_planos"
+# `records.jsonl` do corpus v4 (`ensemble.build_corpus.DESTINO_V4`).
+DEFAULT_RECORDS = "data/govexe/ensemble_orcamento_v4/records.jsonl"
 DEFAULT_OUT = "finetune/data/pairs.jsonl"
 DEFAULT_K = 3
 DEFAULT_NEG = 4
@@ -69,6 +81,10 @@ TOPIC_WORDS = 12          # palavras aproveitadas de cada texto do plano como "t
 MODALIDADE_IMAGEM = "imagem"
 MODALIDADE_TEXTO = "texto"
 MODALIDADES = (MODALIDADE_IMAGEM, MODALIDADE_TEXTO)
+
+# "Plano" de um record do v4 sem `source` -- o corpus v4 nao e feito de planos, e o
+# `plan_id` so agrupa itens para a amostragem de negativos (ver `sample_negatives`).
+PLANO_V4 = "v4"
 
 # Campos do corpus.jsonl que carregam o texto de um item textual, em ordem de preferencia
 # (`text` e o layout do benchmark; `a_repr` e o do ensemble/corpus v4).
@@ -294,6 +310,53 @@ def load_contexts(corpus_dir: str | Path, k: int = DEFAULT_K) -> list[PageContex
     return ctxs
 
 
+def contexts_from_records(records: list[PointerRecord],
+                          k: int = DEFAULT_K) -> list[PageContext]:
+    """Adapta o corpus v4 (`PointerRecord`) para `PageContext`, pela rota do baseline A.
+
+    O roteamento e o MESMO do retriever unificado (`ensemble.native.unified_a.a_route`),
+    porque o positivo do treino precisa entrar no modelo pelo lado em que ele sera
+    embeddado na avaliacao:
+
+    - `documento`/`imagem`/`video` (rota de imagem): o positivo e o ARQUIVO (`a_repr`, um
+      caminho) e o CONTEXTO de geracao da consulta e o `descriptor` -- o OCR/legenda/
+      transcricao que a captura ja extraiu. E o que tira o prompt do item visual do
+      "(sem texto extraido...)" sem precisar de um VLM no gerador.
+    - `texto`/`audio` (rota de texto): o `a_repr` ja e o texto real (artigo, transcricao
+      ASR) e serve das duas coisas -- positivo e contexto.
+
+    `plan_id` vira o `source` do record (`pdf`, `galeria`, `radio`, ...): nao e um plano
+    de governo, so o agrupamento que `sample_negatives` usa para preferir negativos de
+    outra origem.
+    """
+    ctxs: list[PageContext] = []
+    for rec in records:
+        imagem = a_route(rec) == "image"
+        valor = a_repr(rec)
+        ctxs.append(PageContext(
+            page_id=rec.id,
+            image_path=valor if imagem else "",
+            plan_id=rec.source or PLANO_V4,
+            k=k,
+            text=(rec.descriptor if imagem else valor) or None,
+            modality=MODALIDADE_IMAGEM if imagem else MODALIDADE_TEXTO,
+        ))
+    return ctxs
+
+
+def resolve_contexts(corpus_dir: str | Path | None = None,
+                     records: str | Path | None = None,
+                     k: int = DEFAULT_K) -> list[PageContext]:
+    """Contextos da entrada escolhida: `records.jsonl` do v4, ou o corpus do benchmark."""
+    if records is not None:
+        return contexts_from_records(load_records(records), k=k)
+    if corpus_dir is not None:
+        return load_contexts(corpus_dir, k=k)
+    raise ValueError(
+        "sem entrada: informe o corpus do benchmark (corpus_dir/--corpus) ou o "
+        "records.jsonl do corpus v4 (records/--records)")
+
+
 # -- geracao dos pares ----------------------------------------------------------------
 
 
@@ -329,15 +392,19 @@ def _resolve_out(out: str | Path) -> Path:
     return p if p.suffix == ".jsonl" else p / "pairs.jsonl"
 
 
-def make_pairs(corpus_dir: str | Path, out: str | Path,
+def make_pairs(corpus_dir: str | Path | None = None, out: str | Path = DEFAULT_OUT,
                generate_queries: QueryGenerator | None = None,
                k: int = DEFAULT_K, neg: int = DEFAULT_NEG, limit: int | None = None,
                force: bool = False, seed: int = SEED,
                generator_name: str = "template",
-               chat_fn: ChatFn | None = None) -> list[dict]:
+               chat_fn: ChatFn | None = None,
+               records: str | Path | None = None) -> list[dict]:
     """Escreve `pairs.jsonl` com K consultas por item + `neg` negativos, e devolve as linhas.
 
     Cada item vira um par da SUA modalidade (pagina -> `pos_image`, texto -> `pos_text`).
+
+    A entrada e `corpus_dir` (benchmark pt-BR) ou `records` (o `records.jsonl` do corpus
+    v4, adaptado por `contexts_from_records`); informando os dois, `records` ganha.
 
     O gerador vem de `generate_queries` (um callable de um argumento, usado nos testes) ou,
     quando nao informado, de `generator_name` via `resolve_generator` -- que e onde o
@@ -357,7 +424,7 @@ def make_pairs(corpus_dir: str | Path, out: str | Path,
         generate_queries = functools.partial(llm_generate_queries, chat_fn=chat_fn)
 
     out_path = _resolve_out(out)
-    contexts = load_contexts(corpus_dir, k=k)
+    contexts = resolve_contexts(corpus_dir, records, k=k)
     pool = contexts                       # negativos saem do corpus inteiro, nao do recorte
     if limit:
         contexts = contexts[:limit]
@@ -408,6 +475,9 @@ def main():
         description="Gera pares sinteticos (consulta pt-BR -> pagina de plano) para o finetuning.")
     ap.add_argument("--corpus", default=DEFAULT_CORPUS_DIR,
                     help="diretorio do benchmark pt-BR (corpus.jsonl/queries.jsonl/qrels.tsv)")
+    ap.add_argument("--records", default=None,
+                    help=f"records.jsonl do corpus v4 (ex.: {DEFAULT_RECORDS}); quando "
+                         "informado, substitui o --corpus")
     ap.add_argument("--out", default=DEFAULT_OUT,
                     help="arquivo pairs.jsonl de saida (ou o diretorio que vai conte-lo)")
     ap.add_argument("--k", type=int, default=DEFAULT_K, help="consultas por pagina")
@@ -423,7 +493,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     linhas = make_pairs(a.corpus, a.out, k=a.k, neg=a.neg, limit=a.limit, force=a.force,
-                        seed=a.seed, generator_name=a.generator)
+                        seed=a.seed, generator_name=a.generator, records=a.records)
     print(f"{len(linhas)} pares em {_resolve_out(a.out)}")
 
 
