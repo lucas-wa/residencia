@@ -87,12 +87,33 @@ def _ndcg_do_a(records, queries, qrels, adapter_path: str | None, tag: str) -> f
     return valor
 
 
+def _liberar_memoria() -> None:
+    """Solta a carga anterior do Qwen3-VL antes da proxima (VRAM, nao resultado).
+
+    `gc.collect()` derruba as referencias que o embedder anterior ainda segurava e o
+    `empty_cache()` devolve o cache do alocador do torch -- sem isto, a 2a carga depende
+    do GC ter rodado na hora certa e, numa L4 24GB, as duas podem coexistir. Imports
+    locais e guardados: os testes puros (dubles, sem GPU) nao tem torch e so pulam.
+    """
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+    except ImportError:                      # ambiente sem torch: nada a liberar
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def run_ensemble_eval_before_after(cfg, adapter_dir, records, queries,
                                    qrels) -> dict[str, float | int]:
     """nDCG@10 do A no v4 ANTES (base crua) e DEPOIS (com `adapter_path=adapter_dir`).
 
     Carrega o Qwen3-VL duas vezes -- de proposito: o "antes" tem de ser o checkpoint
-    publico, sem nenhum peso do treino. Devolve `{"antes", "depois", "delta",
+    publico, sem nenhum peso do treino. Entre as duas cargas, `_liberar_memoria` solta a
+    primeira (as duas na VRAM ao mesmo tempo apertariam uma L4 24GB); o numero medido nao
+    muda com isso. Devolve `{"antes", "depois", "delta",
     "n_queries"}` e loga as duas linhas; quem chama (`train_lora.run_ensemble_eval`) e
     quem decide que uma falha aqui nao derruba o treino.
     """
@@ -101,6 +122,7 @@ def run_ensemble_eval_before_after(cfg, adapter_dir, records, queries,
              getattr(cfg, "base", "?"), getattr(cfg, "method", "?"), len(records), julgadas)
 
     antes = _ndcg_do_a(records, queries, qrels, None, "antes")
+    _liberar_memoria()                       # a base crua sai da VRAM antes da finetunada
     depois = _ndcg_do_a(records, queries, qrels, str(Path(adapter_dir)), "depois")
 
     resultado = {"antes": antes, "depois": depois, "delta": depois - antes,

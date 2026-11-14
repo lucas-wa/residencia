@@ -134,6 +134,44 @@ def test_run_ensemble_eval_before_after_usa_o_adaptador_so_no_depois(tmp_path, m
     assert res["n_queries"] == 2
 
 
+def test_run_ensemble_eval_before_after_libera_o_modelo_entre_as_cargas(tmp_path, monkeypatch):
+    """A 2a carga nao pode esperar o GC soltar a 1a: numa L4 24GB a dupla-carga aperta."""
+    import ensemble.native.embedders as emb
+    from finetune.train_lora import resolve_config
+
+    eventos: list[str] = []
+
+    def fake_builder(adapter_path=None):
+        eventos.append(f"carrega:{adapter_path}")
+        return _bow_itens, _bow
+
+    monkeypatch.setattr(emb, "build_unified_a_embedder", fake_builder)
+    monkeypatch.setattr(E, "_liberar_memoria", lambda: eventos.append("libera"))
+    adapter = tmp_path / "qwen3vl-lora"
+    adapter.mkdir()
+
+    E.run_ensemble_eval_before_after(resolve_config("qwen3vl", "lora"), adapter,
+                                     _recs(), QUERIES, QRELS)
+
+    assert eventos == ["carrega:None", "libera", f"carrega:{adapter}"]
+
+
+def test_liberar_memoria_nao_exige_torch(monkeypatch):
+    """Sem torch instalado (os testes puros) o free e um no-op, nao um ImportError."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def sem_torch(name, *args, **kwargs):
+        if name == "torch":
+            raise ImportError("torch nao instalado")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", sem_torch)
+
+    assert E._liberar_memoria() is None
+
+
 def test_load_eval_data_le_corpus_queries_e_qrels(tmp_path):
     from ensemble.records import save_records
 
