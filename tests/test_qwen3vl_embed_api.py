@@ -460,7 +460,7 @@ def test_get_embedder_cacheia_por_configuracao(monkeypatch):
 
     class _Fake:
         def __init__(self, model_id, device="cuda", dtype="bfloat16", batch_size=8, dim=None,
-                     max_pixels=DEFAULT_MAX_PIXELS):
+                     max_pixels=DEFAULT_MAX_PIXELS, adapter_path=None):
             construidos.append((model_id, device, dtype, batch_size, dim, max_pixels))
             self.model_id = model_id
 
@@ -485,3 +485,35 @@ def test_get_embedder_cacheia_por_configuracao(monkeypatch):
     # `max_pixels` entra na chave: outro teto == outro embedder
     mod.get_embedder(device="cpu", max_pixels=None)
     assert len(construidos) == 3
+
+
+def test_get_embedder_chaveia_por_adapter_path(monkeypatch):
+    """Base crua e base-com-adaptador NAO podem colidir no cache."""
+    construidos: list[dict] = []
+
+    class _Fake:
+        def __init__(self, model_id, device="cuda", dtype="bfloat16", batch_size=8, dim=None,
+                     max_pixels=DEFAULT_MAX_PIXELS, adapter_path=None):
+            construidos.append({"model_id": model_id, "device": device,
+                                "adapter_path": adapter_path})
+            self.model_id = model_id
+            self.adapter_path = adapter_path
+
+    monkeypatch.setattr(mod, "_EMBEDDERS", {})
+    monkeypatch.setattr(mod, "Qwen3VLEmbedRetriever", _Fake)
+
+    base = mod.get_embedder(device="cpu")
+    com_adapter = mod.get_embedder(device="cpu", adapter_path="/x")
+    assert base is not com_adapter
+    assert len(construidos) == 2
+    assert construidos[0]["adapter_path"] is None
+    assert construidos[1]["adapter_path"] == "/x"
+    assert com_adapter.adapter_path == "/x"
+
+    # mesmo adapter_path -> mesma instancia (cache)
+    assert mod.get_embedder(device="cpu", adapter_path="/x") is com_adapter
+    assert len(construidos) == 2
+
+    # outro adapter_path -> outra instancia
+    outro = mod.get_embedder(device="cpu", adapter_path="/y")
+    assert outro is not com_adapter and len(construidos) == 3

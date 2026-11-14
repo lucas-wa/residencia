@@ -29,8 +29,8 @@ como API de inferencia fora do benchmark -- e o embedder da fatia GCP:
     scores = q @ vecs.T                                   # produto interno = cosseno
 
 `get_embedder` guarda o modelo carregado num cache por (model_id, device, dtype,
-batch_size, dim, max_pixels), entao chamadas repetidas em um mesmo processo nao
-recarregam pesos.
+batch_size, dim, max_pixels, adapter_path), entao chamadas repetidas em um mesmo processo
+nao recarregam pesos.
 
 `max_pixels` poe um TETO de resolucao nas imagens antes do encoder de visao (ver
 `DEFAULT_MAX_PIXELS`): sem ele uma pagina a 150 DPI custa dezenas de segundos por item
@@ -412,14 +412,20 @@ _EMBEDDERS: dict[tuple, Qwen3VLEmbedRetriever] = {}
 def get_embedder(model_id: str = DEFAULT_MODEL_ID, device: str = "cuda",
                  dtype: str = "bfloat16", batch_size: int = 8,
                  dim: int | None = None,
-                 max_pixels: int | None = DEFAULT_MAX_PIXELS) -> Qwen3VLEmbedRetriever:
-    """Embedder carregado (cache por configuracao) -- evita recarregar pesos no processo."""
-    key = (model_id, device, dtype, batch_size, dim, max_pixels)
+                 max_pixels: int | None = DEFAULT_MAX_PIXELS,
+                 adapter_path: str | None = None) -> Qwen3VLEmbedRetriever:
+    """Embedder carregado (cache por configuracao) -- evita recarregar pesos no processo.
+
+    `adapter_path` (diretorio do adaptador LoRA de `finetune/train_lora.py`) entra na
+    CHAVE do cache: base crua e base-com-adaptador sao modelos diferentes e nao podem
+    colidir numa mesma entrada.
+    """
+    key = (model_id, device, dtype, batch_size, dim, max_pixels, adapter_path)
     emb = _EMBEDDERS.get(key)
     if emb is None:
         emb = _EMBEDDERS[key] = Qwen3VLEmbedRetriever(
             model_id, device=device, dtype=dtype, batch_size=batch_size, dim=dim,
-            max_pixels=max_pixels)
+            max_pixels=max_pixels, adapter_path=adapter_path)
     return emb
 
 
