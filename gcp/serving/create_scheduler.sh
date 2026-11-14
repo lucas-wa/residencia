@@ -52,11 +52,13 @@
 # PRE-REQUISITOS (uma vez, fora deste script)
 #
 #   1. APIs: run.googleapis.com, cloudscheduler.googleapis.com, compute.googleapis.com
-#   2. Imagem do job publicada (ela precisa do repo + gcloud + python):
-#          gcloud builds submit --tag "$IMAGE" .
-#      O `trigger_cycle.sh` chama `gcloud compute instances create` e `gcloud compute
-#      ssh`, entao a imagem tem de ter o SDK -- a base `gcr.io/google.com/cloudsdktool/
-#      google-cloud-cli` com o repo e `pip install google-cloud-storage` resolve.
+#   2. Imagem do job publicada, a partir da RAIZ do repo:
+#          docker build -f gcp/serving/Dockerfile -t "$IMAGE" . && docker push "$IMAGE"
+#      O Dockerfile e `gcp/serving/Dockerfile` (base do SDK + repo + openssh-client +
+#      google-cloud-storage): o `trigger_cycle.sh` chama `gcloud compute instances
+#      create` e `gcloud compute ssh`, entao a imagem tem de ter o SDK. `gcloud builds
+#      submit --tag` NAO serve aqui -- ele exige o Dockerfile na raiz do contexto, e a
+#      raiz ja tem o `api/Dockerfile`, que e do SERVICE [4], outra imagem.
 #   3. Service account $SA com, no projeto:
 #          roles/compute.instanceAdmin.v1   (criar/apagar a Spot VM)
 #          roles/iam.serviceAccountUser     (atribuir a SA da VM)
@@ -92,7 +94,7 @@ while [ $# -gt 0 ]; do
         --schedule) SCHEDULE="$2"; shift 2 ;;
         --com-job)  COM_JOB=1; shift ;;
         --dry-run)  DRY_RUN=1; shift ;;
-        -h|--help)  sed -n '2,65p' "$0"; exit 0 ;;
+        -h|--help)  sed -n '2,67p' "$0"; exit 0 ;;
         *) echo "flag desconhecida: $1" >&2; exit 2 ;;
     esac
 done

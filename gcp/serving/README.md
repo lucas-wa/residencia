@@ -25,6 +25,7 @@ Cloud Run Job (sem GPU, efêmero)
 | `upsert_index.py` | **núcleo testável**: `upsert_records` (merge idempotente por `id`) + IO do `records.jsonl` (local ou `gs://`). Testes: `tests/test_upsert_index.py`. |
 | `trigger_cycle.sh` | **um ciclo** ponta a ponta. Não reimplementa provisão nem teardown: chama `gcp/slice/run_slice.sh`. |
 | `create_scheduler.sh` | cria/remove o **cron diário** e o Cloud Run Job que ele dispara. |
+| `Dockerfile` | imagem do Cloud Run Job: base do **SDK** (o ciclo chama `gcloud compute …`) + `openssh-client` + `google-cloud-storage` + o repo em `/app`. Sem GPU e sem torch — a GPU é a Spot VM. |
 
 ### Idempotência — por que o retry é seguro
 
@@ -66,9 +67,13 @@ bash gcp/serving/trigger_cycle.sh 2>&1 | tee logs/ciclo-$(date +%F).log
 ### Habilitar o cron (uma vez)
 
 ```bash
-# pré-requisitos: APIs run/cloudscheduler/compute ativas, imagem do job publicada e a
-# service account com compute.instanceAdmin.v1, iam.serviceAccountUser,
-# storage.objectAdmin e run.invoker — a lista completa está no topo do create_scheduler.sh
+# pré-requisitos: APIs run/cloudscheduler/compute ativas e a service account com
+# compute.instanceAdmin.v1, iam.serviceAccountUser, storage.objectAdmin e run.invoker
+# — a lista completa está no topo do create_scheduler.sh
+# imagem do job (da RAIZ do repo; `gcloud builds submit --tag` não serve: ele exige o
+# Dockerfile na raiz do contexto, que já é o do serviço [4]):
+docker build -f gcp/serving/Dockerfile -t gcr.io/residencia-511517/ciclo-captura:latest . \
+  && docker push gcr.io/residencia-511517/ciclo-captura:latest
 bash gcp/serving/create_scheduler.sh job      # cria/atualiza o Cloud Run Job
 bash gcp/serving/create_scheduler.sh create   # cria o cron 06:00 America/São_Paulo
 bash gcp/serving/create_scheduler.sh run-now  # dispara um ciclo agora, pela mesma rota
