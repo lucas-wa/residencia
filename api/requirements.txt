@@ -1,0 +1,19 @@
+# Dependencias do servico HTTP de consulta (subsistema [4]).
+# Alvo: Python 3.11 (mesmo do repo).
+
+# --- servidor ---
+fastapi>=0.115,<0.116
+uvicorn[standard]>=0.30
+pydantic>=2.9,<3
+numpy
+
+# --- indice no GCS (INDEX_PATH=gs://...); desnecessario com indice local ---
+google-cloud-storage>=2.18
+
+# --- modelo (startup real: Qwen3-VL + adaptador LoRA da Semana 10) ---
+# Pinos alinhados ao requirements.txt/requirements-gpu.txt do repo -- o torch com CUDA
+# vem da imagem base ou do indice de wheels da GPU, nao daqui.
+transformers>=4.46,<4.51
+peft>=0.13
+accelerate>=0.34
+pillow
