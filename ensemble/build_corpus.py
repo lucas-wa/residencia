@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from ensemble.capture.audio import fetch_clips
@@ -14,9 +15,14 @@ from ensemble.capture.document import fetch_budget_pages
 from ensemble.capture.image import fetch_gallery
 from ensemble.capture.text import fetch_budget_articles
 from ensemble.capture.video import fetch_sessions
+from ensemble.corpus_v4 import check_corpus_paths
 from ensemble.records import PointerRecord, save_records, validate_record
 
 DESTINO_PADRAO = "data/govexe/ensemble_orcamento/records.jsonl"
+
+# Corpus v4 (Semana 10): captura maior, em diretorio proprio para nao sobrescrever o v3.
+DESTINO_V4 = "data/govexe/ensemble_orcamento_v4/records.jsonl"
+POR_EIXO_V4 = 50
 
 # Fontes reais de cada eixo (NAO sao mais placeholders): formato e alcancabilidade
 # conferidos por curl.
@@ -67,8 +73,13 @@ def _reter(rec: PointerRecord, eixo_dir: Path) -> None:
 def build_corpus(
     destino: str | Path = DESTINO_PADRAO, *, por_eixo: int = 20, fontes: dict | None = None,
     bin_dir: str | Path | None = None,
+    validar: Callable[[list[PointerRecord]], None] | None = None,
 ) -> Path:
-    """Salva `records.jsonl` e os binarios retidos sob `bin_dir/<eixo>/` (default: <destino>/../bin)."""
+    """Salva `records.jsonl` e os binarios retidos sob `bin_dir/<eixo>/` (default: <destino>/../bin).
+
+    `validar` e uma checagem EXTRA rodada depois do `_reter`/`validate_record` e ANTES de
+    salvar -- corpus reprovado nao vira arquivo (ver `build_corpus_v4`).
+    """
     f = {**FONTES_PADRAO, **(fontes or {})}
     destino = Path(destino)
     bin_dir = Path(bin_dir) if bin_dir is not None else destino.parent / "bin"
@@ -90,9 +101,27 @@ def build_corpus(
         todos.extend(recs)
     for r in todos:
         validate_record(r)
+    if validar is not None:
+        validar(todos)
     destino.parent.mkdir(parents=True, exist_ok=True)
     save_records(todos, destino)
     return destino
+
+
+def build_corpus_v4(
+    destino: str | Path = DESTINO_V4, *, por_eixo: int = POR_EIXO_V4,
+    fontes: dict | None = None, bin_dir: str | Path | None = None,
+) -> Path:
+    """Corpus v4: mesma captura, maior (50/eixo) e com sanity de caminho antes de salvar.
+
+    O v4 alimenta o fine-tune denso da Semana 10, que precisa de mais itens por eixo
+    (piso de 8 queries julgadas por eixo so fecha com corpus maior) e de todo item
+    image-route com imagem de verdade em disco -- `check_corpus_paths` reprova o corpus
+    ANTES de escrever o `records.jsonl`, em vez de deixar o `embed_images` do baseline A
+    quebrar no meio do run.
+    """
+    return build_corpus(destino, por_eixo=por_eixo, fontes=fontes, bin_dir=bin_dir,
+                        validar=check_corpus_paths)
 
 
 if __name__ == "__main__":
