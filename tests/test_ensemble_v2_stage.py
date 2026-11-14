@@ -37,6 +37,11 @@ def _bow(texts: list[str]) -> np.ndarray:
     )
 
 
+def _bow_itens_a(pares: list[tuple[str, str]]) -> np.ndarray:
+    """`embed_items` do A: recebe `(rota, valor)` (o A roteia por modalidade)."""
+    return _bow([valor for _, valor in pares])
+
+
 class FakeColRetriever:
     """Duble de ColVisionRetriever: 1 token por query sobre vetores one-hot de pagina;
     ranqueia as paginas na ordem em que foram embutidas (determinista, sem torch)."""
@@ -88,13 +93,16 @@ def test_main_grava_csv_v2(tmp_path):
     def pair():
         return _bow, _bow
 
+    def pair_a():
+        return _bow_itens_a, _bow
+
     builders = {
         "documento": FakeColRetriever,
         "imagem": pair,
         "audio": pair,
         "texto": pair,
         "video": pair,
-        "unified_a": pair,
+        "unified_a": pair_a,
     }
 
     rc = main(

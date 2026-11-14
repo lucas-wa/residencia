@@ -23,6 +23,11 @@ def _bow(texts: list[str]) -> np.ndarray:
                     dtype=np.float32)
 
 
+def _bow_itens(pares: list[tuple[str, str]]) -> np.ndarray:
+    """`embed_items` do A: recebe `(rota, valor)` (o A e multimodal); o duble embute o valor."""
+    return _bow([valor for _, valor in pares])
+
+
 def _bow_desalinhado(texts: list[str]) -> np.ndarray:
     """Query com 1.0 no item ERRADO e 0.9 no certo: o relevante cai para o 2o lugar."""
     saida = np.zeros((len(texts), len(VOCAB)), dtype=np.float32)
@@ -52,14 +57,14 @@ NDCG_SEGUNDO = 1 / math.log2(3)
 
 def test_unified_ndcg_at10_perfeito_e_um():
     valor = E.unified_ndcg_at10(_recs(), QUERIES, QRELS,
-                                embed_items=_bow, embed_query=_bow)
+                                embed_items=_bow_itens, embed_query=_bow)
 
     assert valor == pytest.approx(1.0)
 
 
 def test_unified_ndcg_at10_cai_quando_o_relevante_e_segundo():
     valor = E.unified_ndcg_at10(_recs(), QUERIES, QRELS,
-                                embed_items=_bow, embed_query=_bow_desalinhado)
+                                embed_items=_bow_itens, embed_query=_bow_desalinhado)
 
     assert valor == pytest.approx(NDCG_SEGUNDO, rel=1e-6)
     assert 0.62 < valor < 0.64                      # ~0.63, nao 0 e nao 1
@@ -71,7 +76,7 @@ def test_unified_ndcg_at10_so_conta_as_queries_julgadas():
     qrels = {**QRELS, "q3": set()}                  # q3 julgada vazia, q4 sem linha
 
     valor = E.unified_ndcg_at10(_recs(), queries, qrels,
-                                embed_items=_bow, embed_query=_bow)
+                                embed_items=_bow_itens, embed_query=_bow)
 
     # media sobre 2 julgadas (q1/q2), nao sobre as 4 queries
     assert valor == pytest.approx(1.0)
@@ -79,22 +84,25 @@ def test_unified_ndcg_at10_so_conta_as_queries_julgadas():
 
 def test_unified_ndcg_at10_sem_query_julgada_e_zero():
     valor = E.unified_ndcg_at10(_recs(), {"q9": "estrada"}, {},
-                                embed_items=_bow, embed_query=_bow)
+                                embed_items=_bow_itens, embed_query=_bow)
 
     assert valor == 0.0
 
 
 def test_unified_ndcg_at10_embute_o_corpus_uma_vez():
-    chamadas: list[list[str]] = []
+    chamadas: list[list[tuple[str, str]]] = []
 
-    def contando(texts):
-        chamadas.append(list(texts))
-        return _bow(texts)
+    def contando(pares):
+        chamadas.append(list(pares))
+        return _bow_itens(pares)
 
     E.unified_ndcg_at10(_recs(), QUERIES, QRELS,
                         embed_items=contando, embed_query=_bow)
 
     assert len(chamadas) == 1 and len(chamadas[0]) == 4
+    # contrato do A multimodal: chegam pares (rota, valor), na ordem dos records
+    assert chamadas[0] == [("image", "orcamento"), ("image", "saude"),
+                           ("text", "educacao"), ("image", "estrada")]
 
 
 # -- wrapper antes/depois --------------------------------------------------------------
@@ -110,7 +118,7 @@ def test_run_ensemble_eval_before_after_usa_o_adaptador_so_no_depois(tmp_path, m
     def fake_builder(adapter_path=None):
         construidos.append(adapter_path)
         # sem adaptador o A erra o topo; com o adaptador acerta
-        return _bow, (_bow if adapter_path else _bow_desalinhado)
+        return _bow_itens, (_bow if adapter_path else _bow_desalinhado)
 
     monkeypatch.setattr(emb, "build_unified_a_embedder", fake_builder)
     adapter = tmp_path / "qwen3vl-lora"

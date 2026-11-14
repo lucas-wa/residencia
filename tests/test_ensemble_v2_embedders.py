@@ -147,15 +147,37 @@ def test_video_embute_o_keyframe_com_siglip2(monkeypatch):
     assert modelo.calls[1] == ("_embed_text", ["orcamento da saude"])
 
 
+DIM_A = 8
+
+
 class _FakeQwen3VL:
-    """Duble do `Qwen3VLEmbedRetriever` -- nenhum checkpoint e tocado."""
+    """Duble do `Qwen3VLEmbedRetriever` -- nenhum checkpoint e tocado.
+
+    Os vetores sao MARCADOS para o teste reconhecer a origem de cada linha: coluna 0 =
+    1.0 (rota imagem) / 2.0 (rota texto); coluna 1 = posicao dentro do grupo. Mesmo
+    `dim` nos dois lados (espaco unico), como no modelo real.
+    """
 
     def __init__(self, model_id, **kwargs):
         self.model_id = model_id
         self.kwargs = kwargs
+        self.calls = []
+
+    def _marcados(self, marca, n):
+        v = np.zeros((n, DIM_A), dtype="float64")
+        v[:, 0] = marca
+        v[:, 1] = np.arange(n, dtype="float64")
+        return v
+
+    def embed_images(self, paths):
+        paths = list(paths)
+        self.calls.append(("embed_images", paths))
+        return self._marcados(1.0, len(paths))
 
     def embed_texts(self, texts):
-        return np.ones((len(texts), 8), dtype="float64")
+        texts = list(texts)
+        self.calls.append(("embed_texts", texts))
+        return self._marcados(2.0, len(texts))
 
 
 def _fake_qwen3vl(monkeypatch, feitos):
@@ -181,8 +203,11 @@ def test_unified_a_repassa_o_adapter_path(monkeypatch):
 
     assert feitos[0].model_id == UNIFIED_A_MODEL
     assert feitos[0].kwargs == {"device": "cuda", "adapter_path": "finetune/runs/x"}
-    assert embed_items is embed_query                  # items e query no mesmo encoder
-    assert embed_items(["orcamento"]).dtype == np.float32
+    # mesmo modelo (espaco unico) para itens e query, mas encoders distintos: o de itens
+    # roteia por modalidade, o de query e sempre texto
+    assert embed_items is not embed_query
+    assert embed_items([("text", "orcamento")]).dtype == np.float32
+    assert embed_query(["orcamento"]).dtype == np.float32
 
 
 def test_unified_a_sem_adapter_path_segue_na_base(monkeypatch):
@@ -194,6 +219,55 @@ def test_unified_a_sem_adapter_path_segue_na_base(monkeypatch):
     build_unified_a_embedder()
 
     assert feitos[0].kwargs == {"device": "cuda", "adapter_path": None}
+
+
+def test_unified_a_roteia_itens_por_modalidade_e_remonta_na_ordem(monkeypatch):
+    """Batch misto: imagens por `embed_images`, textos por `embed_texts`, ordem preservada."""
+    from ensemble.native.embedders import build_unified_a_embedder
+
+    feitos: list[_FakeQwen3VL] = []
+    _fake_qwen3vl(monkeypatch, feitos)
+
+    embed_items, _ = build_unified_a_embedder()
+    saida = embed_items([("image", "a.jpg"), ("text", "oi"), ("image", "b.png")])
+
+    modelo = feitos[0]
+    assert modelo.calls == [
+        ("embed_images", ["a.jpg", "b.png"]),   # um batch por rota, nao um por item
+        ("embed_texts", ["oi"]),
+    ]
+    assert saida.shape == (3, DIM_A) and saida.dtype == np.float32
+    assert [float(linha[0]) for linha in saida] == [1.0, 2.0, 1.0]  # rota de cada linha
+    assert [float(linha[1]) for linha in saida] == [0.0, 0.0, 1.0]  # posicao no grupo
+
+
+def test_unified_a_nao_chama_o_modelo_para_grupo_vazio(monkeypatch):
+    from ensemble.native.embedders import build_unified_a_embedder
+
+    feitos: list[_FakeQwen3VL] = []
+    _fake_qwen3vl(monkeypatch, feitos)
+
+    so_texto, _ = build_unified_a_embedder()
+    so_texto([("text", "oi"), ("text", "tchau")])
+    assert feitos[0].calls == [("embed_texts", ["oi", "tchau"])]
+
+    so_imagem, _ = build_unified_a_embedder()
+    so_imagem([("image", "a.jpg")])
+    assert feitos[1].calls == [("embed_images", ["a.jpg"])]
+
+
+def test_unified_a_query_e_sempre_texto(monkeypatch):
+    """Recuperacao cross-modal: a consulta entra como texto no mesmo espaco."""
+    from ensemble.native.embedders import build_unified_a_embedder
+
+    feitos: list[_FakeQwen3VL] = []
+    _fake_qwen3vl(monkeypatch, feitos)
+
+    _, embed_query = build_unified_a_embedder()
+    consultas = embed_query(["orçamento da saúde"])
+
+    assert feitos[0].calls == [("embed_texts", ["orçamento da saúde"])]
+    assert consultas.shape == (1, DIM_A) and consultas.dtype == np.float32
 
 
 def test_imagem_e_video_compartilham_o_modelo_mas_sao_eixos_separados(monkeypatch):

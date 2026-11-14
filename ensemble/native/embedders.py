@@ -1,7 +1,8 @@
 """Builders de embedder nativos do ensemble v2 -- IMPORT TARDIO.
 
 Cada `build_*_embedder()` devolve `(embed_items, embed_query)`, ambos
-`Callable[[list[str]], np.ndarray]` -> `[n, d]` float32. Imports de torch/transformers/
+`Callable[[list[str]], np.ndarray]` -> `[n, d]` float32 -- menos o `unified_a`, cujo
+`embed_items` recebe pares `(rota, valor)` por ser multimodal. Imports de torch/transformers/
 sentence-transformers ficam DENTRO das funcoes (como `_build_embedder` do v1 e o
 `_build_retriever` do doc_specialist): importar este modulo nunca baixa checkpoint nem
 toca em GPU, entao os testes cobrem so a fiacao. Os modelos reais rodam no Slurm H100.
@@ -19,6 +20,10 @@ log = logging.getLogger(__name__)
 
 Embed = Callable[[list[str]], np.ndarray]
 EmbedderPair = tuple[Embed, Embed]
+# Excecao: o embedder de ITENS do baseline A recebe pares `(rota, valor)` -- ele e
+# multimodal (ver `ensemble/native/unified_a.py:a_route`). A query segue sendo texto.
+EmbedItemsA = Callable[[list[tuple[str, str]]], np.ndarray]
+EmbedderPairA = tuple[EmbedItemsA, Embed]
 
 TEXT_MODEL = "BAAI/bge-m3"
 IMAGE_MODEL = "google/siglip2-so400m-patch14-384"
@@ -114,23 +119,53 @@ def build_video_embedder() -> EmbedderPair:
     )
 
 
-def build_unified_a_embedder(adapter_path: str | None = None) -> EmbedderPair:
-    """Qwen3-VL-Embedding (A): items = representacao-A (texto), query = texto.
+def build_unified_a_embedder(adapter_path: str | None = None) -> EmbedderPairA:
+    """Qwen3-VL-Embedding (A): items MULTIMODAIS (rota por modalidade), query = texto.
+
+    O A e um unico espaco cosine onde imagem e texto convivem, entao o embedder de itens
+    recebe pares `(rota, valor)` (ver `ensemble/native/unified_a.py:a_route`) e roteia:
+    `"image"` -> `m.embed_images(caminhos)` (documento/imagem/video, cujo `a_repr` e um
+    caminho de arquivo) e `"text"` -> `m.embed_texts(textos)` (texto/audio-ASR). O
+    resultado e remontado na ORDEM DE ENTRADA -- `UnifiedRetrieverA` espera a linha `i`
+    no record `i`. Grupo vazio nao chama o modelo. A query e sempre texto (cross-modal).
 
     `adapter_path` carrega o adaptador LoRA do finetune denso (Semana 10) FUNDIDO na base
     -- e assim que o mesmo benchmark mede o A antes e depois do treino (ver
-    `finetune/eval_ensemble.py`). `None` = checkpoint publico, como sempre.
+    `finetune/eval_ensemble.py`); afeta os dois lados, itens-imagem inclusive. `None` =
+    checkpoint publico, como sempre.
     """
     from benchmark.models.qwen3vl_embed import Qwen3VLEmbedRetriever
 
     log.info("carregando %s%s", UNIFIED_A_MODEL,
              f" + adaptador {adapter_path}" if adapter_path else "")
     m = Qwen3VLEmbedRetriever(UNIFIED_A_MODEL, device="cuda", adapter_path=adapter_path)
-    enc = lambda texts: _f32(m.embed_texts(list(texts)))  # noqa: E731
-    return enc, enc
+
+    def embed_items(items: list[tuple[str, str]]) -> np.ndarray:
+        pares = list(items)
+        indices: dict[str, list[int]] = {"image": [], "text": []}
+        valores: dict[str, list[str]] = {"image": [], "text": []}
+        for i, (rota, valor) in enumerate(pares):
+            if rota not in indices:
+                raise ValueError(f"rota desconhecida: {rota!r} (esperado 'image'/'text')")
+            indices[rota].append(i)
+            valores[rota].append(valor)
+
+        encoders = {"image": m.embed_images, "text": m.embed_texts}
+        grupos = {rota: _f32(encoders[rota](valores[rota]))
+                  for rota in ("image", "text") if valores[rota]}
+        if not grupos:
+            return np.zeros((0, 0), dtype=np.float32)
+
+        dim = next(iter(grupos.values())).shape[1]  # mesmo espaco nos dois lados
+        saida = np.empty((len(pares), dim), dtype=np.float32)
+        for rota, vetores in grupos.items():
+            saida[indices[rota]] = vetores
+        return saida
+
+    return embed_items, (lambda texts: _f32(m.embed_texts(list(texts))))
 
 
-EMBEDDER_BUILDERS: dict[str, Callable[[], EmbedderPair]] = {
+EMBEDDER_BUILDERS: dict[str, Callable[[], EmbedderPair | EmbedderPairA]] = {
     "texto": build_text_embedder,
     "imagem": build_image_embedder,
     "audio": build_audio_embedder,

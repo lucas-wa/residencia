@@ -37,7 +37,8 @@ def unified_ndcg_at10(records, queries: dict[str, str], qrels: dict[str, set[str
 
     `records` sao os `PointerRecord` do corpus v4; `embed_items`/`embed_query` sao os
     mesmos callables que o `UnifiedRetrieverA` recebe no driver -- um duble
-    deterministico roda isto inteiro sem GPU.
+    deterministico roda isto inteiro sem GPU. Lembrando que o A e multimodal: o
+    `embed_items` recebe pares `(rota, valor)` (ver `ensemble/native/unified_a.py`).
 
     Criterio de "julgada" copiado do `ensemble/eval/run_eval.py` (linha `conjunto`):
     entra na media a query cujo conjunto-relevante e NAO-VAZIO, e o denominador e o

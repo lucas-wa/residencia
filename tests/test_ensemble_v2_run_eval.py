@@ -233,6 +233,11 @@ def _bow(texts: list[str]) -> np.ndarray:
     )
 
 
+def _bow_itens_a(pares: list[tuple[str, str]]) -> np.ndarray:
+    """`embed_items` do A: recebe `(rota, valor)` (o A roteia por modalidade)."""
+    return _bow([valor for _, valor in pares])
+
+
 class FakeColRetriever:
     """Duble de ColVisionRetriever: 1 token por query sobre vetores one-hot de pagina;
     ranqueia as paginas na ordem em que foram embutidas (determinista, sem torch)."""
@@ -279,13 +284,16 @@ def _insumos_main(tmp_path):
     def pair():
         return _bow, _bow
 
+    def pair_a():
+        return _bow_itens_a, _bow
+
     builders = {
         "documento": FakeColRetriever,
         "imagem": pair,
         "audio": pair,
         "texto": pair,
         "video": pair,
-        "unified_a": pair,
+        "unified_a": pair_a,
     }
     return corpus_path, queries_path, qrels_path, builders
 
@@ -345,13 +353,26 @@ def _spy_pair(registro: list, rotulo: str):
     return build
 
 
+def _spy_pair_a(registro: list, rotulo: str):
+    """Builder duble do A: os itens chegam como pares `(rota, valor)`."""
+
+    def build():
+        def embed_items(pares):
+            registro.append((rotulo, list(pares)))
+            return _bow_itens_a(pares)
+
+        return embed_items, _bow
+
+    return build
+
+
 def _builders_com_espioes(registro: list) -> dict:
     builders = {
         "documento": FakeColRetriever,
         "imagem": _spy_pair(registro, "imagem"),
         "texto": _spy_pair(registro, "texto"),
         "video": _spy_pair(registro, "video"),
-        "unified_a": _spy_pair(registro, "unified_a"),
+        "unified_a": _spy_pair_a(registro, "unified_a"),
         "audio": _spy_pair(registro, "audio-clap"),
         "audio_asr": _spy_pair(registro, "audio-asr"),
     }
