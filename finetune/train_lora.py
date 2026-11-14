@@ -60,6 +60,7 @@ Sem a flag do kind correspondente nao se avalia nada: os dois benchmarks custam 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import math
@@ -962,6 +963,19 @@ def train(cfg: TrainConfig, pairs: list[Pair] | None = None) -> Path:
     (out / "train_config.json").write_text(
         json.dumps(cfg.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
     log.info("adaptador salvo em %s", out)
+
+    # Libera o treino ANTES de quem vem depois: o hook de avaliacao antes/depois
+    # (`run_eval_depois`) carrega a base de novo -- duas vezes no caminho denso -- e o
+    # residuo reservado aqui (pesos + LoRA + os dois estados do AdamW) somaria ao pico.
+    # Numa L4 de 24 GB isso e a diferenca entre rodar e dar CUDA OOM. O `.cpu()` tira os
+    # tensores da GPU antes de soltar a referencia; `empty_cache` devolve ao driver os
+    # blocos que o allocator do torch mantinha reservados.
+    del enc, otim, sched
+    model = model.cpu()
+    del model, proc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return out
 
 

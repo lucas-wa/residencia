@@ -626,6 +626,49 @@ def test_batch_loss_late_interaction_aceita_batch_so_imagem(tmp_path):
     assert perda.ndim == 0 and torch.isfinite(perda)
 
 
+# -- treino (so a liberacao de memoria; nenhum passo real) ----------------------------
+
+
+def test_train_libera_o_modelo_da_gpu_antes_de_retornar(tmp_path, monkeypatch):
+    """Depois de salvar o adaptador, `train` solta modelo/otimizador e esvazia o cache.
+
+    Sem isso o residuo reservado do treino soma ao pico do hook de avaliacao antes/depois
+    (que carrega a base de novo, 2x) -- OOM na L4 de 24 GB. Aqui nao ha treino: o modelo
+    e um duble minimo e a lista de pares vai vazia, entao so a ordem salvar -> liberar e
+    exercitada.
+    """
+    torch = pytest.importorskip("torch")
+    eventos: list[str] = []
+
+    class _ModeloDuble(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = torch.nn.Linear(2, 2)
+
+        def cpu(self):
+            eventos.append("cpu")
+            return super().cpu()
+
+        def save_pretrained(self, path):
+            eventos.append("save")
+            Path(path).mkdir(parents=True, exist_ok=True)
+
+    modelo = _ModeloDuble()
+    monkeypatch.setattr(T, "missing_deps", lambda cfg, deps: [])
+    monkeypatch.setattr(T, "load_base_model", lambda cfg: (modelo, object()))
+    monkeypatch.setattr(T, "wrap_lora", lambda model, cfg: model)
+    monkeypatch.setattr(T, "build_encoder", lambda cfg, model, proc: object())
+    monkeypatch.setattr(T.gc, "collect", lambda: eventos.append("gc") or 0)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: eventos.append("empty_cache"))
+
+    cfg = T.resolve_config("qwen3vl", "lora", output_dir=str(tmp_path / "run"))
+    out = T.train(cfg, pairs=[])
+
+    assert out == tmp_path / "run" and (out / "train_config.json").is_file()
+    assert eventos == ["save", "cpu", "gc", "empty_cache"]
+
+
 # -- dry run --------------------------------------------------------------------------
 
 
