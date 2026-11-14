@@ -595,6 +595,37 @@ def test_batch_loss_dispatch_por_kind(tmp_path):
     assert tardio.vistos["images"] == list(batch.images)         # caminhos de imagem
 
 
+def test_batch_loss_late_interaction_recusa_item_nao_imagem(tmp_path):
+    """MaxSim exige batch so-imagem: um positivo-texto desalinharia o alvo `arange(B)`.
+
+    `batch.images` dropa silenciosamente o item de texto, entao os positivos deixariam de
+    ser as primeiras `n_pos` linhas de `d`. A guarda precisa vir ANTES do encoder -- por
+    isso o duble aqui e um `object()`, que explodiria com AttributeError se fosse tocado.
+    """
+    pytest.importorskip("torch")
+    texto = T.Pair(id="t0", query="o que o plano diz sobre creches?", pos_id="TX001",
+                   pos_image="", pos_modality="texto", pos_text="trecho do plano")
+    imagem = T.Pair(id="i0", query="qual a meta de saude?", pos_id="BR_p99",
+                    pos_image=str(tmp_path / "BR_p99.png"))
+    batch = T.make_batch([texto, imagem], max_neg=0)
+
+    with pytest.raises(ValueError, match="colqwen2.5") as erro:
+        T.batch_loss(T.resolve_config("colqwen2.5", "lora"), object(), batch)
+
+    assert "qwen3vl" in str(erro.value)                  # aponta a saida para pares de texto
+
+
+def test_batch_loss_late_interaction_aceita_batch_so_imagem(tmp_path):
+    """Regressao: com negativos-imagem (`max_neg > 0`) a guarda nao pode barrar o batch."""
+    torch = pytest.importorskip("torch")
+    batch = T.make_batch(T.load_pairs(_pairs_file(tmp_path, n=2)), max_neg=2)
+
+    perda = T.batch_loss(T.resolve_config("colqwen2.5", "lora"), _EncoderTardioDuble(), batch)
+
+    assert batch.n_neg > 0                               # negativos-imagem legitimos
+    assert perda.ndim == 0 and torch.isfinite(perda)
+
+
 # -- dry run --------------------------------------------------------------------------
 
 

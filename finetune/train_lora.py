@@ -871,6 +871,14 @@ def batch_loss(cfg: TrainConfig, encoder, batch: PairBatch):
         q = encoder.encode_queries(list(batch.queries))
         d = encoder.encode_items(list(batch.dense_items))
         return dense_infonce_loss(q, d, cfg.temperature)
+    # `batch.images` dropa calado o que nao e imagem: os positivos deixariam de ser as
+    # primeiras `n_pos` linhas de `d` e o alvo `arange(B)` da `contrastive_loss` sairia
+    # errado. Exige-se o batch inteiro (positivos E negativos) em imagem.
+    nao_imagem = len(batch.items) - len(batch.images)
+    if nao_imagem:
+        raise ValueError(f"base late-interaction ({cfg.spec.kind}) exige todos os itens do "
+                         f"batch como imagem; {nao_imagem} de {len(batch.items)} nao sao "
+                         f"(use --base qwen3vl para pares de texto)")
     q, q_mask = encoder.queries(list(batch.queries))
     d, d_mask = encoder.images(list(batch.images))
     return contrastive_loss(maxsim_scores(q, d, q_mask, d_mask), cfg.temperature)
