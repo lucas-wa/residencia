@@ -44,12 +44,22 @@ def _http_get(url: str, timeout: int = 30) -> str:
         return resp.read().decode("utf-8", errors="replace")
 
 
-def fetch_budget_articles(fontes: list[str], n: int = 20) -> list[PointerRecord]:
-    """Wrapper fino de rede: le feeds RSS (`fontes`), baixa as materias que citam orcamento.
+def fetch_budget_articles(
+    fontes: list[str], n: int = 20, keyword: str = _KEYWORD
+) -> list[PointerRecord]:
+    """Wrapper fino de rede: le feeds RSS (`fontes`) e baixa ate `n` materias.
+
+    Para cada feed: itera os `<item>`, dedup por `link`, baixa a materia e roda
+    `parse_article`. Falha de fetch/parse de um item e pulada, nao aborta.
+
+    Topicalidade: materias cujo titulo ou corpo citam `keyword` vem PRIMEIRO; se as
+    topicais nao chegarem a `n`, as demais (distratores) completam os slots. O filtro
+    so ORDENA -- nunca zera o yield.
 
     Nao coberto por teste de rede; roda na Task 9.
     """
-    out: list[PointerRecord] = []
+    topicais: list[PointerRecord] = []
+    distratores: list[PointerRecord] = []
     seen: set[str] = set()
     for feed in fontes:
         root = ET.fromstring(_http_get(feed))
@@ -63,9 +73,10 @@ def fetch_budget_articles(fontes: list[str], n: int = 20) -> list[PointerRecord]
                 rec = parse_article(_http_get(link), link)
             except Exception:
                 continue
-            if _KEYWORD not in (titulo + " " + rec.descriptor).lower():
-                continue
-            out.append(rec)
-            if len(out) >= n:
-                return out
-    return out
+            if keyword in (titulo + " " + rec.descriptor).lower():
+                topicais.append(rec)
+            else:
+                distratores.append(rec)
+            if len(topicais) >= n:
+                return topicais[:n]
+    return (topicais + distratores)[:n]
