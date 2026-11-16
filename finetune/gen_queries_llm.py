@@ -32,6 +32,7 @@ from finetune.make_pairs import (
     SEED,
     ChatFn,
     _resolve_out,
+    load_doc_filter,
     make_pairs,
 )
 
@@ -96,13 +97,28 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
+    # Split por DOCUMENTO (Semana 10): o treino exclui os docs de avaliacao e o conjunto
+    # sintetico de eval inclui SO eles. Um doc_id por linha, do jeito que o chamador
+    # derivou (ex.: `cut -f3 qrels_eval.tsv | sort -u`).
+    ap.add_argument("--include-docs", default=None,
+                    help="arquivo com um doc_id por linha: SO estes itens viram alvo positivo")
+    ap.add_argument("--exclude-docs", default=None,
+                    help="arquivo com um doc_id por linha: NENHUM deles vira alvo positivo")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    incluir = load_doc_filter(a.include_docs) if a.include_docs else None
+    excluir = load_doc_filter(a.exclude_docs) if a.exclude_docs else None
+    if incluir is not None:
+        log.info("recorte: %d doc(s) podem virar alvo positivo (--include-docs)", len(incluir))
+    if excluir is not None:
+        log.info("recorte: %d doc(s) BANIDOS como alvo positivo (--exclude-docs)", len(excluir))
 
     chat_fn = build_chat_fn(a.model, device=a.device, dtype=a.dtype,
                             max_new_tokens=a.max_new_tokens)
     linhas = make_pairs(records=a.records, out=a.out, k=a.k, neg=a.neg, limit=a.limit,
-                        force=a.force, seed=a.seed, generator_name="llm", chat_fn=chat_fn)
+                        force=a.force, seed=a.seed, generator_name="llm", chat_fn=chat_fn,
+                        include_docs=incluir, exclude_docs=excluir)
     print(f"{len(linhas)} pares em {_resolve_out(a.out)}")
 
 

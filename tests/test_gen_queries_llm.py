@@ -143,3 +143,58 @@ def test_chat_fn_do_runner_alimenta_o_backend_llm(fake_transformers):
 
     assert gen(ctx) == ["quais as propostas de saude do plano?",
                         "o plano preve creches em tempo integral?"]
+
+
+# -- CLI: o split por DOCUMENTO chega ao make_pairs ------------------------------------
+#
+# A VM deriva `eval_docs.txt` do qrels de avaliacao e chama este runner duas vezes: com
+# `--exclude-docs` (treino: nenhum doc de eval como positivo) e com `--include-docs` (o
+# conjunto sintetico de avaliacao, ancorado so neles).
+
+
+def _rodar_main(monkeypatch, *argv: str) -> dict:
+    """Roda `gen_queries_llm.main()` com o LLM e o make_pairs dublados; devolve os kwargs."""
+    import finetune.gen_queries_llm as G
+
+    recebidos: dict = {}
+
+    def falso_make_pairs(**kwargs):
+        recebidos.update(kwargs)
+        return []
+
+    monkeypatch.setattr(G, "build_chat_fn", lambda *a, **k: (lambda prompt: ""))
+    monkeypatch.setattr(G, "make_pairs", falso_make_pairs)
+    monkeypatch.setattr(sys, "argv", ["gen_queries_llm", *argv])
+    G.main()
+    return recebidos
+
+
+def test_main_sem_recorte_nao_filtra_nada(monkeypatch, tmp_path):
+    kwargs = _rodar_main(monkeypatch, "--records", "r.jsonl", "--out", str(tmp_path / "p.jsonl"))
+
+    assert kwargs["include_docs"] is None and kwargs["exclude_docs"] is None
+    assert kwargs["generator_name"] == "llm"
+
+
+def test_main_repassa_exclude_docs_como_conjunto(monkeypatch, tmp_path):
+    """Treino: os docs de avaliacao ficam BANIDOS como alvo positivo."""
+    docs = tmp_path / "eval_docs.txt"
+    docs.write_text("# do qrels\ndocumento-001\nvideo-003\n", encoding="utf-8")
+
+    kwargs = _rodar_main(monkeypatch, "--records", "r.jsonl",
+                         "--out", str(tmp_path / "p.jsonl"), "--exclude-docs", str(docs))
+
+    assert kwargs["exclude_docs"] == {"documento-001", "video-003"}
+    assert kwargs["include_docs"] is None
+
+
+def test_main_repassa_include_docs_como_conjunto(monkeypatch, tmp_path):
+    """Eval sintetico: SO os docs de avaliacao viram alvo positivo."""
+    docs = tmp_path / "eval_docs.txt"
+    docs.write_text("documento-001\n", encoding="utf-8")
+
+    kwargs = _rodar_main(monkeypatch, "--records", "r.jsonl",
+                         "--out", str(tmp_path / "p.jsonl"), "--include-docs", str(docs))
+
+    assert kwargs["include_docs"] == {"documento-001"}
+    assert kwargs["exclude_docs"] is None

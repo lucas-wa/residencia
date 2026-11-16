@@ -9,8 +9,10 @@ from finetune.make_pairs import (
     PageContext,
     build_query_prompt,
     contexts_from_records,
+    filter_contexts,
     llm_generate_queries,
     load_contexts,
+    load_doc_filter,
     make_pairs,
     plan_id_of,
     template_generate_queries,
@@ -368,6 +370,83 @@ def test_make_pairs_sem_corpus_nem_records_erra_claro():
         make_pairs()
 
     assert "records" in str(exc.value)
+
+
+# -- split por DOCUMENTO (--include-docs / --exclude-docs) -----------------------------
+#
+# O eval do v4 tem 7 queries humanas sobre 22 docs. Para que a historia de vazamento seja
+# limpa, NENHUM desses 22 pode ser alvo positivo de treino -- e o conjunto sintetico de
+# avaliacao e o recorte inverso (so eles). O que NAO se recorta e o pool de negativos: um
+# distrator nao carrega rotulo, e tirar metade do corpus de la so enfraqueceria o InfoNCE.
+
+
+def test_load_doc_filter_ignora_vazias_e_comentarios(tmp_path: Path):
+    arquivo = tmp_path / "eval_docs.txt"
+    arquivo.write_text("# docs do eval\ndocumento-001\n\n  video-003  \n", encoding="utf-8")
+
+    assert load_doc_filter(arquivo) == {"documento-001", "video-003"}
+
+
+def test_filter_contexts_sem_recorte_devolve_tudo():
+    ctxs = contexts_from_records(_records_v4())
+
+    assert [c.page_id for c in filter_contexts(ctxs)] == [c.page_id for c in ctxs]
+
+
+def test_filter_contexts_aplica_include_e_exclude_juntos():
+    ctxs = contexts_from_records(_records_v4())
+
+    recorte = filter_contexts(ctxs, include_docs={"documento-001", "video-003"},
+                              exclude_docs={"video-003"})
+
+    assert [c.page_id for c in recorte] == ["documento-001"]
+
+
+def test_make_pairs_exclude_docs_tira_o_doc_do_alvo_mas_nao_do_pool(tmp_path: Path):
+    """Nenhum doc de eval vira positivo -- e todos continuam disponiveis como negativo."""
+    records = tmp_path / "records.jsonl"
+    save_records(_records_v4(), records)
+    out = tmp_path / "pairs.jsonl"
+
+    linhas = make_pairs(records=records, out=out, generate_queries=_mock_gen(), k=1, neg=4,
+                        exclude_docs={"documento-001", "imagem-002"})
+
+    assert {r["pos_id"] for r in linhas} == {"video-003", "texto-004", "audio-005"}
+    # o pool NAO foi recortado: os dois banidos ainda aparecem como distratores
+    negativos = {n for r in linhas for n in r["neg_ids"]}
+    assert {"documento-001", "imagem-002"} <= negativos
+
+
+def test_make_pairs_include_docs_gera_so_sobre_os_docs_de_eval(tmp_path: Path):
+    """O conjunto SINTETICO de avaliacao: consultas ancoradas so nos docs julgados."""
+    records = tmp_path / "records.jsonl"
+    save_records(_records_v4(), records)
+
+    linhas = make_pairs(records=records, out=tmp_path / "syn.jsonl",
+                        generate_queries=_mock_gen(), k=2, neg=1,
+                        include_docs={"documento-001", "audio-005"})
+
+    assert {r["pos_id"] for r in linhas} == {"documento-001", "audio-005"}
+    assert len(linhas) == 4                           # k=2 consultas por doc
+
+
+def test_make_pairs_cli_le_os_arquivos_de_recorte(tmp_path: Path, monkeypatch):
+    """`--exclude-docs FILE` chega ao `make_pairs` como conjunto (um doc_id por linha)."""
+    import finetune.make_pairs as M
+
+    records = tmp_path / "records.jsonl"
+    save_records(_records_v4(), records)
+    excluir = tmp_path / "eval_docs.txt"
+    excluir.write_text("# derivado do qrels\ndocumento-001\n", encoding="utf-8")
+    out = tmp_path / "pairs.jsonl"
+
+    monkeypatch.setattr(M, "resolve_generator", lambda *a, **k: _mock_gen())
+    monkeypatch.setattr("sys.argv", ["make_pairs", "--records", str(records),
+                                     "--out", str(out), "--k", "1",
+                                     "--exclude-docs", str(excluir)])
+    M.main()
+
+    assert "documento-001" not in {r["pos_id"] for r in _read_pairs(out)}
 
 
 def test_make_pairs_injeta_o_chat_fn_no_gerador_llm(tmp_path: Path):

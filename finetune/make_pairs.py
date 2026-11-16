@@ -246,6 +246,36 @@ def _read_jsonl(path: Path) -> list[dict]:
     return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
 
+def load_doc_filter(path: str | Path) -> set[str]:
+    """Le um arquivo de `doc_id` por linha -> conjunto (ignora linha vazia e comentario).
+
+    E a entrada do split por DOCUMENTO: o chamador deriva a lista (ex.: `cut -f3` do qrels
+    de eval) e a passa a `make_pairs` como `include_docs`/`exclude_docs`.
+    """
+    linhas = Path(path).read_text(encoding="utf-8").splitlines()
+    return {ln.strip() for ln in linhas if ln.strip() and not ln.lstrip().startswith("#")}
+
+
+def filter_contexts(contexts: list[PageContext],
+                    include_docs: set[str] | None = None,
+                    exclude_docs: set[str] | None = None) -> list[PageContext]:
+    """Recorta por `doc_id` os itens que podem virar ALVO POSITIVO de um par.
+
+    Split por documento (Semana 10): `exclude_docs` = os docs do conjunto de avaliacao,
+    para que nenhum deles seja positivo de treino; `include_docs` = o recorte inverso,
+    usado para gerar consultas SINTETICAS so sobre os docs de eval. Os dois juntos valem
+    (o item precisa passar nas duas condicoes).
+
+    Quem chama isto recorta so os CONTEXTOS; o pool de negativos continua sendo o corpus
+    inteiro (ver `make_pairs`), senao o treino perderia metade dos distratores.
+    """
+    if include_docs is None and exclude_docs is None:
+        return list(contexts)
+    return [c for c in contexts
+            if (include_docs is None or c.page_id in include_docs)
+            and (exclude_docs is None or c.page_id not in exclude_docs)]
+
+
 def plan_id_of(page_id: str) -> str:
     """`BR001_p07` -> `BR001` (layout do build_planos_benchmark); senao, o proprio id."""
     head, sep, tail = page_id.rpartition("_p")
@@ -398,13 +428,19 @@ def make_pairs(corpus_dir: str | Path | None = None, out: str | Path = DEFAULT_O
                force: bool = False, seed: int = SEED,
                generator_name: str = "template",
                chat_fn: ChatFn | None = None,
-               records: str | Path | None = None) -> list[dict]:
+               records: str | Path | None = None,
+               include_docs: set[str] | None = None,
+               exclude_docs: set[str] | None = None) -> list[dict]:
     """Escreve `pairs.jsonl` com K consultas por item + `neg` negativos, e devolve as linhas.
 
     Cada item vira um par da SUA modalidade (pagina -> `pos_image`, texto -> `pos_text`).
 
     A entrada e `corpus_dir` (benchmark pt-BR) ou `records` (o `records.jsonl` do corpus
     v4, adaptado por `contexts_from_records`); informando os dois, `records` ganha.
+
+    `include_docs`/`exclude_docs` recortam quais itens viram ALVO POSITIVO (split por
+    documento, ver `filter_contexts`) -- o POOL de negativos continua sendo o corpus
+    inteiro, porque um distrator nao vaza rotulo nenhum.
 
     O gerador vem de `generate_queries` (um callable de um argumento, usado nos testes) ou,
     quando nao informado, de `generator_name` via `resolve_generator` -- que e onde o
@@ -426,6 +462,7 @@ def make_pairs(corpus_dir: str | Path | None = None, out: str | Path = DEFAULT_O
     out_path = _resolve_out(out)
     contexts = resolve_contexts(corpus_dir, records, k=k)
     pool = contexts                       # negativos saem do corpus inteiro, nao do recorte
+    contexts = filter_contexts(contexts, include_docs, exclude_docs)
     if limit:
         contexts = contexts[:limit]
 
@@ -489,11 +526,19 @@ def main():
     ap.add_argument("--generator", choices=sorted(GENERATORS), default="template",
                     help="backend de geracao de consultas (template = offline/deterministico; "
                          "llm exige um chat_fn ligado por um runner, nao roda pela CLI pura)")
+    ap.add_argument("--include-docs", default=None,
+                    help="arquivo com um doc_id por linha: SO estes itens viram alvo "
+                         "positivo (o pool de negativos continua sendo o corpus inteiro)")
+    ap.add_argument("--exclude-docs", default=None,
+                    help="arquivo com um doc_id por linha: NENHUM deles vira alvo positivo "
+                         "(split por documento: os docs do conjunto de avaliacao)")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     linhas = make_pairs(a.corpus, a.out, k=a.k, neg=a.neg, limit=a.limit, force=a.force,
-                        seed=a.seed, generator_name=a.generator, records=a.records)
+                        seed=a.seed, generator_name=a.generator, records=a.records,
+                        include_docs=load_doc_filter(a.include_docs) if a.include_docs else None,
+                        exclude_docs=load_doc_filter(a.exclude_docs) if a.exclude_docs else None)
     print(f"{len(linhas)} pares em {_resolve_out(a.out)}")
 
 

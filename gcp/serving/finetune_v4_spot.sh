@@ -9,9 +9,11 @@
 #   [3/9] espera o SSH e envia repo + scripts
 #   [4/9] bootstrap: untar do repo (o treino instala as deps sozinho; ver abaixo)
 #   [5/9] stage: baixa `records.jsonl`, `bin/` e os dois arquivos de eval do $GCS_CORPUS
-#   [6/9] pairs: `finetune.make_pairs` (gerador template, deterministico)
+#   [6/9] pairs: `finetune.make_pairs` (gerador template) ou, com --pairs-mode llm,
+#         `finetune.gen_queries_llm` com SPLIT POR DOCUMENTO + o eval sintetico
 #   [7/9] smoke: 2 passos reais com a VRAM instrumentada -- o gate e OOM-ou-nao
 #   [8/9] finetune: `finetune/run_gcp_finetune.sh` (nDCG@10 do A no v4 ANTES e DEPOIS)
+#         e, em --pairs-mode llm, a 2a medicao (conjunto sintetico) sobre o MESMO treino
 #   [9/9] sobe o adaptador PEFT + o log do treino para $GCS_OUT -- DA VM
 #   [trap] teardown: tenta o upload de novo, apaga a VM e ASSERTA que nada sobrou
 #
@@ -46,6 +48,9 @@
 #
 #   # ensaio completo, sem tocar a nuvem (nenhum gcloud e executado):
 #   bash gcp/serving/finetune_v4_spot.sh --gcs-out gs://residencia-511517-corpus-v4/finetune/qwen3vl-qlora --dry-run
+#
+#   # iteracao "pares via LLM + eval maior" (split por documento; ver o bloco PAIRS_MODE):
+#   bash gcp/serving/finetune_v4_spot.sh --gcs-out gs://.../qwen3vl-qlora-llm --pairs-mode llm
 #
 #   # rodada de verdade (L4 Spot; guarde a saida):
 #   bash gcp/serving/finetune_v4_spot.sh \
@@ -121,6 +126,31 @@ LORA_R="${LORA_R:-32}"
 # custava tempo: desligado, o gradiente volta E o treino acelera. 0 religa o checkpointing.
 NO_GRAD_CKPT="${NO_GRAD_CKPT:-1}"
 
+# -------------------------------------------------------------------------------------
+# PAIRS_MODE -- de onde vem o sinal de treino (e, de quebra, o 2o conjunto de avaliacao)
+#
+#   template (DEFAULT, o fluxo provado): `finetune.make_pairs` com o gerador
+#     deterministico sobre o corpus inteiro, e UMA avaliacao (as 7 queries humanas).
+#
+#   llm: `finetune.gen_queries_llm` (Qwen2.5-7B-Instruct) com SPLIT POR DOCUMENTO --
+#     a resposta as duas fraquezas da 1a rodada (loss do InfoNCE colapsando em poucos
+#     passos por memorizacao de 88 pares; e 7 queries de eval = intervalo largo):
+#
+#       EVAL_DOCS = os doc_id do qrels de eval (derivados NA VM do arquivo staged).
+#       treino    = consultas do LLM sobre os docs FORA de EVAL_DOCS (--exclude-docs):
+#                   nenhum doc de avaliacao e alvo positivo de treino.
+#       eval      = DOIS conjuntos, ambos ancorados so em EVAL_DOCS:
+#                   (1) ancora-ouro: as 7 queries humanas + seus 24 qrels (headline);
+#                   (2) SINTETICO: consultas do LLM sobre os 22 docs de eval
+#                       (--include-docs), ~k por doc -- N maior, CI menor.
+#
+#     A geracao roda em SUBPROCESSO que SAI antes do treino: os ~15GB do 7B saem da VRAM
+#     sozinhos, sem unload manual, e nao concorrem com o QLoRA.
+# -------------------------------------------------------------------------------------
+PAIRS_MODE="${PAIRS_MODE:-template}"            # template | llm
+GEN_K="${GEN_K:-3}"                             # consultas por doc na geracao por LLM
+GEN_MODEL="${GEN_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+
 DRY_RUN=0
 
 # -------------------------------------------------------------------------------------
@@ -157,6 +187,9 @@ while [ $# -gt 0 ]; do
         --batch-size)     BATCH_SIZE="$2"; shift 2 ;;
         --max-neg)        MAX_NEG="$2"; shift 2 ;;
         --lora-r)         LORA_R="$2"; shift 2 ;;
+        --pairs-mode)     PAIRS_MODE="$2"; shift 2 ;;
+        --gen-k)          GEN_K="$2"; shift 2 ;;
+        --gen-model)      GEN_MODEL="$2"; shift 2 ;;
         --no-grad-ckpt)   NO_GRAD_CKPT=1; shift ;;
         --grad-ckpt)      NO_GRAD_CKPT=0; shift ;;
         --dry-run)        DRY_RUN=1; shift ;;
@@ -386,6 +419,9 @@ BATCH_SIZE='$BATCH_SIZE'
 MAX_NEG='$MAX_NEG'
 LORA_R='$LORA_R'
 NO_GRAD_CKPT='$NO_GRAD_CKPT'
+PAIRS_MODE='$PAIRS_MODE'
+GEN_K='$GEN_K'
+GEN_MODEL='$GEN_MODEL'
 BRANCH='$BRANCH'
 ENV
 
@@ -393,7 +429,7 @@ ENV
 #!/usr/bin/env bash
 # Gerado por gcp/serving/finetune_v4_spot.sh -- roda DENTRO da VM L4. Fase em $1.
 set -euo pipefail
-FASE="${1:?uso: finetune_remote.sh <bootstrap|stage|pairs|smoke|finetune|upload>}"
+FASE="${1:?uso: finetune_remote.sh <bootstrap|stage|pairs|smoke|finetune|eval_syn|upload>}"
 # shellcheck disable=SC1091
 source "$HOME/finetune_env.sh"
 echo "=== [vm $(hostname)] fase=$FASE $(date) ==="
@@ -404,6 +440,15 @@ BIN_REL="$CORPUS_DIR/bin"
 QUERIES_REL="ensemble/eval/queries_v4.txt"
 QRELS_REL="ensemble/eval/qrels_v4.tsv"
 PAIRS_REL="finetune/data/pairs.jsonl"
+# Split por DOCUMENTO + eval sintetico (so em PAIRS_MODE=llm). `EVAL_DOCS_REL` e DERIVADO
+# do qrels staged -- nenhum arquivo de dados novo entra no repo nem no bucket.
+EVAL_DOCS_REL="finetune/data/eval_docs.txt"
+SYN_PAIRS_REL="finetune/data/pairs_eval_sintetico.jsonl"
+SYN_QUERIES_REL="finetune/data/queries_syn.txt"
+SYN_QRELS_REL="finetune/data/qrels_syn.tsv"
+# Venv que `finetune/run_gcp_finetune.sh` cria (mesmo default dele): a 2a medicao precisa
+# do torch/peft que estao LA, e nao no python do sistema.
+VENV_REL=".venv-gcp"
 # Onde `train_lora.py` grava quando `--output-dir` nao e passado (`DEFAULT_OUT` =
 # "finetune/runs", `out_path` = "<DEFAULT_OUT>/<base>-<metodo>"): e esta a arvore que a
 # fase `upload` sobe.
@@ -484,11 +529,128 @@ pairs)
     # antes do venv do treino existir. Deterministico e idempotente.
     cd "$REPO_DIR"
     python3 -c "import numpy" 2>/dev/null || python3 -m pip install --user -q numpy
-    echo "=== [pairs] $RECORDS_REL -> $PAIRS_REL (gerador template) ==="
-    PYTHONPATH="$REPO_DIR" python3 -m finetune.make_pairs \
-        --records "$RECORDS_REL" --out "$PAIRS_REL"
+
+    if [ "${PAIRS_MODE:-template}" != "llm" ]; then
+        echo "=== [pairs] $RECORDS_REL -> $PAIRS_REL (gerador template) ==="
+        PYTHONPATH="$REPO_DIR" python3 -m finetune.make_pairs \
+            --records "$RECORDS_REL" --out "$PAIRS_REL"
+        [ -s "$PAIRS_REL" ] || { echo "ERRO: $PAIRS_REL vazio" >&2; exit 1; }
+        echo "--- pares gerados: $(wc -l < "$PAIRS_REL") ---"
+        echo "=== pairs concluido $(date) ==="
+        exit 0          # guarda: o fluxo atual termina AQUI, intacto (uma fase por invocacao)
+    fi
+
+    # -- PAIRS_MODE=llm: split por documento + eval sintetico ---------------------------
+    # Deps do gerador. O DLVM pytorch normalmente ja traz transformers; quando nao traz,
+    # instala SEM `--no-deps`: o torch e EXTRA do transformers, nao dep core, entao o pip
+    # resolve so as deps pure-python (regex, filelock, requests, pyyaml, packaging, tqdm,
+    # tokenizers, safetensors, huggingface_hub) e NAO arrasta um torch proprio para
+    # ~/.local. Com `--no-deps` o import morria em `import regex as re`
+    # (transformers/utils/auto_docstring.py). Ja o accelerate HARD-depende de torch, logo
+    # nele o `--no-deps` fica -- mais `psutil`, a unica dep leve dele nao coberta pelo
+    # transformers --, protegendo o torch da imagem (a mesma armadilha que
+    # `prefer_host_torch` desfaz dentro do run_gcp_finetune.sh).
+    python3 -c "import transformers" 2>/dev/null \
+        || python3 -m pip install --user -q transformers
+    python3 -c "import accelerate" 2>/dev/null \
+        || python3 -m pip install --user -q --no-deps accelerate psutil
+    # jinja2 do host (DLVM) e 3.0.3; o `apply_chat_template` do tokenizer exige >=3.1.0
+    # (ImportError na geracao, DEPOIS de carregar o modelo). Guard por VERSAO, nao por import:
+    # o 3.0.3 importa, so e velho demais. user-site vence o dist-packages da imagem.
+    python3 -c "import jinja2; v=tuple(int(x) for x in jinja2.__version__.split('.')[:2]); exit(0 if v>=(3,1) else 1)" 2>/dev/null \
+        || python3 -m pip install --user -q "jinja2>=3.1.0"
+
+    # Reparo do torchaudio ABI-incompativel da imagem DLVM (pytorch-2-9-cu129), ESPELHO do
+    # `ensure_torchaudio` de finetune/run_gcp_finetune.sh. Duplicacao consciente
+    # (ref: run_gcp_finetune.sh:238 ensure_torchaudio): o caminho de treino ja esta provado
+    # e nao pode regredir por uma refatoracao para helper compartilhado.
+    # Sintoma: `OSError: .../torchaudio/lib/_torchaudio.abi3.so: undefined symbol:
+    # torch_library_impl`, disparado pelo transformers ao RESOLVER a classe do modelo em
+    # `AutoModelForCausalLM.from_pretrained`. A geracao roda no python do SISTEMA, ANTES do
+    # venv do treino -- isto e, antes do `ensure_torchaudio` que faria esse reparo --, por
+    # isso ele precisa acontecer aqui tambem. Sem venv, o pip e sempre `--user`: o user-site
+    # tem prioridade sobre o dist-packages quebrado da imagem.
+    if python3 -c "import torchaudio" 2>/dev/null; then
+        echo "--- torchaudio ok (sem reparo) ---"
+    else
+        echo "--- torchaudio nao importa (ABI incompativel?): reinstalando casado com o torch ---"
+        TA_VER="$(python3 -c "import torch;print(torch.__version__)" 2>/dev/null || true)"
+        TA_VER="${TA_VER%%+*}"
+        CU_RAW="$(python3 -c "import torch;print(torch.version.cuda or str())" 2>/dev/null || true)"
+        CU="cu${CU_RAW//./}"
+        if [ -z "$TA_VER" ]; then
+            echo "aviso: nao foi possivel reparar torchaudio (siga; o erro aparecera no load se for necessario)"
+        else
+            echo "--- pip install torchaudio==$TA_VER (index: $CU) ---"
+            python3 -m pip install --user -q --no-deps --force-reinstall "torchaudio==$TA_VER" \
+                    --index-url "https://download.pytorch.org/whl/$CU" \
+                && python3 -c "import torchaudio" 2>/dev/null \
+                && echo "--- torchaudio reparado (import ok) ---" \
+                || echo "aviso: nao foi possivel reparar torchaudio (siga; o erro aparecera no load se for necessario)"
+        fi
+    fi
+
+    # 1. EVAL_DOCS: os doc_id julgados do conjunto de avaliacao, DERIVADOS do qrels que o
+    #    `stage` baixou (3a coluna do TREC). Nenhum arquivo de dados novo foi criado.
+    #    O mkdir e necessario: quem cria `finetune/data/` no fluxo atual e o proprio
+    #    `make_pairs` (ele faz `parents=True` no `--out`), e aqui o awk escreve ANTES.
+    mkdir -p "$(dirname "$EVAL_DOCS_REL")"
+    awk '$0 !~ /^[[:space:]]*#/ && NF >= 3 {print $3}' "$QRELS_REL" | sort -u \
+        > "$EVAL_DOCS_REL"
+    [ -s "$EVAL_DOCS_REL" ] \
+        || { echo "ERRO: nenhum doc_id em $QRELS_REL -- o split por documento ficaria vazio" >&2; exit 1; }
+    echo "=== [pairs/llm] docs de AVALIACAO (banidos como alvo de treino): $(wc -l < "$EVAL_DOCS_REL") ==="
+
+    # 2. TREINO: consultas do LLM sobre os docs FORA de EVAL_DOCS. Subprocesso que SAI ao
+    #    final -- a VRAM do 7B volta inteira antes do smoke/treino, sem unload manual.
+    echo "=== [pairs/llm] treino: $RECORDS_REL (sem os docs de eval) -> $PAIRS_REL | k=$GEN_K modelo=$GEN_MODEL ==="
+    PYTHONPATH="$REPO_DIR" python3 -m finetune.gen_queries_llm \
+        --records "$RECORDS_REL" --out "$PAIRS_REL" --k "$GEN_K" --model "$GEN_MODEL" \
+        --exclude-docs "$EVAL_DOCS_REL"
     [ -s "$PAIRS_REL" ] || { echo "ERRO: $PAIRS_REL vazio" >&2; exit 1; }
-    echo "--- pares gerados: $(wc -l < "$PAIRS_REL") ---"
+    echo "--- pares de treino (LLM): $(wc -l < "$PAIRS_REL") ---"
+    # Guard do vazamento, agora sobre o ARQUIVO e nao sobre a intencao: nenhum pos_id dos
+    # pares de treino pode ser um doc de avaliacao.
+    PYTHONPATH="$REPO_DIR" python3 - "$PAIRS_REL" "$EVAL_DOCS_REL" <<'PY'
+import json, sys
+pares, docs = sys.argv[1], sys.argv[2]
+proibidos = {ln.strip() for ln in open(docs, encoding="utf-8") if ln.strip()}
+vazou = {json.loads(ln)["pos_id"] for ln in open(pares, encoding="utf-8") if ln.strip()}
+vazou &= proibidos
+if vazou:
+    raise SystemExit(f"ERRO: {len(vazou)} doc(s) de eval viraram positivo de treino: "
+                     f"{sorted(vazou)[:5]}")
+print("--- split por documento conferido: 0 doc de eval como positivo de treino ---")
+PY
+
+    # 3. EVAL SINTETICO: consultas do LLM sobre SO os docs de avaliacao (N maior, CI
+    #    menor). Cada consulta -> o doc que a gerou, com label 1.
+    echo "=== [pairs/llm] eval sintetico: so os docs de eval -> $SYN_PAIRS_REL | k=$GEN_K ==="
+    PYTHONPATH="$REPO_DIR" python3 -m finetune.gen_queries_llm \
+        --records "$RECORDS_REL" --out "$SYN_PAIRS_REL" --k "$GEN_K" --model "$GEN_MODEL" \
+        --include-docs "$EVAL_DOCS_REL"
+    [ -s "$SYN_PAIRS_REL" ] || { echo "ERRO: $SYN_PAIRS_REL vazio" >&2; exit 1; }
+
+    # 4. pairs.jsonl -> o par (queries.txt, qrels.tsv) que o hook de avaliacao le.
+    python3 - "$SYN_PAIRS_REL" "$SYN_QUERIES_REL" "$SYN_QRELS_REL" <<'PY'
+import json, sys
+pares, saida_queries, saida_qrels = sys.argv[1], sys.argv[2], sys.argv[3]
+linhas = {}
+for linha in open(pares, encoding="utf-8"):
+    if not linha.strip():
+        continue
+    r = json.loads(linha)
+    linhas[f"syn-{r['id']}"] = (r["query"], r["pos_id"])     # `id` ja e unico por par
+with open(saida_queries, "w", encoding="utf-8") as q, \
+     open(saida_qrels, "w", encoding="utf-8") as g:
+    for qid, (texto, pos_id) in linhas.items():
+        q.write(f"{qid}\t{texto}\n")
+        g.write(f"{qid}\t0\t{pos_id}\t1\n")
+print(f"--- eval sintetico: {len(linhas)} consultas sobre "
+      f"{len({p for _, p in linhas.values()})} doc(s) de avaliacao ---")
+PY
+    [ -s "$SYN_QUERIES_REL" ] && [ -s "$SYN_QRELS_REL" ] \
+        || { echo "ERRO: o eval sintetico saiu vazio" >&2; exit 1; }
     echo "=== pairs concluido $(date) ==="
     ;;
 
@@ -565,6 +727,45 @@ finetune)
     echo "--- antes/depois no log ---"
     grep -i "ndcg" "$TRAIN_LOG" || echo "    (nenhuma linha de nDCG no log: confira o hook de eval)"
     echo "=== finetune concluido $(date) ==="
+    ;;
+
+# =====================================================================================
+eval_syn)
+# =====================================================================================
+    # A 2a MEDICAO do MESMO adaptador (PAIRS_MODE=llm): nDCG@10 antes/depois no conjunto
+    # SINTETICO. O hook que o train_lora dispara so aceita um conjunto por treino, e
+    # treinar de novo so para medir o segundo seria pagar a GPU duas vezes pela mesma
+    # pergunta -- entao aqui e 1 TREINO, 2 MEDICOES: `finetune.eval_ensemble` roda a mesma
+    # funcao `run_ensemble_eval_before_after` sobre o adaptador ja salvo em disco.
+    #
+    # A saida e APENDADA ao $TRAIN_LOG, que a fase `upload` leva para o bucket: os dois
+    # deltas (ancora-ouro humana e sintetico) ficam no mesmo log da rodada.
+    cd "$REPO_DIR"
+    [ -s "$SYN_QUERIES_REL" ] && [ -s "$SYN_QRELS_REL" ] \
+        || { echo "ERRO: eval sintetico ausente -- rode a fase pairs com PAIRS_MODE=llm" >&2; exit 1; }
+    [ -d "$OUT_REL" ] \
+        || { echo "ERRO: $OUT_REL ausente -- sem adaptador nao ha 'depois' a medir" >&2; exit 1; }
+
+    # O torch/peft/Qwen3-VL estao no venv do treino, nao no python do sistema.
+    if [ -f "$VENV_REL/bin/activate" ]; then
+        # shellcheck disable=SC1091
+        source "$VENV_REL/bin/activate"
+    else
+        echo "--- aviso: $VENV_REL ausente; tentando no python do sistema ---" >&2
+    fi
+
+    echo "=== [eval_syn] 2a medicao (SINTETICO): $(wc -l < "$SYN_QUERIES_REL") queries sobre os docs de eval ===" \
+        | tee -a "$TRAIN_LOG"
+    PYTHONPATH="$REPO_DIR" HF_HOME="$HOME/.cache/huggingface" \
+        python3 -m finetune.eval_ensemble \
+            --corpus "$RECORDS_REL" --queries "$SYN_QUERIES_REL" --qrels "$SYN_QRELS_REL" \
+            --adapter "$OUT_REL" --base "$BASE" --method "$METHOD" \
+            --tag "sintetico (consultas do LLM -- NAO e o gabarito humano)" \
+        2>&1 | tee -a "$TRAIN_LOG"
+
+    echo "--- os DOIS antes/depois desta rodada (ancora-ouro humana + sintetico) ---"
+    grep -i "ndcg" "$TRAIN_LOG" || echo "    (nenhuma linha de nDCG no log)"
+    echo "=== eval_syn concluido $(date) ==="
     ;;
 
 # =====================================================================================
@@ -695,6 +896,11 @@ etapa "[1/9] finetune QLoRA do v4 | projeto=$PROJECT | vm=$VM ($PROVISIONING_MOD
 echo "    corpus de entrada (GCS): $GCS_CORPUS"
 echo "    saida no GCS:            ${GCS_OUT:-<VAZIO>}"
 echo "    treino: base=$BASE metodo=$METHOD epochs=$EPOCHS batch=$BATCH_SIZE max_neg=$MAX_NEG lora_r=$LORA_R no_grad_ckpt=$NO_GRAD_CKPT"
+echo "    pares:  pairs_mode=$PAIRS_MODE gen_k=$GEN_K gen_model=$GEN_MODEL"
+if [ "$PAIRS_MODE" = "llm" ]; then
+    echo "            split por documento: os docs do qrels de eval NAO viram positivo de treino"
+    echo "            avaliacao DUPLA: ancora-ouro (humana) + sintetica (LLM sobre os docs de eval)"
+fi
 echo "    disco=$BOOT_DISK_SIZE  maquina=$MACHINE_TYPE+$ACCELERATOR"
 echo "    corpus na VM:   $CORPUS_DIR (records.jsonl + bin/)"
 echo "    adaptador na VM: finetune/runs/$BASE-$METHOD"
@@ -756,6 +962,25 @@ done
 # Toggle, nao numero: `run_gcp_finetune.sh` so compara com "1", entao qualquer outro valor
 # (um "true", um "2") religaria o checkpointing EM SILENCIO -- e o treino morreria de novo
 # com o grad-detach do QLoRA. Melhor barrar aqui, antes da VM.
+# PAIRS_MODE decide a fase de pares INTEIRA na VM. Um valor errado so apareceria la,
+# depois da VM paga -- e o `case` remoto cairia no fluxo template em silencio, treinando
+# a rodada errada.
+case "$PAIRS_MODE" in
+    template|llm) ;;
+    *) echo "ERRO: PAIRS_MODE invalido: '$PAIRS_MODE' (use template ou llm)" >&2
+       echo "    template = gerador deterministico sobre o corpus inteiro (fluxo atual)" >&2
+       echo "    llm      = consultas do LLM com split por documento + eval sintetico" >&2
+       exit 2 ;;
+esac
+
+# GEN_K multiplica o custo da geracao (k consultas por doc, ~150 docs) -- um "0" produziria
+# zero pares e o treino so descobriria isso na VM.
+case "$GEN_K" in
+    ''|*[!0-9]*) echo "ERRO: GEN_K tem de ser inteiro >= 1 (recebido: '$GEN_K')" >&2; exit 2 ;;
+esac
+[ "$GEN_K" -ge 1 ] || { echo "ERRO: GEN_K tem de ser >= 1 (recebido: '$GEN_K')" >&2; exit 2; }
+[ -n "$GEN_MODEL" ] || { echo "ERRO: GEN_MODEL vazio (ex.: Qwen/Qwen2.5-7B-Instruct)" >&2; exit 2; }
+
 case "$NO_GRAD_CKPT" in
     0|1) ;;
     *) echo "ERRO: NO_GRAD_CKPT tem de ser 0 ou 1 (recebido: '$NO_GRAD_CKPT')" >&2
@@ -825,7 +1050,13 @@ echo "--- records.jsonl + bin/<eixo>/ + eval/{queries_v4.txt,qrels_v4.tsv} ---"
 gancho_de_falha stage
 remoto "bash ~/finetune_remote.sh stage"
 
-etapa "[6/9] pares de treino (finetune.make_pairs, gerador template)"
+if [ "$PAIRS_MODE" = "llm" ]; then
+    etapa "[6/9] pares de treino por LLM ($GEN_MODEL, k=$GEN_K) + eval sintetico"
+    echo "--- split por documento: EVAL_DOCS vem do qrels staged (cut da 3a coluna) ---"
+    echo "--- treino = docs FORA de EVAL_DOCS | eval sintetico = SO os docs de EVAL_DOCS ---"
+else
+    etapa "[6/9] pares de treino (finetune.make_pairs, gerador template)"
+fi
 remoto "bash ~/finetune_remote.sh pairs"
 
 etapa "[7/9] smoke de VRAM: 2 passos reais na L4 (gate de OOM antes do treino inteiro)"
@@ -834,6 +1065,15 @@ remoto "bash ~/finetune_remote.sh smoke"
 etapa "[8/9] finetune QLoRA na VM (o log traz o nDCG@10 do A no v4 ANTES e DEPOIS)"
 gancho_de_falha finetune
 remoto "bash ~/finetune_remote.sh finetune"
+
+# 2a MEDICAO do MESMO adaptador (1 treino, 2 medicoes) -- so no modo llm, que e quem
+# produz o conjunto sintetico. NAO-FATAL de proposito: perder a medicao extra nao pode
+# custar o upload do adaptador, que e o entregavel da rodada paga.
+if [ "$PAIRS_MODE" = "llm" ]; then
+    echo "--- [8/9b] 2a medicao: nDCG@10 antes/depois no conjunto SINTETICO ---"
+    remoto "bash ~/finetune_remote.sh eval_syn" \
+        || echo "--- aviso: a 2a medicao falhou; a ancora-ouro humana ja esta no log ---" >&2
+fi
 
 etapa "[9/9] persistindo o adaptador em $GCS_OUT (ANTES do teardown)"
 gancho_de_falha upload

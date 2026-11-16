@@ -187,3 +187,41 @@ def test_load_eval_data_le_corpus_queries_e_qrels(tmp_path):
     assert [r.id for r in records] == ["doc1", "img1", "aud1", "vid1"]
     assert qs == {"q1": "orcamento"}
     assert qr == {"q1": {"doc1"}}
+
+
+# -- CLI: a MESMA medicao fora do treino (1 treino, 2 medicoes) -------------------------
+#
+# O hook do `train_lora` mede UM conjunto por treino. A iteracao "pares via LLM + eval
+# maior" mede dois (ancora-ouro humana + sintetico) sobre o MESMO adaptador: o 2o conjunto
+# entra por esta CLI, com o adaptador ja salvo, em vez de uma 2a rodada paga de GPU.
+
+
+def test_main_mede_antes_e_depois_do_adaptador_ja_salvo(tmp_path, monkeypatch, capsys):
+    import ensemble.native.embedders as emb
+    from ensemble.records import save_records
+
+    construidos: list[str | None] = []
+
+    def fake_builder(adapter_path=None):
+        construidos.append(adapter_path)
+        return _bow_itens, (_bow if adapter_path else _bow_desalinhado)
+
+    monkeypatch.setattr(emb, "build_unified_a_embedder", fake_builder)
+    corpus = tmp_path / "records.jsonl"
+    save_records(_recs(), corpus)
+    queries = tmp_path / "queries_syn.txt"
+    queries.write_text("syn-1\torcamento\nsyn-2\tsaude\n", encoding="utf-8")
+    qrels = tmp_path / "qrels_syn.tsv"
+    qrels.write_text("syn-1\t0\tdoc1\t1\nsyn-2\t0\timg1\t1\n", encoding="utf-8")
+    adapter = tmp_path / "qwen3vl-qlora"
+    adapter.mkdir()
+
+    rc = E.main(["--corpus", str(corpus), "--queries", str(queries), "--qrels", str(qrels),
+                 "--adapter", str(adapter), "--tag", "sintetico"])
+
+    assert rc == 0
+    assert construidos == [None, str(adapter)]            # antes = base crua; depois = adaptador
+    linha = capsys.readouterr().out.strip()
+    assert "[sintetico]" in linha                         # rotulado como sintetico, nao ouro
+    assert "nDCG@10" in linha and "2 queries julgadas" in linha
+    assert "antes=0.6309 depois=1.0000 delta=+0.3691" in linha

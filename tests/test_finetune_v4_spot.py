@@ -11,6 +11,7 @@ e o TEARDOWN rodando em qualquer saida -- inclusive quando uma etapa falha no me
 (`FINETUNE_FAIL_AT`).
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -325,3 +326,258 @@ def test_no_grad_ckpt_invalido_e_fatal_no_preflight(tmp_path):
     assert "NO_GRAD_CKPT tem de ser 0 ou 1" in saida
     assert "instances create" not in saida
     assert not sentinela.exists()
+
+
+# -- PAIRS_MODE: pares por LLM + split por documento + eval duplo -----------------------
+#
+# A 1a rodada paga mostrou duas fraquezas: a loss do InfoNCE colapsando em poucos passos
+# (88 pares humanos num corpus de 150 = memorizacao) e 7 queries de eval (CI largo). O
+# modo `llm` ataca as duas -- consultas escritas pelo Qwen2.5-7B sobre os docs FORA do
+# eval, e um 2o conjunto de avaliacao sintetico sobre os 22 docs DE eval. O default
+# continua `template`: o fluxo provado nao pode mudar de comportamento por engano.
+
+
+def test_pairs_mode_default_e_template(tmp_path):
+    _, saida, _ = _rodada_completa(tmp_path)
+    assert "pairs_mode=template" in saida
+    assert "gerador template" in saida
+    # nenhuma fase nova aparece no fluxo provado
+    assert "finetune_remote.sh eval_syn" not in saida
+    assert "split por documento" not in saida
+
+
+def test_pairs_mode_llm_imprime_a_geracao_e_a_2a_medicao(tmp_path):
+    _, saida, _ = _rodada_completa(tmp_path, "--pairs-mode", "llm")
+    assert "pairs_mode=llm" in saida
+    assert "split por documento" in saida
+    assert "[6/9] pares de treino por LLM (Qwen/Qwen2.5-7B-Instruct, k=3)" in saida
+    assert "finetune_remote.sh eval_syn" in saida
+    # o treino continua sendo UM so: a 2a medicao nao e uma 2a rodada
+    assert saida.count("finetune_remote.sh finetune") == 1
+
+
+def test_pairs_mode_llm_nao_mexe_nas_fases_provadas(tmp_path):
+    """Aditivo: as 6 fases de sempre continuam todas la, na mesma ordem."""
+    _, saida, _ = _rodada_completa(tmp_path, "--pairs-mode", "llm")
+    posicoes = [saida.index(f"finetune_remote.sh {fase}") for fase in FASES_REMOTAS]
+    assert posicoes == sorted(posicoes)
+    assert saida.index("finetune_remote.sh eval_syn") < saida.index(
+        "finetune_remote.sh upload")
+
+
+def test_pairs_mode_invalido_e_fatal_no_preflight(tmp_path):
+    """Um valor errado cairia no `case` remoto em SILENCIO, treinando a rodada errada."""
+    proc, saida, sentinela = _rodar(tmp_path, "--gcs-out", GCS_OUT, "--pairs-mode", "xpto")
+    assert proc.returncode != 0
+    assert "PAIRS_MODE invalido" in saida
+    assert "instances create" not in saida
+    assert not sentinela.exists()
+
+
+@pytest.mark.parametrize("valor", ["0", "tres", ""])
+def test_gen_k_invalido_e_fatal_no_preflight(tmp_path, valor):
+    """k=0 produziria zero pares -- e so a VM paga descobriria isso."""
+    proc, saida, sentinela = _rodar(tmp_path, "--gcs-out", GCS_OUT, "--gen-k", valor)
+    assert proc.returncode != 0
+    assert "GEN_K tem de ser" in saida
+    assert not sentinela.exists()
+
+
+def test_o_env_gerado_leva_pairs_mode_gen_k_e_gen_model(tmp_path):
+    """A fase de pares roda NA VM: sem estas linhas ela cairia no fluxo template."""
+    env, _ = _scripts_remotos_gerados(tmp_path, "--pairs-mode", "llm",
+                                      "--gen-k", "4", "--gen-model", "Qwen/Outro-7B")
+    assert "PAIRS_MODE='llm'" in env
+    assert "GEN_K='4'" in env
+    assert "GEN_MODEL='Qwen/Outro-7B'" in env
+
+
+def test_a_fase_pairs_deriva_os_docs_de_eval_do_qrels_staged(tmp_path):
+    """EVAL_DOCS sai da 3a coluna do qrels que o `stage` baixou: nenhum dado novo."""
+    _, remoto = _scripts_remotos_gerados(tmp_path)
+    assert '"$QRELS_REL" | sort -u' in remoto
+    assert 'EVAL_DOCS_REL="finetune/data/eval_docs.txt"' in remoto
+
+
+def test_a_fase_pairs_llm_separa_treino_e_eval_por_documento(tmp_path):
+    """Treino: tudo MENOS os docs de eval. Eval sintetico: SO os docs de eval."""
+    _, remoto = _scripts_remotos_gerados(tmp_path)
+    bloco = remoto[remoto.index("PAIRS_MODE:-template"):remoto.index("smoke)")]
+    treino = bloco[bloco.index('--out "$PAIRS_REL" --k'):]
+    assert '--exclude-docs "$EVAL_DOCS_REL"' in treino
+    sintetico = bloco[bloco.index('--out "$SYN_PAIRS_REL"'):]
+    assert '--include-docs "$EVAL_DOCS_REL"' in sintetico
+    # os dois sao SUBPROCESSOS que saem: a VRAM do 7B volta inteira antes do treino
+    assert bloco.count("python3 -m finetune.gen_queries_llm") == 2
+
+
+def test_a_fase_pairs_llm_repara_o_torchaudio_antes_de_carregar_o_gerador(tmp_path):
+    """O torchaudio da DLVM e ABI-incompativel; sem reparo, o transformers morre com
+    `undefined symbol: torch_library_impl` ao resolver a classe do modelo. A geracao roda
+    antes do venv do treino, entao o reparo (espelho do ensure_torchaudio) tem de estar
+    aqui -- e ANTES da 1a chamada do gerador."""
+    _, remoto = _scripts_remotos_gerados(tmp_path)
+    bloco = remoto[remoto.index("PAIRS_MODE:-template"):remoto.index("smoke)")]
+    reparo = bloco.index('python3 -c "import torchaudio"')
+    assert reparo < bloco.index("python3 -m finetune.gen_queries_llm")
+    assert '"torchaudio==$TA_VER"' in bloco
+    assert "--index-url" in bloco and "--force-reinstall" in bloco
+    assert "--user" in bloco[reparo:]                  # sem venv: user-site vence o dist-packages
+
+
+def test_a_2a_medicao_reusa_o_hook_sem_retreinar(tmp_path):
+    """1 treino, 2 medicoes: a fase `eval_syn` mede o adaptador JA salvo em disco."""
+    fonte = SCRIPT.read_text(encoding="utf-8")
+    bloco = fonte[fonte.index("\neval_syn)"):fonte.index("\nupload)")]
+    assert "python3 -m finetune.eval_ensemble" in bloco
+    assert "run_gcp_finetune.sh" not in bloco          # nao ha 2o treino
+    assert '--adapter "$OUT_REL"' in bloco
+    assert '--qrels "$SYN_QRELS_REL"' in bloco
+    assert "sintetico" in bloco                        # rotulado, nao confundido com o ouro
+    assert 'tee -a "$TRAIN_LOG"' in bloco              # os 2 deltas no log que sobe ao GCS
+
+
+def test_a_2a_medicao_nao_pode_custar_o_upload_do_adaptador(tmp_path):
+    """Perder a medicao extra e barato; perder o adaptador de uma rodada paga, nao."""
+    fonte = SCRIPT.read_text(encoding="utf-8")
+    # o `|| echo` tem de estar ANTES da etapa seguinte (a do upload), senao uma falha da
+    # medicao extra derrubaria a rodada com `set -e` e o adaptador morreria com a VM
+    chamada = fonte[fonte.index('remoto "bash ~/finetune_remote.sh eval_syn"'):]
+    ate_a_proxima_etapa = chamada[:chamada.index("etapa ")]
+    assert "|| echo" in ate_a_proxima_etapa
+    assert "a 2a medicao falhou" in ate_a_proxima_etapa
+
+
+# -- a fase `pairs` do modo llm, EXECUTADA de verdade (sem LLM, sem nuvem) --------------
+#
+# O awk que deriva os docs de eval, o guard anti-vazamento e a conversao
+# pairs.jsonl -> (queries_syn.txt, qrels_syn.tsv) sao codigo que so roda NA VM. Aqui eles
+# rodam na maquina de quem revisa: o unico duble e o `python3 -m finetune.gen_queries_llm`
+# (que carregaria 15GB de Qwen2.5-7B); todo o resto -- awk, sort, o python inline -- e o
+# codigo de verdade.
+
+_STUB_PYTHON = """#!/usr/bin/env bash
+# Duble do gerador por LLM; qualquer outro comando vai para o python REAL.
+case "$*" in
+    # torchaudio entra aqui para que o reparo ABI (espelho do ensure_torchaudio) seja
+    # PULADO no teste: reparar de verdade exigiria rede e o indice do pytorch.
+    *"import transformers"*|*"import accelerate"*|*"import torchaudio"*) exit 0 ;;
+    *finetune.gen_queries_llm*) ;;
+    *) exec "$REAL_PYTHON" "$@" ;;
+esac
+out=""; tipo=""; filtro=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --out) out="$2"; shift 2 ;;
+        --include-docs) tipo="include"; filtro="$2"; shift 2 ;;
+        --exclude-docs) tipo="exclude"; filtro="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+mkdir -p "$(dirname "$out")"
+: > "$out"
+for id in documento-001 video-003 texto-004; do
+    if [ "${STUB_VAZA:-0}" != "1" ]; then
+        if [ "$tipo" = "include" ] && ! grep -qxF "$id" "$filtro"; then continue; fi
+        if [ "$tipo" = "exclude" ] && grep -qxF "$id" "$filtro"; then continue; fi
+    fi
+    printf '{"id": "%s-q1", "query": "o que diz %s?", "pos_id": "%s"}\n' \
+        "$id" "$id" "$id" >> "$out"
+done
+"""
+
+# qrels de avaliacao no formato que o `stage` baixa: TREC 4 colunas, com repeticao de doc
+# (2 queries sobre o mesmo documento) e uma linha de comentario.
+QRELS_EVAL = ("# gabarito humano\n"
+              "q01\t0\tdocumento-001\t1\n"
+              "q01\t0\tvideo-003\t1\n"
+              "q02\t0\tdocumento-001\t1\n")
+
+
+def _escrever_sh(destino: Path, texto: str) -> Path:
+    """Escreve um .sh com LF (no Windows o write_text poria CRLF e o bash engasgaria)."""
+    destino.write_bytes(texto.encode("utf-8"))
+    destino.chmod(0o755)
+    return destino
+
+
+def _vm_de_mentira(tmp_path: Path, **env_extra) -> tuple[Path, dict]:
+    """Monta um `$HOME` com o finetune_remote.sh GERADO e um repo minimo. Devolve (home, env)."""
+    import sys
+
+    gerados = tmp_path / "gerados"
+    gerados.mkdir()
+    _, remoto_txt = _scripts_remotos_gerados(gerados, "--pairs-mode", "llm")
+
+    home = tmp_path / "home"
+    repo = home / "residencia"
+    (repo / "ensemble" / "eval").mkdir(parents=True)
+    (repo / "data" / "govexe" / "ensemble_orcamento_v4").mkdir(parents=True)
+    (repo / "ensemble" / "eval" / "qrels_v4.tsv").write_text(QRELS_EVAL, encoding="utf-8")
+    (repo / "data" / "govexe" / "ensemble_orcamento_v4" / "records.jsonl").write_text(
+        "", encoding="utf-8")
+    _escrever_sh(home / "finetune_remote.sh", remoto_txt)
+    _escrever_sh(home / "finetune_env.sh", "\n".join([
+        "PROJECT='p'", "GCS_CORPUS='gs://c'", "GCS_OUT='gs://o'",
+        "CORPUS_DIR='data/govexe/ensemble_orcamento_v4'",
+        "BASE='qwen3vl'", "METHOD='qlora'", "EPOCHS='1'", "BATCH_SIZE='1'",
+        "MAX_NEG='1'", "LORA_R='32'", "NO_GRAD_CKPT='1'",
+        "PAIRS_MODE='llm'", "GEN_K='1'", "GEN_MODEL='Qwen/Duble'", "BRANCH='b'", ""]))
+
+    binario = tmp_path / "bin_stub"
+    binario.mkdir()
+    _escrever_sh(binario / "python3", _STUB_PYTHON)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{binario.as_posix()}{os.pathsep}{env.get('PATH', '')}"
+    env["HOME"] = home.as_posix()
+    env["REAL_PYTHON"] = sys.executable
+    env.update(env_extra)
+    return home, env
+
+
+def _rodar_fase_pairs(home: Path, env: dict):
+    return subprocess.run([BASH, str(home / "finetune_remote.sh"), "pairs"],
+                          cwd=str(home), env=env, capture_output=True, text=True,
+                          timeout=180)
+
+
+def test_fase_pairs_llm_produz_treino_sem_os_docs_de_eval_e_o_eval_sintetico(tmp_path):
+    home, env = _vm_de_mentira(tmp_path)
+
+    proc = _rodar_fase_pairs(home, env)
+
+    saida = proc.stdout + proc.stderr
+    assert proc.returncode == 0, saida
+    dados = home / "residencia" / "finetune" / "data"
+    # EVAL_DOCS: 3a coluna do qrels, unica e ordenada (o comentario nao entra)
+    assert (dados / "eval_docs.txt").read_text(encoding="utf-8").split() == [
+        "documento-001", "video-003"]
+    # treino: so o doc que NAO esta no eval
+    treino = [json.loads(ln) for ln in
+              (dados / "pairs.jsonl").read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert {r["pos_id"] for r in treino} == {"texto-004"}
+    assert "0 doc de eval como positivo de treino" in saida
+    # eval sintetico: SO os docs do gabarito, em queries.txt + qrels TREC de 4 colunas
+    queries = (dados / "queries_syn.txt").read_text(encoding="utf-8").splitlines()
+    qrels = [ln.split("\t") for ln in
+             (dados / "qrels_syn.tsv").read_text(encoding="utf-8").splitlines()]
+    assert [ln.split("\t")[0] for ln in queries] == ["syn-documento-001-q1",
+                                                     "syn-video-003-q1"]
+    assert [ln.split("\t")[1] for ln in queries] == ["o que diz documento-001?",
+                                                     "o que diz video-003?"]
+    assert qrels == [["syn-documento-001-q1", "0", "documento-001", "1"],
+                     ["syn-video-003-q1", "0", "video-003", "1"]]
+
+
+def test_fase_pairs_llm_aborta_se_um_doc_de_eval_virar_positivo_de_treino(tmp_path):
+    """O guard e sobre o ARQUIVO, nao sobre a intencao: se o recorte falhar, a fase para."""
+    home, env = _vm_de_mentira(tmp_path, STUB_VAZA="1")
+
+    proc = _rodar_fase_pairs(home, env)
+
+    saida = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "doc(s) de eval viraram positivo de treino" in saida
+    # parou ANTES de gerar o conjunto sintetico (e antes de qualquer minuto de treino)
+    assert not (home / "residencia" / "finetune" / "data" / "queries_syn.txt").exists()

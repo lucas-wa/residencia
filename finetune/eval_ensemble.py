@@ -28,7 +28,8 @@ log = logging.getLogger(__name__)
 # Corte do nDCG reportado no antes/depois (o maior corte do CSV do driver).
 NDCG_K = 10
 
-__all__ = ["NDCG_K", "unified_ndcg_at10", "load_eval_data", "run_ensemble_eval_before_after"]
+__all__ = ["NDCG_K", "unified_ndcg_at10", "load_eval_data",
+           "run_ensemble_eval_before_after", "main"]
 
 
 def unified_ndcg_at10(records, queries: dict[str, str], qrels: dict[str, set[str]], *,
@@ -130,3 +131,46 @@ def run_ensemble_eval_before_after(cfg, adapter_dir, records, queries,
     log.info("[eval ensemble] nDCG@%d antes=%.4f depois=%.4f delta=%+.4f (%d queries)",
              NDCG_K, antes, depois, depois - antes, julgadas)
     return resultado
+
+
+# -- CLI: a MESMA medicao, fora do treino ----------------------------------------------
+#
+# `train_lora.py` ja dispara este hook no fim do treino, mas so para UM conjunto de
+# avaliacao. A iteracao da Semana 10 mede dois (a ancora-ouro humana e o conjunto
+# SINTETICO de N maior) sobre o MESMO adaptador: treinar duas vezes seria pagar a GPU
+# duas vezes para responder a mesma pergunta. Entao o 2o conjunto entra por aqui, com o
+# adaptador ja salvo em disco -- 1 treino, 2 medicoes.
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`python -m finetune.eval_ensemble --corpus ... --queries ... --qrels ... --adapter ...`"""
+    import argparse
+    from types import SimpleNamespace
+
+    ap = argparse.ArgumentParser(
+        description="nDCG@10 do retriever A no v4, ANTES e DEPOIS de um adaptador ja salvo.")
+    ap.add_argument("--corpus", required=True, help="records.jsonl do corpus v4")
+    ap.add_argument("--queries", required=True, help="queries do conjunto (qid<TAB>texto)")
+    ap.add_argument("--qrels", required=True, help="qrels TREC do conjunto (4 colunas)")
+    ap.add_argument("--adapter", required=True,
+                    help="diretorio do adaptador PEFT (o 'depois'; o 'antes' e a base crua)")
+    ap.add_argument("--tag", default="",
+                    help="rotulo do conjunto no log (ex.: sintetico) -- so apresentacao")
+    ap.add_argument("--base", default="qwen3vl")
+    ap.add_argument("--method", default="qlora")
+    a = ap.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    records, queries, qrels = load_eval_data(a.corpus, a.queries, a.qrels)
+    cfg = SimpleNamespace(base=a.base, method=a.method)
+    res = run_ensemble_eval_before_after(cfg, a.adapter, records, queries, qrels)
+
+    rotulo = f" [{a.tag}]" if a.tag else ""
+    print(f"[eval ensemble{rotulo}] nDCG@{NDCG_K} antes={res['antes']:.4f} "
+          f"depois={res['depois']:.4f} delta={res['delta']:+.4f} "
+          f"({res['n_queries']} queries julgadas)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
