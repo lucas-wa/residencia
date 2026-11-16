@@ -772,3 +772,283 @@ def test_delete_que_falha_de_verdade_continua_retentando(tmp_path):
     assert len([ln for ln in chamadas.splitlines() if "instances delete" in ln]) == 2
     assert "tentativa 1 falhou" in saida
     assert "FALHOU em 2 tentativas" in saida
+
+
+# -- EVAL-ONLY: a 2a medicao sem repagar o treino ---------------------------------------
+#
+# O adaptador do objetivo #2 ja esta no bucket; o que faltava era a medicao no conjunto
+# SINTETICO, que morreu duas vezes como cauda de um treino de ~3h. Com `--eval-only` a
+# rodada baixa o adaptador do GCS, regenera so o sintetico e mede os DOIS conjuntos num
+# passo so (CLI `multi`). O que estes testes guardam e (1) que a sequencia curta nao passa
+# pelo treino, (2) que a sequencia LONGA continua exatamente como era.
+
+FASES_EVAL_ONLY = ("bootstrap", "stage", "pairs", "fetch_adapter", "eval_multi", "upload")
+
+
+def _so_codigo(trecho: str) -> str:
+    """Tira as linhas de comentario: as negativas valem sobre o CODIGO, nao sobre a prosa."""
+    return "\n".join(ln for ln in trecho.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def test_eval_only_roda_a_sequencia_curta_e_pula_o_treino(tmp_path):
+    """(a) stage -> pairs -> fetch_adapter -> eval_multi -> upload, sem smoke nem finetune."""
+    _, saida, _ = _rodada_completa(tmp_path, "--pairs-mode", "llm", "--eval-only")
+    posicoes = [saida.index(f"finetune_remote.sh {fase}") for fase in FASES_EVAL_ONLY]
+    assert posicoes == sorted(posicoes), f"fases fora de ordem: {FASES_EVAL_ONLY}"
+    # o treino inteiro fica de fora: e exatamente o que esta rodada nao quer repagar
+    for fase in ("smoke", "finetune", "eval_syn"):
+        assert f"finetune_remote.sh {fase}" not in saida, f"fase '{fase}' nao devia rodar"
+    assert "EVAL-ONLY (eval_only=1)" in saida
+    # o teardown anti-leak continua valendo igual
+    assert "conferencia ok: nenhuma VM sobrou" in saida
+
+
+def test_eval_only_sobe_so_o_log_e_nao_re_envia_o_adaptador(tmp_path):
+    """O adaptador VEIO do bucket: re-subi-lo so arriscaria sobrescrever o entregavel."""
+    _, saida, _ = _rodada_completa(tmp_path, "--pairs-mode", "llm", "--eval-only")
+    assert "eval_syn_multi.log" in saida
+    assert "rsync -r <finetune/runs/qwen3vl-qlora>" not in saida
+
+    _, remoto = _scripts_remotos_gerados(tmp_path, "--pairs-mode", "llm", "--eval-only")
+    bloco = remoto[remoto.index("\nupload)"):remoto.index("\nfetch_adapter)")]
+    guarda = bloco[bloco.index('EVAL_ONLY:-0'):bloco.index("exit 0")]
+    assert 'gcloud storage cp "$EVAL_LOG" "$GCS_OUT/eval_syn_multi.log"' in guarda
+    assert "rsync" not in guarda
+
+
+def test_fetch_adapter_baixa_o_adaptador_do_adapter_uri_sem_treinar(tmp_path):
+    """(b) o `depois` vem do GCS, nao de uma GPU: `rsync` de $ADAPTER_URI para $OUT_REL."""
+    _, remoto = _scripts_remotos_gerados(tmp_path, "--pairs-mode", "llm", "--eval-only")
+    bloco = remoto[remoto.index("\nfetch_adapter)"):remoto.index("\neval_multi)")]
+    assert 'gcloud storage rsync -r "$ADAPTER_URI" "$OUT_REL"' in bloco
+    assert "--project=" in bloco
+    # so o CODIGO conta: os comentarios CITAM o run_gcp_finetune.sh para explicar por que
+    # ele nao e invocado aqui (e quem, no fluxo normal, montaria o venv)
+    assert "run_gcp_finetune.sh" not in _so_codigo(bloco)   # nao ha treino nenhum aqui
+    # prefixo errado => rsync devolve 0 com diretorio vazio: a fase tem de gritar
+    assert "adaptador nao baixou de $ADAPTER_URI" in bloco
+
+
+def test_fetch_adapter_monta_o_venv_que_o_eval_vai_usar(tmp_path):
+    """Sem smoke/finetune, NINGUEM monta o `.venv-gcp` -- e o eval cairia no python do
+    sistema da DLVM, que tem torch mas nao tem peft: ImportError com a L4 ja paga.
+
+    O bloco e o do bootstrap de `api_demo_spot.sh` (que carrega Qwen3-VL+peft sem treinar,
+    o mesmo problema): venv `--system-site-packages`, `requirements-slurm.txt` com marcador
+    por hash, e o guard "preferir o torch da imagem".
+    """
+    _, remoto = _scripts_remotos_gerados(tmp_path, "--pairs-mode", "llm", "--eval-only")
+    bloco = remoto[remoto.index("\nfetch_adapter)"):remoto.index("\neval_multi)")]
+    assert 'python3 -m venv --system-site-packages "$VENV_REL"' in bloco
+    assert "pip install --quiet -r requirements-slurm.txt" in bloco
+    assert ".residencia_deps_$REQ_HASH" in bloco            # nao reinstala a cada rodada
+    # `api/requirements.txt` pina transformers<4.51 e rebaixaria o Qwen3-VL-Embedding
+    # (o comentario do bloco o cita justamente para dizer que NAO e ele)
+    assert "api/requirements.txt" not in _so_codigo(bloco)
+    # guard `prefer_host_torch`: um torch do pip sombrearia o torch+CUDA da imagem
+    assert 'for _sp in "$TORCH_ROOT"/lib/python*/site-packages' in bloco
+    assert "import torch; print('torch'" in bloco
+    # e continua sem treinar
+    assert "run_gcp_finetune.sh" not in _so_codigo(bloco)
+
+    # a fase `eval_multi` so ATIVA o venv: quem o constroi e a `fetch_adapter`, que o
+    # orquestrador dispara antes dela
+    eval_multi = remoto[remoto.index("\neval_multi)"):remoto.index("\n*)")]
+    assert 'source "$VENV_REL/bin/activate"' in eval_multi
+    assert "python3 -m venv" not in eval_multi
+
+
+# Dubles da fase `fetch_adapter` EXECUTADA: o `gcloud` materializa o adaptador (e grava a
+# chamada), e o `python3` responde pelo venv/pip/import torch -- criar o venv de verdade
+# instalaria `requirements-slurm.txt` pela rede, que e justamente o que nao pode acontecer
+# num teste. O resto (mkdir, os guards, o `for _sp`, o marcador por hash) e codigo de verdade.
+_GCLOUD_TRAZ_O_ADAPTADOR = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$GCLOUD_LOG"
+if [ "$2" = "rsync" ]; then
+    destino="${5:-}"
+    if [ "${ADAPTADOR_VAZIO:-0}" != "1" ]; then
+        mkdir -p "$destino"; printf '{}\\n' > "$destino/adapter_config.json"
+    fi
+fi
+exit 0
+"""
+
+_PYTHON_DO_VENV = """#!/usr/bin/env bash
+case "$*" in
+    *"-m venv"*)
+        alvo="${!#}"
+        mkdir -p "$alvo/bin" "$alvo/lib/python3.13/site-packages/torch"
+        printf '#!/usr/bin/env bash\\nVIRTUAL_ENV="%s"\\nexport VIRTUAL_ENV\\n' \\
+            "$(pwd)/$alvo" > "$alvo/bin/activate"
+        exit 0 ;;
+    *"-m pip"*)        printf '%s\\n' "$*" >> "$PIP_LOG"; exit 0 ;;
+    *"import torch"*)  echo "torch 2.9.0 /opt/conda/lib/python3.13/site-packages/torch/__init__.py"; exit 0 ;;
+    *)                 exit 0 ;;
+esac
+"""
+
+
+def _vm_de_mentira_eval_only(tmp_path: Path, **env_extra) -> tuple[Path, dict]:
+    """`$HOME` minimo para rodar a fase `fetch_adapter` sem nuvem e sem instalar nada."""
+    gerados = tmp_path / "gerados"
+    gerados.mkdir()
+    _, remoto_txt = _scripts_remotos_gerados(gerados, "--pairs-mode", "llm", "--eval-only")
+
+    home = tmp_path / "home"
+    repo = home / "residencia"
+    repo.mkdir(parents=True)
+    (repo / "requirements-slurm.txt").write_text("transformers>=4.57,<5\n", encoding="utf-8")
+    _escrever_sh(home / "finetune_remote.sh", remoto_txt)
+    _escrever_sh(home / "finetune_env.sh", "\n".join([
+        "PROJECT='p'", "GCS_CORPUS='gs://c'", "GCS_OUT='gs://o'",
+        "CORPUS_DIR='data/govexe/ensemble_orcamento_v4'",
+        "BASE='qwen3vl'", "METHOD='qlora'", "EPOCHS='1'", "BATCH_SIZE='1'",
+        "MAX_NEG='1'", "LORA_R='32'", "NO_GRAD_CKPT='1'",
+        "PAIRS_MODE='llm'", "GEN_K='1'", "GEN_MODEL='Qwen/Duble'",
+        "EVAL_ONLY='1'", "ADAPTER_URI='gs://bucket-de-teste/finetune/adapter'",
+        "BRANCH='b'", ""]))
+
+    binario = tmp_path / "bin_stub"
+    binario.mkdir()
+    _escrever_sh(binario / "gcloud", _GCLOUD_TRAZ_O_ADAPTADOR)
+    _escrever_sh(binario / "python3", _PYTHON_DO_VENV)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{binario.as_posix()}{os.pathsep}{env.get('PATH', '')}"
+    env["HOME"] = home.as_posix()
+    env["GCLOUD_LOG"] = (tmp_path / "chamadas_gcloud.txt").as_posix()
+    env["PIP_LOG"] = (tmp_path / "chamadas_pip.txt").as_posix()
+    env.update(env_extra)
+    return home, env
+
+
+def test_fase_fetch_adapter_executada_baixa_o_adaptador_e_monta_o_venv(tmp_path):
+    """A fase EXECUTADA de verdade: adaptador do bucket + venv pronto para o `eval_multi`."""
+    home, env = _vm_de_mentira_eval_only(tmp_path)
+
+    proc = subprocess.run([BASH, str(home / "finetune_remote.sh"), "fetch_adapter"],
+                          cwd=str(home), env=env, capture_output=True, text=True, timeout=180)
+
+    saida = proc.stdout + proc.stderr
+    assert proc.returncode == 0, saida
+    chamadas = Path(env["GCLOUD_LOG"]).read_text(encoding="utf-8")
+    assert ("storage rsync -r gs://bucket-de-teste/finetune/adapter "
+            "finetune/runs/qwen3vl-qlora --project=p") in chamadas
+    repo = home / "residencia"
+    assert (repo / "finetune" / "runs" / "qwen3vl-qlora" / "adapter_config.json").is_file()
+    # venv montado, deps instaladas uma vez e marcadas por hash do requirements
+    venv = repo / ".venv-gcp"
+    assert (venv / "bin" / "activate").is_file()
+    assert "install --quiet -r requirements-slurm.txt" in \
+        Path(env["PIP_LOG"]).read_text(encoding="utf-8")
+    assert [p.name for p in venv.glob(".residencia_deps_*")], "marcador de deps ausente"
+    # guard `prefer_host_torch`: o torch que o pip traria foi removido do venv
+    assert not (venv / "lib" / "python3.13" / "site-packages" / "torch").exists()
+    assert "removendo para o torch da imagem prevalecer" in saida
+
+
+def test_fase_fetch_adapter_aborta_se_o_adaptador_nao_vier(tmp_path):
+    """Prefixo errado => o rsync devolve 0 com diretorio vazio; a fase tem de gritar.
+
+    Sem isto a rodada seguiria para o `eval_multi` e so descobriria o engano depois de
+    carregar o Qwen3-VL na L4 -- paga.
+    """
+    home, env = _vm_de_mentira_eval_only(tmp_path, ADAPTADOR_VAZIO="1")
+
+    proc = subprocess.run([BASH, str(home / "finetune_remote.sh"), "fetch_adapter"],
+                          cwd=str(home), env=env, capture_output=True, text=True, timeout=180)
+
+    saida = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "adaptador nao baixou de gs://bucket-de-teste/finetune/adapter" in saida
+    # parou ANTES de montar o venv (nenhum minuto de pip numa rodada que nao vai medir nada)
+    assert not (home / "residencia" / ".venv-gcp").exists()
+
+
+def test_eval_only_diz_que_o_entregavel_e_o_log_e_nao_o_adaptador(tmp_path):
+    """O teardown nao pode anunciar um adaptador que esta rodada nem produziu."""
+    _, saida, _ = _rodada_completa(tmp_path, "--pairs-mode", "llm", "--eval-only")
+    assert "as medicoes estao em" in saida
+    assert "eval_syn_multi.log (e so isso sobreviveu a rodada)" in saida
+    assert "o adaptador esta em" not in saida
+    # o fluxo de treino continua anunciando o adaptador, como sempre
+    _, saida_treino, _ = _rodada_completa(tmp_path, "--pairs-mode", "llm")
+    assert "o adaptador esta em" in saida_treino
+
+
+def test_eval_multi_mede_humano_e_sintetico_na_mesma_invocacao(tmp_path):
+    """(c) os DOIS conjuntos numa chamada so da CLI `multi` -- 2 embeds do corpus, nao 4."""
+    _, remoto = _scripts_remotos_gerados(tmp_path, "--pairs-mode", "llm", "--eval-only")
+    bloco = remoto[remoto.index("\neval_multi)"):remoto.index("\n*)")]
+    assert "python3 -m finetune.eval_ensemble multi" in bloco
+    assert '--conjunto "humano:$QUERIES_REL:$QRELS_REL"' in bloco
+    assert '--conjunto "sintetico:$SYN_QUERIES_REL:$SYN_QRELS_REL"' in bloco
+    assert '--adapter "$OUT_REL"' in bloco
+    assert 'tee "$EVAL_LOG"' in bloco                  # o log que a fase `upload` leva
+    assert "run_gcp_finetune.sh" not in bloco
+
+
+def test_eval_only_exige_pairs_mode_llm(tmp_path):
+    """(d) quem produz o sintetico e a fase pairs do modo llm: sem ele nao ha 2a medicao.
+
+    Barrar no preflight (e nao na VM) e a diferenca entre um erro de digitacao gratis e um
+    erro de digitacao com L4 de pe.
+    """
+    proc, saida, sentinela = _rodar(tmp_path, "--gcs-out", GCS_OUT, "--eval-only")
+    assert proc.returncode != 0
+    assert "--eval-only exige PAIRS_MODE=llm" in saida
+    assert "instances create" not in saida
+    assert not sentinela.exists()
+
+
+def test_adapter_uri_tem_de_ser_uri_gs(tmp_path):
+    """Um caminho local no lugar do bucket so falharia DENTRO da VM, ja paga."""
+    proc, saida, _ = _rodar(tmp_path, "--gcs-out", GCS_OUT, "--pairs-mode", "llm",
+                            "--eval-only", "--adapter-uri", "/tmp/adaptador")
+    assert proc.returncode != 0
+    assert "ADAPTER_URI tem de ser um URI gs://" in saida
+    assert "instances create" not in saida
+
+
+def test_o_env_gerado_leva_eval_only_e_adapter_uri(tmp_path):
+    """As duas fases novas rodam NA VM: sem estas linhas elas nem sabem que e eval-only."""
+    env, _ = _scripts_remotos_gerados(
+        tmp_path, "--pairs-mode", "llm", "--eval-only",
+        "--adapter-uri", "gs://bucket-de-teste/finetune/outro/adapter")
+    assert "EVAL_ONLY='1'" in env
+    assert "ADAPTER_URI='gs://bucket-de-teste/finetune/outro/adapter'" in env
+
+
+def test_sem_eval_only_o_fluxo_de_treino_fica_identico(tmp_path):
+    """(e) tudo e ADITIVO: a rodada de treino nao sabe que o modo eval-only existe."""
+    _, saida, _ = _rodada_completa(tmp_path, "--pairs-mode", "llm")
+    assert "finetune_remote.sh smoke" in saida
+    assert "finetune_remote.sh finetune" in saida
+    assert "finetune_remote.sh eval_syn" in saida
+    for fase in ("fetch_adapter", "eval_multi"):
+        assert f"finetune_remote.sh {fase}" not in saida
+    assert "EVAL-ONLY" not in saida
+    env, _ = _scripts_remotos_gerados(tmp_path, "--pairs-mode", "llm")
+    assert "EVAL_ONLY='0'" in env
+
+
+def test_fase_pairs_em_eval_only_gera_so_o_conjunto_sintetico(tmp_path):
+    """A fase `pairs` EXECUTADA (com o gerador dublado): sem pares de treino, so o eval.
+
+    Gerar pares de treino numa rodada que nao treina seria pagar os 15GB do 7B por um
+    arquivo que ninguem le.
+    """
+    home, env = _vm_de_mentira(tmp_path, EVAL_ONLY="1")
+
+    proc = _rodar_fase_pairs(home, env)
+
+    saida = proc.stdout + proc.stderr
+    assert proc.returncode == 0, saida
+    assert "pulando os pares de TREINO" in saida
+    dados = home / "residencia" / "finetune" / "data"
+    assert not (dados / "pairs.jsonl").exists()
+    # o sintetico sai igual ao do fluxo de treino: so os docs do gabarito
+    qrels = [ln.split("\t") for ln in
+             (dados / "qrels_syn.tsv").read_text(encoding="utf-8").splitlines()]
+    assert qrels == [["syn-documento-001-q1", "0", "documento-001", "1"],
+                     ["syn-video-003-q1", "0", "video-003", "1"]]

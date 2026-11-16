@@ -52,6 +52,12 @@
 #   # iteracao "pares via LLM + eval maior" (split por documento; ver o bloco PAIRS_MODE):
 #   bash gcp/serving/finetune_v4_spot.sh --gcs-out gs://.../qwen3vl-qlora-llm --pairs-mode llm
 #
+#   # SO MEDIR de novo um adaptador que ja esta no bucket (nao treina; ver EVAL_ONLY):
+#   bash gcp/serving/finetune_v4_spot.sh --gcs-out gs://.../qwen3vl-qlora-llm \
+#        --pairs-mode llm --eval-only \
+#        --adapter-uri gs://residencia-511517-corpus-v4/finetune/qwen3vl-qlora-llm/adapter
+#   #   fases: stage -> pairs(so o sintetico) -> fetch_adapter -> eval_multi -> upload(so o log)
+#
 #   # rodada de verdade (L4 Spot; guarde a saida):
 #   bash gcp/serving/finetune_v4_spot.sh \
 #        2>&1 | tee logs/finetune-v4-$(date +%F).log
@@ -151,6 +157,23 @@ PAIRS_MODE="${PAIRS_MODE:-template}"            # template | llm
 GEN_K="${GEN_K:-3}"                             # consultas por doc na geracao por LLM
 GEN_MODEL="${GEN_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 
+# -------------------------------------------------------------------------------------
+# EVAL_ONLY -- medir de novo um adaptador que JA existe, sem repagar o treino
+#
+# O treino do objetivo #2 ja foi feito e o adaptador esta no GCS. Quando falta so uma
+# MEDICAO (o conjunto sintetico, que duas vezes morreu como cauda de um treino de ~3h),
+# retreinar seria pagar a GPU de novo para responder a mesma pergunta. Com `--eval-only` a
+# rodada fica curta: baixa o adaptador de $ADAPTER_URI, regenera o sintetico e mede os DOIS
+# conjuntos (humano + sintetico) num passo so, pela CLI `multi` do `finetune.eval_ensemble`
+# -- que reusa o embedding do corpus (2 embeds em vez de 4). As fases `smoke` e `finetune`
+# nao rodam, e o upload sobe SO o log: o adaptador ja e o entregavel que veio do bucket.
+#
+# So faz sentido com PAIRS_MODE=llm: o conjunto sintetico e produzido pela fase `pairs` do
+# modo llm, e sem ele a 2a medicao nao existe (ver o guard no preflight).
+# -------------------------------------------------------------------------------------
+EVAL_ONLY="${EVAL_ONLY:-0}"
+ADAPTER_URI="${ADAPTER_URI:-gs://residencia-511517-corpus-v4/finetune/qwen3vl-qlora-llm/adapter}"
+
 DRY_RUN=0
 
 # -------------------------------------------------------------------------------------
@@ -192,6 +215,8 @@ while [ $# -gt 0 ]; do
         --pairs-mode)     PAIRS_MODE="$2"; shift 2 ;;
         --gen-k)          GEN_K="$2"; shift 2 ;;
         --gen-model)      GEN_MODEL="$2"; shift 2 ;;
+        --eval-only)      EVAL_ONLY=1; shift ;;
+        --adapter-uri)    ADAPTER_URI="$2"; shift 2 ;;
         --no-grad-ckpt)   NO_GRAD_CKPT=1; shift ;;
         --grad-ckpt)      NO_GRAD_CKPT=0; shift ;;
         --dry-run)        DRY_RUN=1; shift ;;
@@ -330,9 +355,16 @@ remoto_com_timeout() {   # idem, com teto de tempo (usado no upload e no resgate
 # deletes.
 # -------------------------------------------------------------------------------------
 subir_resultado_para_gcs() {
-    echo "--- subindo o adaptador da VM para $GCS_OUT (teto: ${UPLOAD_TIMEOUT}s) ---"
-    echo "    [na VM] gcloud storage rsync -r <finetune/runs/$BASE-$METHOD> $GCS_OUT/adapter --project=$PROJECT"
-    echo "    [na VM] gcloud storage cp ~/finetune_train.log $GCS_OUT/finetune_train.log --project=$PROJECT"
+    if [ "${EVAL_ONLY:-0}" = "1" ]; then
+        # Em EVAL-ONLY o adaptador veio do bucket: o que esta rodada produziu -- e o unico
+        # que sobe -- e o log das duas medicoes.
+        echo "--- subindo o log das medicoes da VM para $GCS_OUT (teto: ${UPLOAD_TIMEOUT}s) ---"
+        echo "    [na VM] gcloud storage cp ~/eval_syn_multi.log $GCS_OUT/eval_syn_multi.log --project=$PROJECT"
+    else
+        echo "--- subindo o adaptador da VM para $GCS_OUT (teto: ${UPLOAD_TIMEOUT}s) ---"
+        echo "    [na VM] gcloud storage rsync -r <finetune/runs/$BASE-$METHOD> $GCS_OUT/adapter --project=$PROJECT"
+        echo "    [na VM] gcloud storage cp ~/finetune_train.log $GCS_OUT/finetune_train.log --project=$PROJECT"
+    fi
     if remoto_com_timeout "$UPLOAD_TIMEOUT" "bash ~/finetune_remote.sh upload"; then
         UPLOAD_FEITO=1
         return 0
@@ -493,7 +525,17 @@ teardown() {
         echo "--- conferencia ok: nenhuma VM sobrou ---"
     fi
 
-    if [ "${UPLOAD_FEITO:-0}" = "1" ]; then
+    # SO o texto muda por modo: em EVAL-ONLY o entregavel da rodada e o log das duas
+    # medicoes (o adaptador nao foi produzido aqui -- veio de $ADAPTER_URI e segue la).
+    if [ "${EVAL_ONLY:-0}" = "1" ]; then
+        if [ "${UPLOAD_FEITO:-0}" = "1" ]; then
+            echo "--- as medicoes estao em $GCS_OUT/eval_syn_multi.log (e so isso sobreviveu a rodada) ---"
+            echo "--- o adaptador medido continua em $ADAPTER_URI (nao foi produzido nem reescrito aqui) ---"
+        else
+            echo "--- ATENCAO: o log das medicoes NAO chegou a $GCS_OUT/eval_syn_multi.log;" \
+                 "a rodada nao deixou nada (o adaptador em $ADAPTER_URI segue intacto) ---" >&2
+        fi
+    elif [ "${UPLOAD_FEITO:-0}" = "1" ]; then
         echo "--- o adaptador esta em $GCS_OUT (e so isso sobreviveu a rodada) ---"
     else
         echo "--- ATENCAO: o adaptador NAO chegou a $GCS_OUT; a rodada nao deixou nada ---" >&2
@@ -528,6 +570,8 @@ NO_GRAD_CKPT='$NO_GRAD_CKPT'
 PAIRS_MODE='$PAIRS_MODE'
 GEN_K='$GEN_K'
 GEN_MODEL='$GEN_MODEL'
+EVAL_ONLY='$EVAL_ONLY'
+ADAPTER_URI='$ADAPTER_URI'
 BRANCH='$BRANCH'
 ENV
 
@@ -535,7 +579,7 @@ ENV
 #!/usr/bin/env bash
 # Gerado por gcp/serving/finetune_v4_spot.sh -- roda DENTRO da VM L4. Fase em $1.
 set -euo pipefail
-FASE="${1:?uso: finetune_remote.sh <bootstrap|stage|pairs|smoke|finetune|eval_syn|upload>}"
+FASE="${1:?uso: finetune_remote.sh <bootstrap|stage|pairs|smoke|finetune|eval_syn|fetch_adapter|eval_multi|upload>}"
 # shellcheck disable=SC1091
 source "$HOME/finetune_env.sh"
 echo "=== [vm $(hostname)] fase=$FASE $(date) ==="
@@ -560,6 +604,9 @@ VENV_REL=".venv-gcp"
 # fase `upload` sobe.
 OUT_REL="finetune/runs/${BASE}-${METHOD}"
 TRAIN_LOG="$HOME/finetune_train.log"
+# Log da rodada EVAL-ONLY: nao ha treino, entao nao ha $TRAIN_LOG a apendar -- os dois
+# deltas (humano + sintetico) da CLI `multi` ficam aqui, e e SO isto que o upload sobe.
+EVAL_LOG="$HOME/eval_syn_multi.log"
 
 case "$FASE" in
 
@@ -709,15 +756,21 @@ pairs)
 
     # 2. TREINO: consultas do LLM sobre os docs FORA de EVAL_DOCS. Subprocesso que SAI ao
     #    final -- a VRAM do 7B volta inteira antes do smoke/treino, sem unload manual.
-    echo "=== [pairs/llm] treino: $RECORDS_REL (sem os docs de eval) -> $PAIRS_REL | k=$GEN_K modelo=$GEN_MODEL ==="
-    PYTHONPATH="$REPO_DIR" python3 -m finetune.gen_queries_llm \
-        --records "$RECORDS_REL" --out "$PAIRS_REL" --k "$GEN_K" --model "$GEN_MODEL" \
-        --exclude-docs "$EVAL_DOCS_REL"
-    [ -s "$PAIRS_REL" ] || { echo "ERRO: $PAIRS_REL vazio" >&2; exit 1; }
-    echo "--- pares de treino (LLM): $(wc -l < "$PAIRS_REL") ---"
-    # Guard do vazamento, agora sobre o ARQUIVO e nao sobre a intencao: nenhum pos_id dos
-    # pares de treino pode ser um doc de avaliacao.
-    PYTHONPATH="$REPO_DIR" python3 - "$PAIRS_REL" "$EVAL_DOCS_REL" <<'PY'
+    #    Em EVAL_ONLY nao ha treino nesta rodada: gerar pares de treino seria pagar o 7B
+    #    por um arquivo que ninguem vai ler. O guard de vazamento vai junto -- ele guarda
+    #    exatamente o arquivo que nao foi gerado.
+    if [ "${EVAL_ONLY:-0}" = "1" ]; then
+        echo "=== [pairs/llm] EVAL-ONLY: pulando os pares de TREINO (so o conjunto sintetico) ==="
+    else
+        echo "=== [pairs/llm] treino: $RECORDS_REL (sem os docs de eval) -> $PAIRS_REL | k=$GEN_K modelo=$GEN_MODEL ==="
+        PYTHONPATH="$REPO_DIR" python3 -m finetune.gen_queries_llm \
+            --records "$RECORDS_REL" --out "$PAIRS_REL" --k "$GEN_K" --model "$GEN_MODEL" \
+            --exclude-docs "$EVAL_DOCS_REL"
+        [ -s "$PAIRS_REL" ] || { echo "ERRO: $PAIRS_REL vazio" >&2; exit 1; }
+        echo "--- pares de treino (LLM): $(wc -l < "$PAIRS_REL") ---"
+        # Guard do vazamento, agora sobre o ARQUIVO e nao sobre a intencao: nenhum pos_id
+        # dos pares de treino pode ser um doc de avaliacao.
+        PYTHONPATH="$REPO_DIR" python3 - "$PAIRS_REL" "$EVAL_DOCS_REL" <<'PY'
 import json, sys
 pares, docs = sys.argv[1], sys.argv[2]
 proibidos = {ln.strip() for ln in open(docs, encoding="utf-8") if ln.strip()}
@@ -728,6 +781,7 @@ if vazou:
                      f"{sorted(vazou)[:5]}")
 print("--- split por documento conferido: 0 doc de eval como positivo de treino ---")
 PY
+    fi
 
     # 3. EVAL SINTETICO: consultas do LLM sobre SO os docs de avaliacao (N maior, CI
     #    menor). Cada consulta -> o doc que a gerou, com label 1.
@@ -882,6 +936,22 @@ upload)
     # tentativa morreu por preempcao) e `cp` para o log (um arquivo).
     cd "$REPO_DIR"
     [ -n "$GCS_OUT" ] || { echo "ERRO: GCS_OUT vazio na VM" >&2; exit 2; }
+
+    # EVAL-ONLY: o adaptador VEIO do bucket (fase `fetch_adapter`). Re-subi-lo seria
+    # sobrescrever o entregavel com uma copia dele mesmo -- e, se o rsync tivesse trazido
+    # a arvore pela metade, com uma copia PIOR. O que esta rodada produziu e o log das
+    # duas medicoes, e e so ele que sobe.
+    if [ "${EVAL_ONLY:-0}" = "1" ]; then
+        [ -s "$EVAL_LOG" ] \
+            || { echo "ERRO: $EVAL_LOG vazio ou ausente -- a rodada eval-only nao mediu nada" >&2; exit 1; }
+        echo "=== [upload/eval-only] $EVAL_LOG -> $GCS_OUT/eval_syn_multi.log ==="
+        gcloud storage cp "$EVAL_LOG" "$GCS_OUT/eval_syn_multi.log" --project="$PROJECT"
+        echo "--- conferencia do que ficou no bucket ---"
+        gcloud storage ls -r "$GCS_OUT" --project="$PROJECT"
+        echo "=== upload concluido $(date) ==="
+        exit 0      # guarda: o adaptador NAO e re-enviado neste modo
+    fi
+
     if [ ! -d "$OUT_REL" ]; then
         echo "ERRO: $OUT_REL nao existe -- o treino nao terminou; nada a subir" >&2
         exit 1
@@ -896,6 +966,126 @@ upload)
     echo "--- conferencia do que ficou no bucket ---"
     gcloud storage ls -r "$GCS_OUT" --project="$PROJECT"
     echo "=== upload concluido $(date) ==="
+    ;;
+
+# =====================================================================================
+fetch_adapter)
+# =====================================================================================
+    # EVAL-ONLY: o "depois" nao vem de um treino, vem do BUCKET. O adaptador do objetivo
+    # #2 ja esta em $ADAPTER_URI; baixa-lo para $OUT_REL deixa a VM no mesmo estado em que
+    # a fase `finetune` a deixaria -- so que em segundos e sem GPU. Esta fase SUBSTITUI o
+    # par smoke+finetune no modo eval-only, e nao treina nada.
+    cd "$REPO_DIR"
+    [ -n "${ADAPTER_URI:-}" ] || { echo "ERRO: ADAPTER_URI vazio na VM" >&2; exit 2; }
+    echo "=== [fetch_adapter] $ADAPTER_URI -> $OUT_REL (sem treinar) ==="
+    mkdir -p "$OUT_REL"
+    gcloud storage rsync -r "$ADAPTER_URI" "$OUT_REL" --project="$PROJECT"
+
+    # Falhar ALTO aqui: um prefixo errado no $ADAPTER_URI faz o rsync devolver 0 com um
+    # diretorio VAZIO, e a medicao so descobriria isso depois de carregar o modelo.
+    if [ ! -f "$OUT_REL/adapter_config.json" ] && [ -z "$(ls -A "$OUT_REL" 2>/dev/null)" ]; then
+        echo "ERRO: adaptador nao baixou de $ADAPTER_URI -- $OUT_REL ficou vazio" >&2
+        exit 1
+    fi
+    ls -la "$OUT_REL"
+
+    # -- ambiente Python do eval (portado do bootstrap de gcp/serving/api_demo_spot.sh) ---
+    # Sem treino nesta rodada, NINGUEM monta o `$VENV_REL`: quem o cria no fluxo normal e
+    # `finetune/run_gcp_finetune.sh`, invocado so pelas fases smoke/finetune -- puladas
+    # aqui. O `eval_multi` cairia no python do sistema da DLVM, que tem torch mas nao tem
+    # peft/bitsandbytes, e a medicao morreria num ImportError com a L4 ja paga. O
+    # `api_demo_spot.sh` resolveu o mesmo problema (carregar Qwen3-VL+peft SEM treinar)
+    # portando este bloco; a duplicacao e consciente, como la.
+    #
+    # `--system-site-packages` e o que importa: o torch+CUDA vem da imagem DLVM, casado com
+    # o driver. `requirements-slurm.txt` traz transformers/peft/accelerate/qwen-vl-utils/
+    # pillow/numpy. `api/requirements.txt` NAO serve aqui: ele pina `transformers<4.51`
+    # (alvo do Cloud Run) e o Qwen3-VL-Embedding exige >=4.57.
+    [ -f "$REPO_DIR/requirements-slurm.txt" ] \
+        || { echo "ERRO: requirements-slurm.txt ausente -- o tarball chegou incompleto" >&2; exit 1; }
+    if [ ! -d "$VENV_REL" ]; then
+        echo "--- criando venv (--system-site-packages) em $VENV_REL ---"
+        python3 -m venv --system-site-packages "$VENV_REL" \
+            || echo "--- venv falhou; seguindo no python do sistema (deps via pip --user) ---"
+    fi
+    if [ -f "$VENV_REL/bin/activate" ]; then
+        # shellcheck disable=SC1091
+        source "$VENV_REL/bin/activate"
+        DEPS_MARKER_DIR="${VIRTUAL_ENV:-$VENV_REL}"   # absoluto: o activate resolve o path
+    else
+        DEPS_MARKER_DIR="$HOME/.local"
+    fi
+    echo "--- python: $(command -v python3) ($(python3 --version 2>&1)) ---"
+
+    REQ_HASH="$(sha256sum requirements-slurm.txt | cut -d" " -f1)"
+    DEPS_MARKER="$DEPS_MARKER_DIR/.residencia_deps_$REQ_HASH"
+    if [ -f "$DEPS_MARKER" ]; then
+        echo "--- deps ja instaladas (marcador: $DEPS_MARKER) ---"
+    else
+        mkdir -p "$DEPS_MARKER_DIR"
+        if [ -n "${VIRTUAL_ENV:-}" ]; then
+            python3 -m pip install --quiet -r requirements-slurm.txt
+        else
+            python3 -m pip install --quiet --user -r requirements-slurm.txt
+        fi
+        touch "$DEPS_MARKER"
+    fi
+
+    # Guard "preferir o torch da imagem" (ESPELHO de `prefer_host_torch`): o pip resolve a
+    # arvore inteira e qualquer dep que declare torch instala um torch proprio no venv --
+    # sem as libs CUDA do no e, por vir antes no sys.path, sombreando o torch bom.
+    if [ -n "${VIRTUAL_ENV:-}" ]; then TORCH_ROOT="$VIRTUAL_ENV"; else TORCH_ROOT="$HOME/.local"; fi
+    for _sp in "$TORCH_ROOT"/lib/python*/site-packages; do
+        [ -d "$_sp" ] || continue
+        if [ -d "$_sp/torch" ]; then
+            echo "--- torch encontrado em $_sp: removendo para o torch da imagem prevalecer ---"
+            rm -rf "$_sp"/torch "$_sp"/torch-* "$_sp"/torchvision* \
+                   "$_sp"/torchaudio* "$_sp"/nvidia* "$_sp"/functorch* || true
+        fi
+    done
+    python3 -c "import torch; print('torch', torch.__version__, torch.__file__)" \
+        || echo "aviso: import torch falha mesmo apos limpar $TORCH_ROOT -- verifique a VM antes de gastar GPU" >&2
+
+    echo "=== fetch_adapter concluido $(date) ==="
+    ;;
+
+# =====================================================================================
+eval_multi)
+# =====================================================================================
+    # As DUAS medicoes do mesmo adaptador num passo so: a ancora-ouro HUMANA (as queries
+    # staged) e o conjunto SINTETICO (consultas do LLM sobre os docs de eval). A CLI
+    # `multi` do `finetune.eval_ensemble` monta o A uma vez por estado e pontua os dois
+    # conjuntos no MESMO embedding do corpus -- 2 embeds em vez de 4, que e metade do
+    # tempo de GPU da rodada. O log vai inteiro para $EVAL_LOG, que a fase `upload` leva
+    # para o bucket.
+    cd "$REPO_DIR"
+    [ -s "$QUERIES_REL" ] && [ -s "$QRELS_REL" ] \
+        || { echo "ERRO: queries/qrels humanos ausentes -- rode a fase stage antes" >&2; exit 1; }
+    [ -s "$SYN_QUERIES_REL" ] && [ -s "$SYN_QRELS_REL" ] \
+        || { echo "ERRO: eval sintetico ausente -- rode a fase pairs com PAIRS_MODE=llm" >&2; exit 1; }
+    [ -d "$OUT_REL" ] && [ -n "$(ls -A "$OUT_REL" 2>/dev/null)" ] \
+        || { echo "ERRO: $OUT_REL vazio ou ausente -- sem adaptador nao ha 'depois' a medir" >&2; exit 1; }
+
+    # O torch/peft/Qwen3-VL estao no venv do treino, nao no python do sistema.
+    if [ -f "$VENV_REL/bin/activate" ]; then
+        # shellcheck disable=SC1091
+        source "$VENV_REL/bin/activate"
+    else
+        echo "--- aviso: $VENV_REL ausente; tentando no python do sistema ---" >&2
+    fi
+
+    echo "=== [eval_multi] humano ($(wc -l < "$QUERIES_REL") queries) + sintetico ($(wc -l < "$SYN_QUERIES_REL") queries) no MESMO embedding ==="
+    PYTHONPATH="$REPO_DIR" HF_HOME="$HOME/.cache/huggingface" \
+        python3 -m finetune.eval_ensemble multi \
+            --corpus "$RECORDS_REL" \
+            --conjunto "humano:$QUERIES_REL:$QRELS_REL" \
+            --conjunto "sintetico:$SYN_QUERIES_REL:$SYN_QRELS_REL" \
+            --adapter "$OUT_REL" --base "$BASE" --method "$METHOD" \
+        2>&1 | tee "$EVAL_LOG"
+
+    echo "--- os DOIS antes/depois desta rodada (ancora-ouro humana + sintetico) ---"
+    grep -i "ndcg" "$EVAL_LOG" || echo "    (nenhuma linha de nDCG no log)"
+    echo "=== eval_multi concluido $(date) ==="
     ;;
 
 *)
@@ -1007,6 +1197,12 @@ if [ "$PAIRS_MODE" = "llm" ]; then
     echo "            split por documento: os docs do qrels de eval NAO viram positivo de treino"
     echo "            avaliacao DUPLA: ancora-ouro (humana) + sintetica (LLM sobre os docs de eval)"
 fi
+if [ "$EVAL_ONLY" = "1" ]; then
+    echo "    modo:   EVAL-ONLY (eval_only=1) -- NAO treina: smoke e finetune ficam de fora"
+    echo "            adaptador vem de: $ADAPTER_URI"
+    echo "            medicao: humano + sintetico num passo so (CLI multi, 1 embedding por estado)"
+    echo "            upload:  so o log ($GCS_OUT/eval_syn_multi.log); o adaptador nao e re-enviado"
+fi
 echo "    disco=$BOOT_DISK_SIZE  maquina=$MACHINE_TYPE+$ACCELERATOR"
 echo "    corpus na VM:   $CORPUS_DIR (records.jsonl + bin/)"
 echo "    adaptador na VM: finetune/runs/$BASE-$METHOD"
@@ -1078,6 +1274,30 @@ case "$PAIRS_MODE" in
        echo "    llm      = consultas do LLM com split por documento + eval sintetico" >&2
        exit 2 ;;
 esac
+
+# EVAL_ONLY so existe com PAIRS_MODE=llm: quem produz o conjunto sintetico e a fase `pairs`
+# do modo llm. Em `template` a rodada subiria a VM, baixaria o adaptador e so entao
+# descobriria que nao ha 2o conjunto a medir -- com a L4 ja cobrando. Fatal AQUI, antes de
+# provisionar, inclusive em --dry-run (nao depende da nuvem).
+case "$EVAL_ONLY" in
+    0|1) ;;
+    *) echo "ERRO: EVAL_ONLY tem de ser 0 ou 1 (recebido: '$EVAL_ONLY')" >&2; exit 2 ;;
+esac
+if [ "$EVAL_ONLY" = "1" ]; then
+    if [ "$PAIRS_MODE" != "llm" ]; then
+        echo "ERRO: --eval-only exige PAIRS_MODE=llm (recebido: '$PAIRS_MODE')." >&2
+        echo "    o conjunto SINTETICO da 2a medicao e produzido pela fase pairs do modo llm;" >&2
+        echo "    use: --eval-only --pairs-mode llm" >&2
+        exit 2
+    fi
+    case "$ADAPTER_URI" in
+        gs://*) ;;
+        *) echo "ERRO: ADAPTER_URI tem de ser um URI gs:// (recebido: '$ADAPTER_URI')" >&2
+           echo "    use: --adapter-uri gs://<bucket>/<prefixo>/adapter" >&2
+           exit 2 ;;
+    esac
+    ADAPTER_URI="${ADAPTER_URI%/}"
+fi
 
 # GEN_K multiplica o custo da geracao (k consultas por doc, ~150 docs) -- um "0" produziria
 # zero pares e o treino so descobriria isso na VM.
@@ -1179,7 +1399,11 @@ echo "--- records.jsonl + bin/<eixo>/ + eval/{queries_v4.txt,qrels_v4.tsv} ---"
 gancho_de_falha stage
 remoto "bash ~/finetune_remote.sh stage"
 
-if [ "$PAIRS_MODE" = "llm" ]; then
+if [ "$EVAL_ONLY" = "1" ]; then
+    etapa "[6/9] eval sintetico por LLM ($GEN_MODEL, k=$GEN_K) -- SEM pares de treino"
+    echo "--- split por documento: EVAL_DOCS vem do qrels staged (cut da 3a coluna) ---"
+    echo "--- eval-only: so o conjunto sintetico (SO os docs de EVAL_DOCS) e gerado ---"
+elif [ "$PAIRS_MODE" = "llm" ]; then
     etapa "[6/9] pares de treino por LLM ($GEN_MODEL, k=$GEN_K) + eval sintetico"
     echo "--- split por documento: EVAL_DOCS vem do qrels staged (cut da 3a coluna) ---"
     echo "--- treino = docs FORA de EVAL_DOCS | eval sintetico = SO os docs de EVAL_DOCS ---"
@@ -1188,27 +1412,49 @@ else
 fi
 remoto "bash ~/finetune_remote.sh pairs"
 
-etapa "[7/9] smoke de VRAM: 2 passos reais na L4 (gate de OOM antes do treino inteiro)"
-remoto "bash ~/finetune_remote.sh smoke"
+if [ "$EVAL_ONLY" = "1" ]; then
+    # EVAL-ONLY: sem smoke e sem finetune. O "depois" ja existe -- baixa-lo do bucket custa
+    # segundos, e o que resta e a medicao que faltava. A rodada inteira e curta de
+    # proposito: foi a cauda de um treino de ~3h que a derrubou duas vezes.
+    etapa "[7/9] fetch_adapter: trazendo o adaptador de $ADAPTER_URI (NAO treina)"
+    remoto "bash ~/finetune_remote.sh fetch_adapter"
 
-etapa "[8/9] finetune QLoRA na VM (o log traz o nDCG@10 do A no v4 ANTES e DEPOIS)"
-gancho_de_falha finetune
-remoto "bash ~/finetune_remote.sh finetune"
+    etapa "[8/9] eval_multi: nDCG@10 antes/depois nos DOIS conjuntos (humano + sintetico)"
+    echo "--- CLI multi: 1 carga de modelo e 1 embedding do corpus por estado (2 em vez de 4) ---"
+    remoto "bash ~/finetune_remote.sh eval_multi"
+else
+    etapa "[7/9] smoke de VRAM: 2 passos reais na L4 (gate de OOM antes do treino inteiro)"
+    remoto "bash ~/finetune_remote.sh smoke"
 
-# 2a MEDICAO do MESMO adaptador (1 treino, 2 medicoes) -- so no modo llm, que e quem
-# produz o conjunto sintetico. NAO-FATAL de proposito: perder a medicao extra nao pode
-# custar o upload do adaptador, que e o entregavel da rodada paga.
-if [ "$PAIRS_MODE" = "llm" ]; then
-    echo "--- [8/9b] 2a medicao: nDCG@10 antes/depois no conjunto SINTETICO ---"
-    remoto "bash ~/finetune_remote.sh eval_syn" \
-        || echo "--- aviso: a 2a medicao falhou; a ancora-ouro humana ja esta no log ---" >&2
+    etapa "[8/9] finetune QLoRA na VM (o log traz o nDCG@10 do A no v4 ANTES e DEPOIS)"
+    gancho_de_falha finetune
+    remoto "bash ~/finetune_remote.sh finetune"
+
+    # 2a MEDICAO do MESMO adaptador (1 treino, 2 medicoes) -- so no modo llm, que e quem
+    # produz o conjunto sintetico. NAO-FATAL de proposito: perder a medicao extra nao pode
+    # custar o upload do adaptador, que e o entregavel da rodada paga.
+    if [ "$PAIRS_MODE" = "llm" ]; then
+        echo "--- [8/9b] 2a medicao: nDCG@10 antes/depois no conjunto SINTETICO ---"
+        remoto "bash ~/finetune_remote.sh eval_syn" \
+            || echo "--- aviso: a 2a medicao falhou; a ancora-ouro humana ja esta no log ---" >&2
+    fi
 fi
 
-etapa "[9/9] persistindo o adaptador em $GCS_OUT (ANTES do teardown)"
+if [ "$EVAL_ONLY" = "1" ]; then
+    etapa "[9/9] persistindo o log das medicoes em $GCS_OUT (ANTES do teardown)"
+else
+    etapa "[9/9] persistindo o adaptador em $GCS_OUT (ANTES do teardown)"
+fi
 gancho_de_falha upload
 subir_resultado_para_gcs
 
-etapa "finetune v4 concluido -- o teardown vem a seguir"
-echo "    adaptador: $GCS_OUT/adapter/"
-echo "    log do treino (antes/depois): $GCS_OUT/finetune_train.log"
+if [ "$EVAL_ONLY" = "1" ]; then
+    etapa "eval-only do v4 concluido -- o teardown vem a seguir"
+    echo "    medicoes (humano + sintetico): $GCS_OUT/eval_syn_multi.log"
+    echo "    adaptador medido (intocado):   $ADAPTER_URI"
+else
+    etapa "finetune v4 concluido -- o teardown vem a seguir"
+    echo "    adaptador: $GCS_OUT/adapter/"
+    echo "    log do treino (antes/depois): $GCS_OUT/finetune_train.log"
+fi
 exit 0
