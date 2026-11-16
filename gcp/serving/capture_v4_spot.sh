@@ -487,7 +487,8 @@ import bs4                                              # noqa: F401  (html do e
 import pypdfium2                                        # (render das paginas do documento)
 from PIL import Image                                   # noqa: F401  (imagem)
 from faster_whisper import WhisperModel                 # noqa: F401  (audio/video, ASR)
-print("pypdfium2", pypdfium2.V_PYPDFIUM2, "| bs4", bs4.__version__)
+_pdfium_ver = getattr(pypdfium2, "V_PYPDFIUM2", None) or getattr(pypdfium2, "__version__", "?")
+print("pypdfium2", _pdfium_ver, "| bs4", bs4.__version__)
 from ensemble.build_corpus import DESTINO_V4, DOCUMENTO_V4, POR_EIXO_V4, build_corpus_v4
 from ensemble.corpus_v4 import check_corpus_paths       # noqa: F401  (sanity de caminho)
 print("destino v4 (default do modulo):", DESTINO_V4)
