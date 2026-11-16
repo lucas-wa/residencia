@@ -160,6 +160,8 @@ ZONE=""                 # zona onde a VM subiu de fato
 ZONAS_TENTADAS=""       # toda zona em que um `create` foi tentado (o teardown varre todas)
 UPLOAD_FEITO=0          # 1 depois que o adaptador chegou em $GCS_OUT
 TMP_DIR=""
+SAIDA_DO_DELETE=""      # saida do ultimo `instances delete` que falhou (vira o diagnostico
+                        # de auth do teardown)
 
 TEARDOWN_RETRIES="${TEARDOWN_RETRIES:-3}"
 TEARDOWN_ESPERA="${TEARDOWN_ESPERA:-20}"      # segundos entre tentativas de delete
@@ -251,6 +253,36 @@ precondicao_ausente() {
     exit 2
 }
 
+# -------------------------------------------------------------------------------------
+# AUTH -- o token do gcloud e um recurso que EXPIRA no meio da rodada
+#
+# A conta que dispara o script pode estar sob politica de reauth periodica: o access token
+# vence e o gcloud nao renova sozinho (precisa de `gcloud auth login` interativo). Numa
+# rodada longa isso nao aparece no comeco -- aparece LA NA FRENTE, no upload do adaptador
+# e, pior, no `instances delete` do teardown, que falha e deixa a L4 DE PE cobrando.
+#
+# `token_de_auth_ok` exercita o token e e a unica forma de tocar auth neste script. Em
+# `--dry-run` ela so ANUNCIA a checagem: `print-access-token` e chamada de REDE, e o ensaio
+# nao executa um gcloud sequer (mesma regra do `run`/`existe`).
+token_de_auth_ok() {
+    if [ "$DRY_RUN" = "1" ]; then
+        printf '    [dry-run] gcloud auth print-access-token --project=%s   # (checagem de rede: o ensaio nao a executa)\n' \
+            "$PROJECT"
+        return 0
+    fi
+    gcloud auth print-access-token --project="$PROJECT" >/dev/null 2>&1
+}
+
+# Assinatura de token vencido na saida de um gcloud que falhou. E texto do proprio gcloud:
+# "Reauthentication failed. cannot prompt during non-interactive execution."
+falha_e_de_auth() {
+    case "$1" in
+        *"Reauthentication failed"*|*"cannot prompt during non-interactive execution"*)
+            return 0 ;;
+    esac
+    return 1
+}
+
 # Gancho de verificacao do trap: `FINETUNE_FAIL_AT=<etapa>` faz a etapa falhar de proposito
 # (etapas: provision, bootstrap, stage, finetune, upload). Serve para provar que o teardown
 # roda em qualquer saida -- e so isso.
@@ -312,14 +344,53 @@ subir_resultado_para_gcs() {
 #      falha transitoria, e engoli-la com `|| true` seria vazar recurso pago.
 #   5. Conferencia final que ASSERTA: se algo sobreviveu, o script grita LEAK, imprime o
 #      delete manual e sai com status != 0.
+#   6. A saida de cada delete que falha e CAPTURADA (e reemitida): e nela que o teardown
+#      le se a causa foi o token vencido -- e so nesse caso imprime o banner de
+#      recuperacao manual, com os comandos exatos.
 # -------------------------------------------------------------------------------------
+# Banner do delete que falhou por AUTH: a VM esta de pe, o `gcloud` desta maquina nao
+# consegue mais falar com a API, e o operador precisa dos comandos prontos -- inclusive o
+# resgate do adaptador, que morre junto com a VM se ele apagar sem subir antes.
+banner_de_recuperacao() {
+    local zona="$1"
+    {
+        echo ""
+        echo "=========== RECUPERACAO MANUAL NECESSARIA (auth do gcloud expirou) ==========="
+        echo "  1. gcloud auth login"
+        echo "  2. (resgatar adaptador, se o upload nao rodou:)"
+        echo "     gcloud compute ssh $VM --zone=$zona --project=$PROJECT --command \\"
+        echo "       \"cd ~/residencia && gcloud storage rsync -r finetune/runs/$BASE-$METHOD \\"
+        echo "        $GCS_OUT/adapter --project=$PROJECT\""
+        echo "  3. gcloud compute instances delete $VM --zone=$zona --project=$PROJECT --quiet"
+        echo "  4. gcloud compute instances list --project=$PROJECT   # tem de dar 'Listed 0 items.'"
+        echo "=============================================================================="
+    } >&2
+}
+
 apagar_com_retry() {
     local rotulo="$1"; shift
     local tentativa=1
+    local saida rc_del
+    SAIDA_DO_DELETE=""
     while [ "$tentativa" -le "$TEARDOWN_RETRIES" ]; do
-        if run "$@"; then
+        # No ensaio nao ha saida a capturar: `run` imprime o comando e devolve 0, como em
+        # todo o resto do script.
+        if [ "$DRY_RUN" = "1" ]; then
+            run "$@"
             return 0
         fi
+        # Capturar (e reemitir) em vez de deixar passar direto: o teardown precisa LER o
+        # motivo da falha para distinguir "operacao em andamento" de "token vencido".
+        saida="$("$@" 2>&1)"
+        rc_del=$?
+        if [ -n "$saida" ]; then
+            printf '%s\n' "$saida" >&2
+        fi
+        if [ "$rc_del" = "0" ]; then
+            return 0
+        fi
+        SAIDA_DO_DELETE="$SAIDA_DO_DELETE
+$saida"
         if [ "$tentativa" -lt "$TEARDOWN_RETRIES" ]; then
             echo "--- $rotulo: tentativa $tentativa falhou (operacao em andamento?);" \
                  "nova tentativa em ${TEARDOWN_ESPERA}s ---" >&2
@@ -341,6 +412,14 @@ teardown() {
     etapa "TEARDOWN (saida com status $rc) -- apagando a VM $VM"
     echo "--- a partir daqui INT/TERM/HUP sao IGNORADOS: a limpeza nao se interrompe ---"
 
+    # Exercitar o token ANTES dos deletes: se a credencial so estava stale, isto a renova e
+    # a limpeza segue normal; se ja venceu de vez, pelo menos o aviso sai antes do retry e
+    # o banner cobre o resto.
+    if ! token_de_auth_ok; then
+        echo "--- aviso: o gcloud desta maquina nao tem token valido AGORA;" \
+             "o resgate e os deletes podem falhar (veja o banner no fim) ---" >&2
+    fi
+
     # Ultima chance de salvar o adaptador: se a rodada morreu depois de treinar mas antes
     # de subir, ele ainda esta na VM que estamos prestes a apagar. Se o treino nem chegou
     # la, a fase falha limpo e seguimos para os deletes.
@@ -352,9 +431,15 @@ teardown() {
     local zona
     for zona in ${ZONAS_TENTADAS:-}; do
         echo "--- apagando a VM $VM em $zona (se existir) ---"
-        apagar_com_retry "delete da VM em $zona" \
-            gcloud compute instances delete "$VM" --zone="$zona" \
-                --project="$PROJECT" --quiet
+        if ! apagar_com_retry "delete da VM em $zona" \
+                gcloud compute instances delete "$VM" --zone="$zona" \
+                    --project="$PROJECT" --quiet; then
+            # Falha de auth nao se resolve com retry nem com a conferencia: so com um
+            # `gcloud auth login` humano. Entao o banner, aqui, com a VM e a zona reais.
+            if falha_e_de_auth "$SAIDA_DO_DELETE"; then
+                banner_de_recuperacao "$zona"
+            fi
+        fi
     done
     if [ -z "${ZONAS_TENTADAS:-}" ]; then
         echo "--- nenhuma VM foi criada nesta rodada ---"
@@ -998,6 +1083,29 @@ esac
 
 if ! command -v gcloud >/dev/null 2>&1; then
     precondicao_ausente "gcloud nao esta no PATH"
+fi
+
+# TOKEN VALIDO, aqui, antes de existir recurso pago. Um token ja vencido na largada nao
+# impede a VM de subir (o `create` falharia so se a credencial sumisse de vez), mas condena
+# o fim da rodada: o upload do adaptador e o delete do teardown passam pelo gcloud DESTA
+# maquina. Falhar agora custa zero; falhar depois custou uma L4 orfa cobrando.
+# Em `--dry-run` a checagem e apenas anunciada (ver `token_de_auth_ok`).
+if ! token_de_auth_ok; then
+    echo "ERRO: gcloud sem token valido. Rode 'gcloud auth login' (a conta ativa tem" \
+         "politica de reauth que pode expirar em runs longos)." >&2
+    exit 2
+fi
+
+# Aviso, nao barreira: contas academicas/institucionais costumam carregar a politica de
+# reauth que derrubou a rodada anterior NO MEIO dela -- o token passa aqui e vence uma hora
+# depois. Quem quer imunidade usa service account; quem so quer rodar segue em frente.
+if [ "$DRY_RUN" != "1" ]; then
+    CONTA_ATIVA="$(gcloud config get-value account 2>/dev/null || true)"
+    case "$CONTA_ATIVA" in
+        *.edu|*.edu.br|*discente*|*aluno*)
+            echo "AVISO: conta $CONTA_ATIVA pode exigir reauth no meio de runs longos;" \
+                 "para runs >1h considere uma service account." >&2 ;;
+    esac
 fi
 
 # A VM recebe o CHECKOUT LOCAL (tarball da arvore de trabalho, sem .git): a branch que

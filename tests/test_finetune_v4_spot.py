@@ -581,3 +581,148 @@ def test_fase_pairs_llm_aborta_se_um_doc_de_eval_virar_positivo_de_treino(tmp_pa
     assert "doc(s) de eval viraram positivo de treino" in saida
     # parou ANTES de gerar o conjunto sintetico (e antes de qualquer minuto de treino)
     assert not (home / "residencia" / "finetune" / "data" / "queries_syn.txt").exists()
+
+
+# -- auth do gcloud: o token que venceu NO MEIO de uma rodada paga ----------------------
+#
+# Numa rodada longa o access token da conta ativa (politica de reauth) venceu no meio: o
+# upload do adaptador falhou E o `instances delete` do teardown falhou -- a L4 ficou de pe
+# cobrando ate alguem reparar. Os testes abaixo cobrem as duas pontas: falhar ANTES de
+# pagar qualquer coisa, e deixar instrucoes impossiveis de perder quando quebra no fim.
+#
+# Aqui o `gcloud` dublado nao e mais o delator que sempre falha (aquele serve ao `--dry-run`):
+# e um dublê PROGRAMAVEL, para que o fluxo de verdade -- SEM `--dry-run` -- possa rodar sem
+# tocar a nuvem. Ele registra cada chamada num log, e o que nao foi programado nunca vira
+# rede, so um rc.
+
+_GCLOUD_PROGRAMAVEL = """#!/usr/bin/env bash
+# gcloud dublado e OFFLINE: cada chamada vai para o log e o rc vem do ambiente.
+printf '%s\\n' "$*" >> "$GCLOUD_LOG"
+case "$*" in
+    "auth print-access-token"*)  exit "${AUTH_RC:-0}" ;;
+    "config get-value account"*) printf '%s\\n' "${CONTA_ATIVA:-dev@example.com}"; exit 0 ;;
+    *"instances create"*)        exit "${CREATE_RC:-0}" ;;
+    *"instances delete"*)
+        if [ "${DELETE_REAUTH:-0}" = "1" ]; then
+            echo "ERROR: (gcloud.compute.instances.delete) There was a problem refreshing" \\
+                 "your current auth tokens: Reauthentication failed. cannot prompt during" \\
+                 "non-interactive execution." >&2
+            exit 1
+        fi
+        exit 0 ;;
+    *"instances describe"*)      exit "${DESCRIBE_RC:-1}" ;;
+    *) exit 0 ;;
+esac
+"""
+
+
+def _rodar_de_verdade(tmp_path: Path, *args: str, **env_extra: str):
+    """Roda o script SEM `--dry-run`, com um gcloud programavel que nao toca a nuvem.
+
+    Devolve (CompletedProcess, saida, chamadas_ao_gcloud). `--branch ''` desliga a checagem
+    de checkout (que e fatal fora do dry-run) e o `sleep` dublado tira os minutos de espera
+    do teardown -- nenhum dos dois e o objeto destes testes.
+    """
+    binario = tmp_path / "bin_real"
+    binario.mkdir()
+    log = tmp_path / "chamadas_gcloud.txt"
+    _escrever_sh(binario / "gcloud", _GCLOUD_PROGRAMAVEL)
+    _escrever_sh(binario / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+    env = dict(os.environ)
+    env["PATH"] = f"{binario.as_posix()}{os.pathsep}{env.get('PATH', '')}"
+    for chave in ("FINETUNE_FAIL_AT", "GCS_OUT", "GCS_CORPUS", "BRANCH", "VM", "ZONES",
+                  "PROJECT", "BASE", "METHOD", "EPOCHS", "BATCH_SIZE", "MAX_NEG", "LORA_R",
+                  "NO_GRAD_CKPT"):
+        env.pop(chave, None)
+    env["GCLOUD_LOG"] = log.as_posix()
+    env.update(env_extra)
+    proc = subprocess.run(
+        [BASH, str(SCRIPT), "--gcs-out", GCS_OUT, "--branch", "", *args],
+        cwd=str(RAIZ), env=env, capture_output=True, text=True, timeout=180)
+    chamadas = log.read_text(encoding="utf-8") if log.exists() else ""
+    return proc, proc.stdout + proc.stderr, chamadas
+
+
+def test_token_invalido_aborta_o_preflight_antes_de_qualquer_vm(tmp_path):
+    """A ponta (a): token ja vencido na largada nao pode virar VM paga.
+
+    Sem isto a rodada sobe a L4, treina, e so descobre o problema na hora de subir o
+    adaptador e apagar a VM -- que foi exatamente o incidente.
+    """
+    proc, saida, chamadas = _rodar_de_verdade(tmp_path, AUTH_RC="1")
+
+    assert proc.returncode != 0
+    assert "gcloud sem token valido" in saida
+    assert "gcloud auth login" in saida
+    # nada pago chegou nem a ser tentado
+    assert "instances create" not in saida
+    assert "instances create" not in chamadas
+
+
+def test_token_valido_deixa_o_preflight_seguir(tmp_path):
+    """A ponta (b): com token bom o preflight nao muda nada do fluxo de hoje."""
+    proc, saida, chamadas = _rodar_de_verdade(
+        tmp_path, AUTH_RC="0", FINETUNE_FAIL_AT="provision")
+
+    assert "gcloud sem token valido" not in saida
+    assert "auth print-access-token" in chamadas       # a checagem rodou de verdade
+    # seguiu ate a etapa seguinte do preflight e so parou na falha INJETADA
+    assert "falha INJETADA na etapa 'provision'" in saida
+    assert "nenhuma VM foi criada nesta rodada" in saida
+    assert "instances create" not in chamadas
+    assert proc.returncode != 0
+
+
+def test_dry_run_nao_executa_o_check_de_auth(tmp_path):
+    """A ponta (c): `print-access-token` e chamada de REDE -- o ensaio so a anuncia."""
+    proc, saida, sentinela = _rodada_completa(tmp_path)
+
+    assert proc.returncode == 0, saida
+    assert "[dry-run] gcloud auth print-access-token" in saida
+    # o gcloud delator do dry-run continua intocado: nenhum gcloud foi EXECUTADO
+    assert not sentinela.exists()
+
+
+def test_conta_sujeita_a_reauth_so_avisa(tmp_path):
+    """Aviso, nao barreira: a conta academica roda, mas o operador fica sabendo do risco."""
+    proc, saida, _ = _rodar_de_verdade(
+        tmp_path, AUTH_RC="0", FINETUNE_FAIL_AT="provision",
+        CONTA_ATIVA="fulano@discente.ufg.br")
+
+    assert "AVISO: conta fulano@discente.ufg.br pode exigir reauth" in saida
+    assert "service account" in saida
+    # avisou e SEGUIU: quem parou a rodada foi a falha injetada, nao o aviso
+    assert "falha INJETADA na etapa 'provision'" in saida
+
+
+def test_delete_que_falha_por_auth_imprime_o_banner_de_recuperacao(tmp_path):
+    """A ponta (d): se o token morreu no meio, o teardown nao consegue apagar a VM.
+
+    O retry nao resolve (so um `gcloud auth login` humano resolve), entao o que resta e
+    nao deixar o operador adivinhar: VM, zona, projeto e o resgate do adaptador, prontos.
+    """
+    proc, saida, _ = _rodar_de_verdade(
+        tmp_path, "--zones", "us-central1-a",
+        AUTH_RC="0", CREATE_RC="1", DELETE_REAUTH="1", DESCRIBE_RC="0",
+        TEARDOWN_RETRIES="1")
+
+    assert proc.returncode != 0
+    assert "RECUPERACAO MANUAL NECESSARIA (auth do gcloud expirou)" in saida
+    assert "1. gcloud auth login" in saida
+    assert ("3. gcloud compute instances delete govexe-finetune-v4 "
+            "--zone=us-central1-a --project=residencia-511517 --quiet") in saida
+    assert "finetune/runs/qwen3vl-qlora" in saida      # o resgate do adaptador
+    assert f"{GCS_OUT}/adapter" in saida
+    # o anti-leak continua valendo: a VM sobreviveu e o script grita
+    assert "LEAK" in saida
+
+
+def test_delete_que_falha_por_outro_motivo_nao_vira_banner_de_auth(tmp_path):
+    """O banner e um diagnostico, nao um rodape: falha comum segue no caminho de sempre."""
+    proc, saida, _ = _rodar_de_verdade(
+        tmp_path, "--zones", "us-central1-a",
+        AUTH_RC="0", CREATE_RC="1", DELETE_REAUTH="0", DESCRIBE_RC="1",
+        TEARDOWN_RETRIES="1")
+
+    assert "RECUPERACAO MANUAL NECESSARIA" not in saida
+    assert "conferencia ok: nenhuma VM sobrou" in saida
