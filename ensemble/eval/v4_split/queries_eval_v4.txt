@@ -1,0 +1,7 @@
+q01	orçamento da saúde no PLOA
+q02	emendas parlamentares ao orçamento
+q14	orçamento da segurança pública
+q19	merenda escolar e alimentação nas escolas
+q20	recursos digitais e tecnologia na educação
+q26	relator recomenda aprovação do projeto com mudanças no texto
+q27	crédito e infraestrutura para a agricultura e o campo

@@ -1,0 +1,28 @@
+q01	orçamento da saúde para o próximo ano
+q02	emendas parlamentares ao orçamento
+q03	despesas com educação no orçamento
+q04	quem é o relator do orçamento
+q05	o que é a lei orçamentária anual
+q06	contingenciamento e bloqueio de gastos
+q07	o que faz a comissão mista de orçamento
+q08	investimentos em infraestrutura
+q09	orçamento da segurança pública
+q10	previdência social e benefícios
+q11	lei de diretrizes orçamentárias
+q12	crédito suplementar e remanejamento de recursos
+q13	meta fiscal e arcabouço fiscal
+q14	repasses da União para estados e municípios
+q15	votação de projetos no plenário
+q16	reforma tributária e impostos
+q17	pauta e ordem do dia das sessões
+q18	orçamento da cultura e do esporte
+q19	plenário do Congresso Nacional durante sessão
+q20	reunião de comissão parlamentar
+q21	fachada do Congresso Nacional em Brasília
+q22	parlamentar discursando na tribuna
+q23	prédio do Tribunal de Contas da União
+q24	profissional de saúde em hospital do SUS
+q25	cédulas de dinheiro e calculadora
+q26	obra de infraestrutura em construção
+q27	autoridades assinando documento
+q28	público nas galerias do plenário

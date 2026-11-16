@@ -1,0 +1,21 @@
+q03	despesas com educação no orçamento
+q04	relator do orçamento e parecer da LOA
+q05	o que é a lei orçamentária anual
+q06	lei de diretrizes orçamentárias
+q07	o que faz a comissão mista de orçamento
+q08	meta fiscal e arcabouço fiscal
+q09	investimentos em infraestrutura no orçamento
+q10	previdência social e benefícios
+q11	votação de projetos no plenário
+q12	reforma tributária e impostos
+q13	crédito suplementar e alterações na programação orçamentária
+q15	política para a primeira infância
+q16	combate ao feminicídio e proteção à mulher
+q17	direitos da pessoa idosa
+q18	aumento de penas para crimes
+q21	relator de projeto de lei em comissão
+q22	autor de proposta legislativa
+q23	deputada relatora apresentando parecer
+q24	cerimônia de homenagem e entrega de medalha no Congresso
+q25	audiência com a Receita Federal sobre reforma tributária
+q28	deputado autor de proposta sobre segurança pública

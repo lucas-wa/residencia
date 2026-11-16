@@ -28,3 +28,4 @@ logs/
 
 # HF caches
 .cache/
+data/govexe/ensemble_orcamento_v4/bin/
