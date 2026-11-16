@@ -283,6 +283,18 @@ falha_e_de_auth() {
     return 1
 }
 
+# Assinatura de recurso INEXISTENTE na saida de um `instances delete` que falhou -- tambem
+# texto do proprio gcloud: "The resource ... was not found" / "Could not fetch resource:".
+# Nao se confunde com auth: token vencido fala de reauth, nao de recurso. O teardown varre
+# TODAS as zonas tentadas, e as que nunca tiveram VM respondem exatamente isto.
+delete_e_inexistente() {
+    case "$1" in
+        *"was not found"*|*"Could not fetch resource"*)
+            return 0 ;;
+    esac
+    return 1
+}
+
 # Gancho de verificacao do trap: `FINETUNE_FAIL_AT=<etapa>` faz a etapa falhar de proposito
 # (etapas: provision, bootstrap, stage, finetune, upload). Serve para provar que o teardown
 # roda em qualquer saida -- e so isso.
@@ -341,7 +353,8 @@ subir_resultado_para_gcs() {
 #   3. O resgate do adaptador vem antes dos deletes (apagar a VM destroi o treino), mas com
 #      TIMEOUT: um upload travado numa VM preemptada nao pode adiar a limpeza para sempre.
 #   4. Todo delete tem RETRY: "operation in progress" logo apos um create interrompido e
-#      falha transitoria, e engoli-la com `|| true` seria vazar recurso pago.
+#      falha transitoria, e engoli-la com `|| true` seria vazar recurso pago. "not found"
+#      e a excecao: nao ha o que apagar nessa zona, entao e sucesso e nao retry.
 #   5. Conferencia final que ASSERTA: se algo sobreviveu, o script grita LEAK, imprime o
 #      delete manual e sai com status != 0.
 #   6. A saida de cada delete que falha e CAPTURADA (e reemitida): e nela que o teardown
@@ -387,6 +400,14 @@ apagar_com_retry() {
             printf '%s\n' "$saida" >&2
         fi
         if [ "$rc_del" = "0" ]; then
+            return 0
+        fi
+        # "not found" nao e falha a retentar: e a resposta de uma zona onde a VM nunca
+        # existiu -- e o teardown passa por TODAS as zonas tentadas, nao so pela que pegou.
+        # Retentar aqui queimaria TEARDOWN_RETRIES x TEARDOWN_ESPERA por zona vazia
+        # enquanto a VM de verdade, na zona seguinte, continua cobrando.
+        if delete_e_inexistente "$saida"; then
+            echo "--- $rotulo: nada a apagar nessa zona (VM nao existe aqui) ---"
             return 0
         fi
         SAIDA_DO_DELETE="$SAIDA_DO_DELETE

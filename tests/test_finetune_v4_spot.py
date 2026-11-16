@@ -609,6 +609,16 @@ case "$*" in
                  "non-interactive execution." >&2
             exit 1
         fi
+        if [ "${DELETE_NOTFOUND:-0}" = "1" ]; then
+            echo "ERROR: (gcloud.compute.instances.delete) Could not fetch resource:" >&2
+            echo " - The resource 'projects/p/zones/z/instances/govexe-finetune-v4' was" \\
+                 "not found" >&2
+            exit 1
+        fi
+        if [ "${DELETE_ERRO:-0}" = "1" ]; then
+            echo "ERROR: (gcloud.compute.instances.delete) The resource is not ready" >&2
+            exit 1
+        fi
         exit 0 ;;
     *"instances describe"*)      exit "${DESCRIBE_RC:-1}" ;;
     *) exit 0 ;;
@@ -726,3 +736,39 @@ def test_delete_que_falha_por_outro_motivo_nao_vira_banner_de_auth(tmp_path):
 
     assert "RECUPERACAO MANUAL NECESSARIA" not in saida
     assert "conferencia ok: nenhuma VM sobrou" in saida
+
+
+# -- `not found` no delete: zona vazia nao e falha a retentar ---------------------------
+#
+# Com fallback de zona, o teardown varre TODAS as zonas tentadas e as que nunca tiveram VM
+# respondem "was not found". Retentar isso queima TEARDOWN_RETRIES x TEARDOWN_ESPERA por
+# zona vazia -- com a VM de verdade, na zona seguinte, ainda cobrando.
+
+
+def test_delete_em_zona_sem_vm_e_sucesso_sem_retry(tmp_path):
+    proc, saida, chamadas = _rodar_de_verdade(
+        tmp_path, "--zones", "us-central1-a",
+        AUTH_RC="0", CREATE_RC="1", DELETE_NOTFOUND="1", DESCRIBE_RC="1",
+        TEARDOWN_RETRIES="3")
+
+    assert "nada a apagar nessa zona (VM nao existe aqui)" in saida
+    # curto-circuito: UMA tentativa, sem a linha de retry e sem o veredito de falha
+    assert len([ln for ln in chamadas.splitlines() if "instances delete" in ln]) == 1
+    assert "tentativa 1 falhou" not in saida
+    assert "FALHOU em 3 tentativas" not in saida
+    # e nao se confunde com auth: o banner continua sendo so do token vencido
+    assert "RECUPERACAO MANUAL NECESSARIA" not in saida
+    assert "conferencia ok: nenhuma VM sobrou" in saida
+
+
+def test_delete_que_falha_de_verdade_continua_retentando(tmp_path):
+    """So o `not found` curto-circuita: erro generico segue no caminho de retry de sempre."""
+    proc, saida, chamadas = _rodar_de_verdade(
+        tmp_path, "--zones", "us-central1-a",
+        AUTH_RC="0", CREATE_RC="1", DELETE_ERRO="1", DESCRIBE_RC="1",
+        TEARDOWN_RETRIES="2")
+
+    assert "nada a apagar nessa zona" not in saida
+    assert len([ln for ln in chamadas.splitlines() if "instances delete" in ln]) == 2
+    assert "tentativa 1 falhou" in saida
+    assert "FALHOU em 2 tentativas" in saida

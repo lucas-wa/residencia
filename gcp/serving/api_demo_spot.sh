@@ -34,12 +34,12 @@
 #
 # PORTADO DE `gcp/serving/finetune_v4_spot.sh` (que por sua vez o portou de
 # capture_v4_spot.sh / gcp/slice/run_slice.sh): as vars de estado, `token_de_auth_ok`,
-# `falha_e_de_auth`, `banner_de_recuperacao`, `apagar_com_retry`, a funcao `teardown()`
-# inteira (com a conferencia anti-leak), o preflight de auth, o guard de prefixo no GCS,
-# `--instance-termination-action=DELETE` e o trap em EXIT. A COPIA e deliberada: o
-# finetune esta rodando e refatorar os dois para um `gcp/serving/spot_common.sh` agora
-# seria mexer na fiacao de teardown no meio de uma rodada paga. O commom pode vir depois,
-# com os dois scripts parados.
+# `falha_e_de_auth`, `delete_e_inexistente`, `banner_de_recuperacao`, `apagar_com_retry`,
+# a funcao `teardown()` inteira (com a conferencia anti-leak), o preflight de auth, o
+# guard de prefixo no GCS, `--instance-termination-action=DELETE` e o trap em EXIT. A
+# COPIA e deliberada: o finetune esta rodando e refatorar os dois para um
+# `gcp/serving/spot_common.sh` agora seria mexer na fiacao de teardown no meio de uma
+# rodada paga. O commom pode vir depois, com os dois scripts parados.
 #
 # O QUE MUDA em relacao ao finetune: as fases de trabalho (`pairs|smoke|finetune|eval_syn`
 # viram `build_index|serve`), o artefato que se resgata no teardown (o INDICE, nao o
@@ -274,6 +274,18 @@ falha_e_de_auth() {
     return 1
 }
 
+# Assinatura de recurso INEXISTENTE na saida de um `instances delete` que falhou -- tambem
+# texto do proprio gcloud: "The resource ... was not found" / "Could not fetch resource:".
+# Nao se confunde com auth: token vencido fala de reauth, nao de recurso. O teardown varre
+# TODAS as zonas tentadas, e as que nunca tiveram VM respondem exatamente isto.
+delete_e_inexistente() {
+    case "$1" in
+        *"was not found"*|*"Could not fetch resource"*)
+            return 0 ;;
+    esac
+    return 1
+}
+
 # Gancho de verificacao do trap: `API_DEMO_FAIL_AT=<etapa>` faz a etapa falhar de proposito
 # (etapas: provision, bootstrap, stage, build_index, upload_index, serve, probe). Serve
 # para provar que o teardown roda em qualquer saida -- e so isso.
@@ -371,7 +383,8 @@ fechar_port_forward() {
 #      O uvicorn NAO e parado: ele morre junto com a VM, e um ssh a mais so atrasaria o
 #      delete.
 #   5. Todo delete tem RETRY: "operation in progress" logo apos um create interrompido e
-#      falha transitoria, e engoli-la com `|| true` seria vazar recurso pago.
+#      falha transitoria, e engoli-la com `|| true` seria vazar recurso pago. "not found"
+#      e a excecao: nao ha o que apagar nessa zona, entao e sucesso e nao retry.
 #   6. Conferencia final que ASSERTA: se algo sobreviveu, o script grita LEAK, imprime o
 #      delete manual e sai com status != 0.
 #   7. A saida de cada delete que falha e CAPTURADA (e reemitida): e nela que o teardown
@@ -413,6 +426,14 @@ apagar_com_retry() {
             printf '%s\n' "$saida" >&2
         fi
         if [ "$rc_del" = "0" ]; then
+            return 0
+        fi
+        # "not found" nao e falha a retentar: e a resposta de uma zona onde a VM nunca
+        # existiu -- e o teardown passa por TODAS as zonas tentadas, nao so pela que pegou.
+        # Retentar aqui queimaria TEARDOWN_RETRIES x TEARDOWN_ESPERA por zona vazia
+        # enquanto a VM de verdade, na zona seguinte, continua cobrando.
+        if delete_e_inexistente "$saida"; then
+            echo "--- $rotulo: nada a apagar nessa zona (VM nao existe aqui) ---"
             return 0
         fi
         SAIDA_DO_DELETE="$SAIDA_DO_DELETE
